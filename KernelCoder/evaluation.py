@@ -20,18 +20,19 @@ import ast
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXTERNAL = os.path.join(REPO_ROOT, "external")
+KERNEL_EVAL_BUILD_DIR = os.path.join(REPO_ROOT, "cache")
 sys.path.append(REPO_ROOT)
 sys.path.append(EXTERNAL)
 
 # KernelBench imports
-from KerenlBench.src.compile import batch_compile, remove_cache_dir
-from KerenlBench.src.eval import eval_kernel_against_ref, eval_reference_kernel, KernelExecResult, check_metadata_serializable_all_types
-from KerenlBench.src.utils import set_gpu_arch, WorkArgs
-from KerenlBench.src.dataset import construct_kernelbench_dataset, fetch_ref_arch_from_level_problem_id
-from KerenlBench.src.run_utils import fetch_kernel_from_disk, check_if_eval_exists_local
+from KernelBench.src.compile import batch_compile, remove_cache_dir, WorkArgs
+from KernelBench.src.eval import eval_kernel_against_ref, eval_reference_kernel, KernelExecResult, check_metadata_serializable_all_types
+from KernelBench.src.utils import set_gpu_arch, WorkArgs
+from KernelBench.src.dataset import construct_kernelbench_dataset, fetch_ref_arch_from_level_problem_id
+from KernelBench.src.run_utils import fetch_kernel_from_disk, check_if_eval_exists_local
 
 # Local imports
-from configs import parse_evaluation_args, RUNS_DIR, KERNEL_EVAL_BUILD_DIR
+from configs import parse_evaluation_args
 
 
 @dataclass

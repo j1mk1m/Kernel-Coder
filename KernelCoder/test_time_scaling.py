@@ -22,8 +22,9 @@ sys.path.append(REPO_ROOT)
 sys.path.append(EXTERNAL)
 
 # KernelBench imports
-from KerenlBench.src.utils import set_gpu_arch, WorkArgs
-from KerenlBench.src.dataset import construct_kernelbench_dataset, fetch_ref_arch_from_level_problem_id
+from KernelBench.src.utils import set_gpu_arch
+from KernelBench.src.compile import WorkArgs
+from KernelBench.src.dataset import construct_kernelbench_dataset, fetch_ref_arch_from_level_problem_id
 
 # Local imports
 from configs import parse_test_time_scaling_args 
