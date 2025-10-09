@@ -19,6 +19,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXTERNAL = os.path.join(REPO_ROOT, "external")
 RUNS_DIR = os.path.join(REPO_ROOT, "runs")
 sys.path.append(REPO_ROOT)
+sys.path.append(os.path.join(REPO_ROOT, "KernelCoder"))
 sys.path.append(EXTERNAL)
 
 # KernelBench imports

@@ -1,18 +1,24 @@
 import torch
 import multiprocessing as mp
 import os
+import sys
 import json
 import yaml
 from datasets import load_dataset
 from llm_utils import create_llm_client, get_usage_summary
 
-from src.dataset import construct_kernelbench_dataset
-from src.utils import set_gpu_arch, create_inference_server_from_presets
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EXTERNAL = os.path.join(REPO_ROOT, "external")
+RUNS_DIR = os.path.join(REPO_ROOT, "runs")
+sys.path.append(REPO_ROOT)
+sys.path.append(EXTERNAL)
 
-from main.test_time_scaling import iterative_refinement
-from main.configs import parse_evolrule_args, RUNS_DIR
-from main.autorule import autorule
+from KernelBench.src.dataset import construct_kernelbench_dataset
+from KernelBench.src.utils import set_gpu_arch, create_inference_server_from_presets
 
+from KernelCoder.test_time_scaling import iterative_refinement
+from KernelCoder.configs import parse_evolrule_args
+from KernelCoder.rule.autorule import autorule
 
 
 def main(config):

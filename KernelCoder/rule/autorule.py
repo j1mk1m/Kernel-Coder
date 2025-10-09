@@ -3,15 +3,19 @@ import sys
 import json
 import random
 from tqdm import tqdm
-
-from configs import parse_evolrule_args, parse_cross_model_alignment_args
-from src.utils import read_json_file
 from llm_utils import create_llm_client
 
-REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUN_DIR = os.path.join(REPO_TOP_DIR, "runs")
-KERNEL_BENCH_PATH = os.path.join(REPO_TOP_DIR, "KernelBench")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EXTERNAL = os.path.join(REPO_ROOT, "external")
+KERNEL_BENCH_PATH = os.path.join(EXTERNAL, "KernelBench", "KernelBench")
 
+sys.path.append(REPO_ROOT)
+sys.path.append(EXTERNAL)
+
+from KernelBench.src.utils import read_json_file
+
+
+from KernelCoder.configs import parse_evolrule_args, parse_cross_model_alignment_args
 
 
 def process_generated_kernels(level, run_dir):
@@ -437,15 +441,6 @@ Return the merged list as a JSON array of strings. Do not use ``json``, just out
     return filtered_rules
 
 
-def read_best_k_kernels(level: int, test: bool = False):
-    if test:
-        with open(os.path.join(KERNEL_BENCH_PATH, f"best_k_kernels_level{level}_small.json"), "r") as f:
-            best_k_kernels = json.load(f)
-    else:
-        with open(os.path.join(KERNEL_BENCH_PATH, f"best_k_kernels_level{level}.json"), "r") as f:
-            best_k_kernels = json.load(f)
-    return best_k_kernels
-
 def retrieve_kernel_source(kernel, level):
     src_file = os.path.join(REPO_TOP_DIR, "runs", kernel["run_name"], f"level_{level}_problem_{kernel['problem_id']}_sample_{kernel['sample_id']}_kernel.py")
     with open(src_file, "r") as f:
@@ -468,6 +463,17 @@ if __name__ == "__main__":
     
     autorule(config, run_dir, llm_client)
 
+
+
+# Deprecated
+def read_best_k_kernels(level: int, test: bool = False):
+    if test:
+        with open(os.path.join(KERNEL_BENCH_PATH, f"best_k_kernels_level{level}_small.json"), "r") as f:
+            best_k_kernels = json.load(f)
+    else:
+        with open(os.path.join(KERNEL_BENCH_PATH, f"best_k_kernels_level{level}.json"), "r") as f:
+            best_k_kernels = json.load(f)
+    return best_k_kernels
 
 
 # def cross_model_alignment(config):
