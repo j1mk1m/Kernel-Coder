@@ -1,7 +1,12 @@
 set -x
 
-RUN_NAME="grpo_train_small_Qwen2.5-Coder-7B-Instruct-SFT"
+export RUN_NAME="grpo_train_small_Qwen2.5-Coder-7B-Instruct-SFT"
 MODEL="gyeongwk/Qwen2.5-Coder-7B-Instruct-SFT"
+
+export EVAL_SERVER_HOST="babel-15-32"
+export EVAL_SERVER_PORT=8083
+export NUM_GENERATIONS=8
+export HARDWARE="A6000_babel"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
