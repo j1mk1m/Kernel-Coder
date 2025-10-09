@@ -13,8 +13,7 @@ sys.path.append(REPO_ROOT)
 sys.path.append(EXTERNAL)
 
 # KernelBench imports
-from KernelBench.src.compile import WorkArgs
-from KernelBench.src.utils import maybe_multithread, extract_last_code
+from KernelBench.src.utils import maybe_multithread, extract_last_code, WorkArgs
 from KernelBench.src.dataset import fetch_ref_arch_from_level_problem_id
 from KernelBench.src.run_utils import check_if_response_exists
 

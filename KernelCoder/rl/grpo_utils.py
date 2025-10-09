@@ -7,19 +7,18 @@ from src.run_utils import fetch_baseline_results
 from src.reward_hacking import is_generated_kernel_used, torch_function_used
 
 
-HARDWARE = "A6000_babel"
 
 # Reward utils
-def get_speedup_from_exec_result(level, problem, exec_result):
+def get_speedup_from_exec_result(level, problem, exec_result, hardware):
     if not exec_result.correctness:
         return 0.0
-    baseline_results = fetch_baseline_results(level, problem, HARDWARE)
+    baseline_results = fetch_baseline_results(level, problem, hardware)
     speedup = baseline_results["mean"] / exec_result.runtime
     return speedup
 
-def kevin_reward_from_exec_result(level, problem, exec_result):
+def kevin_reward_from_exec_result(level, problem, exec_result, hardware):
     if exec_result.correctness:
-        return 0.3 + get_speedup_from_exec_result(level, problem, exec_result)
+        return 0.3 + get_speedup_from_exec_result(level, problem, exec_result, hardware)
     else:
         return 0.0
 

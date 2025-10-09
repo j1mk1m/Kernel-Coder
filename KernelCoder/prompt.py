@@ -8,9 +8,12 @@ Design principles:
 
 import os
 import random
-from KernelBench.src.utils import read_file, read_json_file
+from KernelBench.src.utils import read_file, read_json_file, WorkArgs
 from KernelBench.src.run_utils import fetch_kernel_from_disk, fetch_eval_results_for_problem, fetch_eval_result_from_disk
-from KernelBench.src.eval import KernelExecResult, WorkArgs
+from KernelBench.src.eval import KernelExecResult
+
+REPO_TOP_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+KB_ROOT = os.path.join(REPO_TOP_PATH, "external", "KernelBench")
 
 
 ############################################
@@ -133,15 +136,15 @@ def prompt_base(ref_arch_src: str, triton=False, rule_path=None) -> str:
 
     # path to prompt template, show an example of Model (torch specifications) and ModelNew (torch + custom CUDA kernels)
     example_arch_path = os.path.join(
-        REPO_TOP_PATH, f"src/prompts/model_ex_add.py"
+        KB_ROOT, f"src/prompts/model_ex_add.py"
     )
     if triton:
         example_new_arch_path = os.path.join(
-            REPO_TOP_PATH, f"src/prompts/model_new_ex_add_triton.py"
+            KB_ROOT, f"src/prompts/model_new_ex_add_triton.py"
         )
     else:
         example_new_arch_path = os.path.join(
-            REPO_TOP_PATH, f"src/prompts/model_new_ex_add.py"
+            KB_ROOT, f"src/prompts/model_new_ex_add.py"
         )
 
     if not os.path.exists(example_arch_path):
@@ -174,37 +177,37 @@ def prompt_cot(ref_arch_src: str, cot_example: str = "ex_fuse_gelu", triton=Fals
 
     # k = 2
     example_fuse_gelu = read_file(
-        os.path.join(REPO_TOP_PATH, "src/prompts/few_shot/model_ex_fuse_gelu.py")
+        os.path.join(KB_ROOT, "src/prompts/few_shot/model_ex_fuse_gelu.py")
     )
     example_fuse_gelu_cot = read_file(
-        os.path.join(REPO_TOP_PATH, "src/prompts/cot/model_cot_fuse_gelu.py")
+        os.path.join(KB_ROOT, "src/prompts/cot/model_cot_fuse_gelu.py")
     )
     example_fuse_gelu_new = read_file(
-        os.path.join(REPO_TOP_PATH, "src/prompts/few_shot/model_new_ex_fuse_gelu.py")
+        os.path.join(KB_ROOT, "src/prompts/few_shot/model_new_ex_fuse_gelu.py")
     )
     example_fuse_gelu_desc = "This given architecture is for a fused gelu: "
 
     # k = 3
     example_mnist2 = read_file(
-        os.path.join(REPO_TOP_PATH, "src/prompts/few_shot/model_ex_mnist2.py")
+        os.path.join(KB_ROOT, "src/prompts/few_shot/model_ex_mnist2.py")
     )
     example_mnist2_cot = read_file(
-        os.path.join(REPO_TOP_PATH, "src/prompts/cot/model_cot_mnist2.py")
+        os.path.join(KB_ROOT, "src/prompts/cot/model_cot_mnist2.py")
     )
     example_mnist2_new = read_file(
-        os.path.join(REPO_TOP_PATH, "src/prompts/few_shot/model_new_ex_mnist2.py")
+        os.path.join(KB_ROOT, "src/prompts/few_shot/model_new_ex_mnist2.py")
     )
     exmaple_mnist2_desc = "This given architecture is for a model with fused convolutions and relus: "
 
     # k = 4
     example_tiled_matmul = read_file(
-        os.path.join(REPO_TOP_PATH, "src/prompts/few_shot/model_ex_tiled_matmul.py")
+        os.path.join(KB_ROOT, "src/prompts/few_shot/model_ex_tiled_matmul.py")
     )
     example_tiled_matmul_cot = read_file(
-        os.path.join(REPO_TOP_PATH, "src/prompts/cot/model_cot_tiled_matmul.py")
+        os.path.join(KB_ROOT, "src/prompts/cot/model_cot_tiled_matmul.py")
     )
     example_tiled_matmul_new = read_file(
-        os.path.join(REPO_TOP_PATH, "src/prompts/few_shot/model_new_ex_tiled_matmul.py")
+        os.path.join(KB_ROOT, "src/prompts/few_shot/model_new_ex_tiled_matmul.py")
     )
     example_tiled_matmul_desc = "This given architecture is for a model with tiled matrix multiplication: "
     
@@ -444,7 +447,7 @@ def generate_prompt_stanford(work: WorkArgs, config, ref_arch_src: str, llm_clie
     return prompt
 
 
-def generate_prompt(work: WorkArgs, config, ref_arch_src: str, llm_client, run_dir: str, rule_path=None) -> str:
+def generate_prompt(work: WorkArgs, config, ref_arch_src: str, llm_client, run_dir: str, rule_path=None, **kwargs) -> str:
     triton = "KernelLLM" in config.model_name
     match config.method:
         case "base":

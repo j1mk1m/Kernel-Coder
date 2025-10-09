@@ -23,7 +23,7 @@ from src.reward_hacking import is_generated_kernel_used, torch_function_used
 from src.dataset import fetch_ref_arch_from_level_problem_id
 from src.prompt_constructor import prompt_base
 
-from main.evaluation_utils import send_batch_evaluation_request, EvaluationWorkArgs, serialize_work_args
+from KernelCoder.evaluation import send_batch_evaluation_request, EvaluationWorkArgs, serialize_work_args
 
 
 

@@ -8,35 +8,28 @@ from verl.interactions.base import BaseInteraction
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(REPO_ROOT)
 
-from src.run_utils import fetch_baseline_results, write_kernel_to_disk, write_eval_result_to_separate_file
-from src.prompt_constructor import exec_result_to_exeution_feedback
-from src.utils import extract_last_code
+from KernelBench.src.run_utils import fetch_baseline_results, write_kernel_to_disk, write_eval_result_to_separate_file
+from KernelBench.src.prompt_constructor import exec_result_to_exeution_feedback
+from KernelBench.src.utils import extract_last_code
 
-from main.evaluation_utils import send_evaluation_request, EvaluationWorkArgs
+from evaluation import send_evaluation_request, EvaluationWorkArgs
+from rl.grpo_utils import kevin_reward_from_exec_result
+from rl.reward_hacking import is_generated_kernel_used, torch_function_used
 
 
 # RUNS_DIR = "/data/user_data/gyeongwk/KernelBench/grpo/runs"
 RUNS_DIR = os.path.join(REPO_ROOT, "runs")
-RUN_NAME = "grpo_train_multi_turn_Qwen2.5-7B-Instruct-SFT"
-EVAL_SERVER_HOST = "shire-1-10"
-EVAL_SERVER_PORT = 8085
-NUM_GENERATIONS = 8
-HARDWARE = "A6000_babel"
+RUN_NAME = os.environ.get("RUN_NAME", "test_run")
+EVAL_SERVER_HOST = os.environ.get("EVAL_SERVER_HOST", "hyperbolic-1")
+EVAL_SERVER_PORT = os.environ.get("EVAL_SERVER_PORT", 8085)
+NUM_GENERATIONS = os.environ.get("NUM_GENERATIONS", 8)
+HARDWARE = os.environ.get("HARDWARE", "H100_hyperbolic")
 
 os.makedirs(os.path.join(RUNS_DIR, RUN_NAME), exist_ok=True)
 
 # Define custom reward functions
 def reward_from_exec_result(level, problem, exec_result):
-    if exec_result.correctness:
-        try:
-            baseline_results = fetch_baseline_results(level, problem, HARDWARE)
-            speedup = baseline_results["mean"] / exec_result.runtime
-            return 0.3 + float(speedup)
-        except Exception as e:
-            print(f"Error fetching baseline results for level {level} problem {problem}: {e}")
-            return 0.3
-    else:
-        return 0.0
+    return kevin_reward_from_exec_result(level, problem, exec_result, HARDWARE)
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, thread_id=None, iteration=0):
