@@ -25,7 +25,7 @@ sys.path.append(REPO_ROOT)
 sys.path.append(EXTERNAL)
 
 # KernelBench imports
-from KernelBench.src.compile import batch_compile, remove_cache_dir, WorkArgs
+from KernelBench.src.compile import batch_compile, remove_cache_dir
 from KernelBench.src.eval import eval_kernel_against_ref, eval_reference_kernel, KernelExecResult, check_metadata_serializable_all_types
 from KernelBench.src.utils import set_gpu_arch, WorkArgs
 from KernelBench.src.dataset import construct_kernelbench_dataset, fetch_ref_arch_from_level_problem_id

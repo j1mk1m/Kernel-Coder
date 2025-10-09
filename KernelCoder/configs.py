@@ -46,7 +46,6 @@ def post_process_dataset_args(args):
     return args
 
 
-
 def parse_test_time_scaling_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--_tags", type=str, default="test_test_time_scaling")

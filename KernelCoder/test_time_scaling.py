@@ -22,8 +22,7 @@ sys.path.append(REPO_ROOT)
 sys.path.append(EXTERNAL)
 
 # KernelBench imports
-from KernelBench.src.utils import set_gpu_arch
-from KernelBench.src.compile import WorkArgs
+from KernelBench.src.utils import set_gpu_arch, WorkArgs
 from KernelBench.src.dataset import construct_kernelbench_dataset, fetch_ref_arch_from_level_problem_id
 
 # Local imports
@@ -47,7 +46,7 @@ def base(config, level, problem_id_range: range, llm_client: callable, run_dir: 
             )
         )
     
-    batch_generate(workload, config, llm_client, run_dir, rule_path)    
+    batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
     
     eval_file_path = os.path.join(run_dir, f"eval_results.json")
     batch_eval(workload, config, run_dir, eval_file_path)
@@ -72,7 +71,7 @@ def best_of_n(config, level, problem_id_range: range, llm_client: callable, run_
                 )
             )
         
-        batch_generate(workload, config, llm_client, run_dir, rule_path)     
+        batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
         batch_eval(workload, config, run_dir, eval_file_path) 
 
 
@@ -99,7 +98,7 @@ def iterative_refinement(config, level, problem_id_range: range, llm_client: cal
                     )
                 )
 
-        batch_generate(workload, config, llm_client, run_dir, rule_path)
+        batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
         batch_eval(workload, config, run_dir, eval_file_path)
 
 
@@ -146,7 +145,7 @@ def metr(config, level, problem_id_range: range, llm_client: callable, run_dir: 
                 )
             )
     
-    batch_generate(workload, config, llm_client, run_dir, rule_path)
+    batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
     batch_eval(workload, config, run_dir, eval_file_path)
 
     # 2. Continue generating samples until we reach num_samples
@@ -162,7 +161,7 @@ def metr(config, level, problem_id_range: range, llm_client: callable, run_dir: 
                 )
             )
             
-        batch_generate(workload, config, llm_client, run_dir, rule_path)
+        batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
         batch_eval(workload, config, run_dir, eval_file_path)
 
 
@@ -186,7 +185,7 @@ def stanford(config, level, problem_id_range: range, llm_client: callable, run_d
                     )
                 )
         
-        batch_generate(workload, config, llm_client, run_dir, rule_path)
+        batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
         batch_eval(workload, config, run_dir, eval_file_path)
 
 
