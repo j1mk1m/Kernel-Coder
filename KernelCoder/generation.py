@@ -15,7 +15,7 @@ sys.path.append(EXTERNAL)
 # KernelBench imports
 from KernelBench.src.utils import maybe_multithread, extract_last_code, WorkArgs
 from KernelBench.src.dataset import fetch_ref_arch_from_level_problem_id
-from KernelBench.src.run_utils import check_if_response_exists
+from KernelBench.src.run_utils import check_if_response_exists, check_if_kernel_exists
 
 # Local imports
 from prompt import generate_prompt
@@ -67,7 +67,7 @@ def batch_generate(
     run_dir: str,
     **kwargs
 ):
-    total_work = [work for work in total_work if not check_if_response_exists(run_dir, work.level, work.problem_id, work.sample_id)]
+    total_work = [work for work in total_work if not check_if_kernel_exists(run_dir, work.level, work.problem_id, work.sample_id)]
     return maybe_multithread(generate_sample_launcher, 
                       total_work, 
                       config.num_workers, 

@@ -1,12 +1,18 @@
 import yaml
 import argparse
+import sys
 from argparse import ArgumentParser
 import os
 import json
 import numpy as np
 
-from src.dataset import construct_kernelbench_dataset, TEST_PROBLEM_IDS_LEVEL_1, TEST_PROBLEM_IDS_LEVEL_2, TRAIN_PROBLEM_IDS_LEVEL_1, TRAIN_PROBLEM_IDS_LEVEL_2
-from src.score import *
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EXTERNAL = os.path.join(REPO_ROOT, "external")
+sys.path.append(REPO_ROOT)
+sys.path.append(EXTERNAL)
+
+from KernelBench.src.dataset import construct_kernelbench_dataset
+from KernelBench.src.score import *
 
 
 """
@@ -104,7 +110,7 @@ def compute_efficiency_metrics_all_baselines(config, hardware: str, eval_results
     results = {}
     for baseline in BASELINES:
         try:
-            baseline_file_path = f'results/timing/{hardware}/baseline_time_{baseline}.json'
+            baseline_file_path = os.path.join(EXTERNAL, "KernelBench", "results", "timing", hardware, f'baseline_time_{baseline}.json')
             assert os.path.exists(baseline_file_path), f"Baseline file does not exist at {baseline_file_path}"
 
             with open(baseline_file_path, 'r') as f:
@@ -378,7 +384,7 @@ def main(run_dir, hardware, grpo):
     if not os.path.exists(config_path):
         print("No config file found. Using empty dict")
         config  = {
-            "level": 2,
+            "level": 3,
             "method": "best-of-N",
             "num_parallel": 8,
             "num_iterations": 1,

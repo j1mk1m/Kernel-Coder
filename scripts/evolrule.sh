@@ -1,19 +1,20 @@
 python KernelCoder/rule/evolrule.py \
-    --run_name test_evolrule \
+    --run_name evolrule_level1_gemini \
     --num_epochs 2 \
     --autorule_num_samples_per_problem 1 \
     --autorule_sample_best_and_worst True \
-    --autorule_num_alignment_samples 5 \
-    --autorule_total_validation_limit 10 \
+    --autorule_num_alignment_samples 50 \
+    --autorule_total_validation_limit 200 \
     --autorule_alignment_threshold 0.70 \
-    --num_parallel 2 \
+    --num_parallel 8 \
     --num_iterations 1 \
-    --level 2 \
-    --subset "(1,2)" \
-    --model_name gemini/gemini-2.0-flash \
+    --level 1 \
+    --model_name gemini/gemini-2.5-pro \
     --server_type litellm \
-    --max_tokens 8192 \
+    --max_tokens 16384 \
     --temperature 0.7 \
+    --num_workers 16 \
     --hardware H100_hyperbolic \
     --gpu_arch Hopper \
-    --num_eval_devices 1 \
+    --num_eval_devices 2 \
+    --verbose

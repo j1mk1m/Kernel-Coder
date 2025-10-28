@@ -5,7 +5,7 @@ import sys
 import json
 import yaml
 from datasets import load_dataset
-from llm_utils import create_llm_client, get_usage_summary
+from llm_utils import create_llm_client, get_usage_summary, setup_logging
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 EXTERNAL = os.path.join(REPO_ROOT, "external")
@@ -66,6 +66,7 @@ def main(config):
     assert config.num_eval_devices <= torch.cuda.device_count(), f"Number of GPUs requested ({config.num_eval_devices}) is greater than the number of available GPUs ({torch.cuda.device_count()})"
 
     # Create inference function with config parameters
+    setup_logging(level="WARNING", log_file="usage.log")
     default_base_api = f"http://{config.vllm_host}:{config.vllm_port}/v1" if config.server_type == "vllm" else None
     llm_client = create_llm_client(os.path.join(run_dir, "llm_usage.json"),
                                    default_model=config.model_name,
