@@ -1,5 +1,9 @@
 from dataclasses import dataclass
 
+from typing import List
+
+from KernelCoder.benchmarks.benchmark import Task, Solution, EvaluationResult
+
 """
 Components
 - Memory: retrieve, consolidate
@@ -29,11 +33,9 @@ class KnowledgeBase:
     def __init__(self):
         pass
 
-    @abstractmethod
     def retrieve(self, query):
         pass
 
-    @abstractmethod
     def add(self, entry):
         pass
 
@@ -49,13 +51,25 @@ class Memory(KnowledgeBase):
         self.memory = []
 
     def retrieve(self, query):
-        # for each memory, calculate similarity and output top k most similar 
+        # for each memory, calculate similarity and output top k most similar (default k=1)
+        # gemini-embedding-001 model was used
+        pass
 
     def add(self, entry):
         self.memory.append(entry)
 
     def extract_memory(self, solutions: List[Solution], evals: List[EvaluationResult]) -> List[MemoryItem]:
         pass
+
+class MaTTSMemory(KnowledgeBase):
+    def __init__(self):
+        self.memory = []
+
+    def retrieve(self, query):
+        pass
+
+    def add(self, entry):
+        self.memory.append(entry)
 
 
 class Rules(KnowledgeBase):

@@ -4,6 +4,9 @@ import os
 REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def add_benchmark_args(parser):
+    parser.add_argument("--benchmark", type=str, default="KernelBench")
+
 def add_inference_args(parser, rl_training=False):
     parser.add_argument("--server_type", type=str, default="vllm")
     parser.add_argument("--max_tokens", type=int, default=4096)
@@ -51,9 +54,10 @@ def parse_test_time_scaling_args():
     parser.add_argument("--_tags", type=str, default="test_test_time_scaling")
 
     parser.add_argument("--run_name", type=str, required=True)
+    parser.add_argument("--test", action="store_true")
 
-    parser.add_argument("--autorule", action="store_true")
-    parser.add_argument("--autorule_path", type=str, default=None)
+    add_benchmark_args(parser)
+
 
     # Methods
     parser.add_argument("--method", type=str, default="base")
@@ -66,7 +70,7 @@ def parse_test_time_scaling_args():
     # Dataset
     parser.add_argument("--dataset_src", type=str, default="local")
     parser.add_argument("--dataset_name", type=str, default="ScalingIntelligence/KernelBench")
-    parser.add_argument("--level", type=int, required=True)
+    parser.add_argument("--level", type=int, default=1)
     parser.add_argument("--subset", type=str, default="(None, None)")
 
     # Inference Server
