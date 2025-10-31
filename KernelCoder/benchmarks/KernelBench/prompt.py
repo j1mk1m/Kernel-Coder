@@ -193,8 +193,8 @@ Here is your wall clock time: {runtime} milliseconds.
     return evaluation_feedback
  
 
-def prompt_refinement_from_last_kernel(ref_arch_src: str, config, last_kernel_src: str, last_exec_result: KernelExecResult, triton=False) -> str:
-    prompt = prompt_main(ref_arch_src, config, triton)
+def prompt_refinement_from_last_kernel(ref_arch_src: str, last_kernel_src: str, last_exec_result: KernelExecResult, triton=False, context=None) -> str:
+    prompt = prompt_base(ref_arch_src, triton=triton, context=context)
     execution_feedback = exec_result_to_exeution_feedback(last_exec_result)
 
     prompt += f"""Your latest generated kernel:
@@ -266,6 +266,19 @@ Here is your idea for how to improve the kernel:
 
     prompt += get_problem_instruction(triton)
     return prompt
+
+def get_refinement_prompt(task_id: str, task_description: str, trace, config, run_dir: str, context=None) -> str:
+    evaluations = trace.get_evaluations(task_id)
+    # find best solution a
+    correct_evals = [eval for eval in evaluations if eval.correctness]
+    if len(correct_evals) == 0:
+        exec_result = evaluations[-1]
+        last_solution = trace.get_solution(exec_result.evaluation_id)
+    else:
+        exec_result = max(correct_evals, key=lambda x: x.runtime)
+        last_solution = trace.get_solution(exec_result.evaluation_id)
+    return prompt_refinement_from_last_kernel(task_description, last_solution.solution_code, exec_result, triton=False, context=context)
+
 
 
 def generate_prompt_iterative_refinement(task, config, ref_arch_src: str, llm_client, run_dir: str, triton=False, context=None) -> str:

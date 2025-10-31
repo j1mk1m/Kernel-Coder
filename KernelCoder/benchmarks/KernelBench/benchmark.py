@@ -13,7 +13,7 @@ from external.KernelBench.src.utils import set_gpu_arch, extract_last_code
 
 
 from KernelCoder.benchmarks.benchmark import Benchmark
-from KernelCoder.benchmarks.KernelBench.prompt import generate_prompt
+from KernelCoder.benchmarks.KernelBench.prompt import prompt_base, get_refinement_prompt
 from KernelCoder.benchmarks.KernelBench.evaluation import batch_eval, EvaluationWorkArgs
 from KernelCoder.benchmarks.KernelBench.analysis.metrics import compute_metrics_from_traces
 from KernelCoder.benchmarks.KernelBench.classes import KernelBenchTask, KernelBenchSolution, KernelBenchEvaluationResult, KernelBenchTraces
@@ -36,11 +36,10 @@ class KernelBenchBenchmark(Benchmark):
 
 
     def get_prompt(self, task: KernelBenchTask, context: str=None) -> str:
-        return generate_prompt(task, self.config, task.task_description, self.llm_client, self.run_dir, context=context)
+        return prompt_base(task.task_description, context=context)
 
     def get_refinement_prompt(self, task: KernelBenchTask, trace: KernelBenchTraces, context: str=None) -> str:
-        # TODO
-        return get_refinement_prompt(task, trace, self.config, self.llm_client, self.run_dir, context=context)
+        return get_refinement_prompt(task.task_id, task.task_description, trace, self.config, self.run_dir, context=context)
 
     def parse_solution(self, task_id, solution_id: str, response: str) -> KernelBenchSolution:
         if response is None:
@@ -65,8 +64,11 @@ class KernelBenchBenchmark(Benchmark):
             traces.add_evaluation(evaluation)
         return traces
 
+    def format_solution(self, solution: KernelBenchSolution, evaluation: KernelBenchEvaluationResult) -> str:
+        return f"Kernel: \n{solution.solution_code} \n\nEvaluation: {evaluation.correctness} \n\nRuntime: {evaluation.runtime}"
+
     def format_trajectory(self, task: KernelBenchTask, solution: KernelBenchSolution, evaluation: KernelBenchEvaluationResult) -> str:
-        return f"Task: \n{task.task_description}\n\nKernel: \n{solution.solution_code} \n\nEvaluation: {evaluation.correctness} \n\nRuntime: {evaluation.runtime} \n\nMetadata: {evaluation.metadata}"
+        return f"Task: \n{task.task_description}\n\n{self.format_solution(solution, evaluation)}"
 
     def analyze(self, trace: KernelBenchTraces) -> dict:
         hardware = getattr(self.config, "hardware", "A6000_babel")

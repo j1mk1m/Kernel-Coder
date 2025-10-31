@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-@dataclass
+@dataclass(frozen=True)
 class Task:
     task_id: str
 
@@ -35,6 +35,12 @@ class Traces:
     def load(self, path):
         pass
     
+    def get_solution(self, solution_id: str) -> Solution:
+        solutions = [solution for solution in self.solutions if solution.solution_id == solution_id]
+        if len(solutions) == 0:
+            raise ValueError(f"Solution {solution_id} not found")
+        return solutions[0]
+    
     def get_solutions(self, task_id: str) -> List[Solution]:
         return [solution for solution in self.solutions if solution.task_id == task_id]
     
@@ -42,7 +48,10 @@ class Traces:
         return [evaluation for evaluation in self.evaluations if evaluation.task_id == task_id]
     
     def get_evaluation(self, task_id: str, solution_id: str) -> EvaluationResult:
-        return [evaluation for evaluation in self.evaluations if evaluation.task_id == task_id and evaluation.solution_id == solution_id]
+        evaluations = [evaluation for evaluation in self.evaluations if evaluation.task_id == task_id and evaluation.solution_id == solution_id]
+        if len(evaluations) == 0:
+            return None
+        return evaluations[0]
 
     def check_for_solution(self, solution_id: str) -> bool:
         return any(solution.solution_id == solution_id for solution in self.solutions)
@@ -75,6 +84,13 @@ class Benchmark:
     def evaluate_solution(self, traces: Traces) -> Traces:
         """
         For every solution in the trace, evaluate and return updated trace
+        """
+        pass
+
+    def format_solution(self, solution: Solution, evaluation: EvaluationResult) -> str:
+        """
+        Get a string representation of the solution (solution, evaluation result)
+        This can be used to extract memory or rules
         """
         pass
 

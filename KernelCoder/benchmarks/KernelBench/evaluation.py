@@ -19,7 +19,7 @@ import yaml
 from dataclasses import dataclass
 import ast
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 EXTERNAL = os.path.join(REPO_ROOT, "external")
 KERNEL_EVAL_BUILD_DIR = os.path.join(REPO_ROOT, "cache")
 sys.path.append(REPO_ROOT)

@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --partition general
 #SBATCH --time 0-23:00 # set time
-#SBATCH --job-name=test
+#SBATCH --job-name=tts_base
 #SBATCH --chdir=/home/gyeongwk/Kernel-Coder # working directory
 
-#SBATCH --gres=gpu:A6000:2
+#SBATCH --gres=gpu:A6000:1
 #SBATCH --mem=64GB
 #SBATCH --cpus-per-task=8 # cpus
 
@@ -15,9 +15,7 @@
 
 source ~/anaconda3/etc/profile.d/conda.sh
 
-export LLM_API_KEY="T5RSn/6GkE0dlna5I/I4P/g/RkmAF0mnH7j5/0fs"
-
 source ~/.bashrc
 conda activate kernel
 
-bash scripts/test_time_scaling.sh
+bash scripts/test_time_scaling_base.sh

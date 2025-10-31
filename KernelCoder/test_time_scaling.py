@@ -42,28 +42,18 @@ from configs import parse_test_time_scaling_args
 from benchmarks import get_benchmark
 
 
-def _batched_generate(config, benchmark, traces, items, llm_client, use_refinement: bool = False):
+def _batched_generate(config, benchmark, traces, items, llm_client):
     """
     Generate solutions in parallel for a batch of (task, solution_name) pairs.
     items: List[Tuple[Task, str]]
     """
     # Prepare prompts
-    prompts = []
-    for task, sol_name in items:
-        if use_refinement:
-            prompt = benchmark.get_refinement_prompt(task, traces)
-        else:
-            prompt = benchmark.get_prompt(task)
-        with open(os.path.join(benchmark.run_dir, f"{sol_name}_prompt.txt"), "w") as f:
-            f.write(prompt)
-        prompts.append(prompt)
+    prompts = [prompt for _, _, prompt in items]
 
     # Parallel LLM calls (I/O-bound -> threads are fine and avoid pickling issues)
     def _infer(prompt: str):
         try:
             response = llm_client.text_completion(prompt)["choices"][0]["text"]
-            with open(os.path.join(benchmark.run_dir, f"{sol_name}_response.txt"), "w") as f:
-                f.write(response if response is not None else "Failed to generate response")
             return response
         except Exception as e:
             logger.error(f"Error generating solution: {e}")
@@ -74,7 +64,9 @@ def _batched_generate(config, benchmark, traces, items, llm_client, use_refineme
         responses = pool.map(_infer, prompts)
 
     # Parse and add to traces
-    for (task, sol_name), response in zip(items, responses):
+    for (task, sol_name, prompt), response in zip(items, responses):
+        with open(os.path.join(benchmark.run_dir, f"{sol_name}_response.txt"), "w") as f:
+            f.write(response if response is not None else "Failed to generate response")
         solution = benchmark.parse_solution(task.task_id, sol_name, response)
         traces.add_solution(solution)
 
@@ -89,16 +81,15 @@ def base(config, benchmark, dataset, trace_cls, llm_client):
     for task in dataset:
         sol_name = f"{task.task_id}_solution_0"
         if not traces.check_for_solution(sol_name):
-            items.append((task, sol_name))
+            items.append((task, sol_name, benchmark.get_prompt(task)))
 
     if items:
-        _batched_generate(config, benchmark, traces, items, llm_client, use_refinement=False)
+        _batched_generate(config, benchmark, traces, items, llm_client)
     
     traces = benchmark.evaluate_solution(traces)
     metrics = benchmark.analyze(traces)
     
 
-# TODO: implement
 def best_of_n(config, benchmark, dataset, trace_cls, llm_client):
     """
     Best-of-N approach
@@ -112,10 +103,10 @@ def best_of_n(config, benchmark, dataset, trace_cls, llm_client):
         for sample_id in range(config.num_parallel):
             sol_name = f"{task.task_id}_solution_{sample_id}"
             if not traces.check_for_solution(sol_name):
-                items.append((task, sol_name))
+                items.append((task, sol_name, benchmark.get_prompt(task)))
 
     if items:
-        _batched_generate(config, benchmark, traces, items, llm_client, use_refinement=False)
+        _batched_generate(config, benchmark, traces, items, llm_client)
 
     traces = benchmark.evaluate_solution(traces)
     metrics = benchmark.analyze(traces)
@@ -136,10 +127,11 @@ def iterative_refinement(config, benchmark, dataset, trace_cls, llm_client):
             for sample_id in range(config.num_parallel):
                 sol_name = f"{task.task_id}_solution_{sample_id + iteration * config.num_parallel}"
                 if not traces.check_for_solution(sol_name):
-                    items.append((task, sol_name))
+                    prompt = benchmark.get_prompt(task) if iteration == 0 else benchmark.get_refinement_prompt(task, traces)
+                    items.append((task, sol_name, prompt))
 
         if items:
-            _batched_generate(config, benchmark, traces, items, llm_client, use_refinement=True)
+            _batched_generate(config, benchmark, traces, items, llm_client)
 
         # Evaluate after each iteration to inform subsequent refinement rounds
         traces = benchmark.evaluate_solution(traces)

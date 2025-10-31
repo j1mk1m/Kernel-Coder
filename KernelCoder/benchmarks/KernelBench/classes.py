@@ -5,7 +5,7 @@ import json
 
 from KernelCoder.benchmarks.benchmark import Task, Solution, EvaluationResult, Traces
 
-@dataclass
+@dataclass(frozen=True)
 class KernelBenchTask(Task):
     task_id: str
     level: int
