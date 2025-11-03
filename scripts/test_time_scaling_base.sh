@@ -9,3 +9,5 @@ python KernelCoder/test_time_scaling.py \
     --temperature 0.7 \
     --hardware A6000_babel \
     --num_eval_devices 1 \
+    --num_cpu_workers 16
+

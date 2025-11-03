@@ -1,8 +1,6 @@
 import argparse
 import os
 
-REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 
 def add_inference_args(parser, rl_training=False):
     parser.add_argument("--server_type", type=str, default="vllm")
@@ -30,7 +28,7 @@ def add_kernelbench_args(parser):
     parser.add_argument("--gpu_arch", type=str, default="Ampere") # GPU architecture: make sure matches hardware type
     parser.add_argument("--num_eval_devices", type=int, default=1) # number of GPUs used for evaluation
 
-    parser.add_argument("--build_cache_with_cpu", type=bool, default=True)
+    parser.add_argument("--build_cache_with_cpu", type=bool, default=False)
     parser.add_argument("--num_cpu_workers", type=int, default=1)
 
     parser.add_argument("--num_correct_trials", type=int, default=5)
@@ -84,14 +82,15 @@ def parse_main_args():
     parser.add_argument("--memory", type=str, default="memory")
     parser.add_argument("--memory_model_name", type=str, default="anthropic/claude-haiku-4-5-20251001")
     parser.add_argument("--memory_embedding_model_name", type=str, default="voyage/voyage-3-large")
+    add_evolrule_args(parser)
 
     # Training
     parser.add_argument("--num_epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=1)
 
     # Test-time Scaling 
-    parser.add_argument("--num_parallel", type=int, default=8)
-    parser.add_argument("--num_iterations", type=int, default=4)
+    parser.add_argument("--num_parallel", type=int, default=1)
+    parser.add_argument("--num_iterations", type=int, default=1)
  
     # Inference Server
     parser.add_argument("--model_name", type=str, default="anthropic/claude-haiku-4-5-20251001")
@@ -101,6 +100,12 @@ def parse_main_args():
     parser.add_argument("--test", action="store_true")
 
     args = parser.parse_args()
+    if args.num_parallel > 1:
+        args.method = "best-of-N"
+    elif args.num_iterations > 1:
+        args.method = "iterative refinement"
+    else:
+        args.method = "base"
     return args
 
 

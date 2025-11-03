@@ -98,17 +98,18 @@ def best_of_n(config, benchmark, dataset, trace_cls, llm_client):
     traces = trace_cls(dataset, benchmark.run_dir)
     
     # Build batch of generation items across all tasks and samples
-    items = []
-    for task in dataset:
-        for sample_id in range(config.num_parallel):
+    for sample_id in range(config.num_parallel):
+        items = []
+        for task in dataset:
             sol_name = f"{task.task_id}_solution_{sample_id}"
             if not traces.check_for_solution(sol_name):
                 items.append((task, sol_name, benchmark.get_prompt(task)))
 
-    if items:
-        _batched_generate(config, benchmark, traces, items, llm_client)
+        if items:
+            _batched_generate(config, benchmark, traces, items, llm_client)
 
-    traces = benchmark.evaluate_solution(traces)
+        traces = benchmark.evaluate_solution(traces)
+
     metrics = benchmark.analyze(traces)
 
 
@@ -179,4 +180,5 @@ if __name__ == "__main__":
     benchmark, train_dataset, eval_dataset, trace_cls = get_benchmark(config, run_dir, llm_client)
 
     test_time_scaling(config, run_dir, benchmark, eval_dataset, trace_cls, llm_client)
+    llm_client.save_usage_data()
 

@@ -10,7 +10,8 @@ import os
 import random
 from external.KernelBench.src.utils import read_file, read_json_file, WorkArgs
 from external.KernelBench.src.run_utils import fetch_kernel_from_disk, fetch_eval_results_for_problem, fetch_eval_result_from_disk
-from external.KernelBench.src.eval import KernelExecResult
+
+from KernelCoder.benchmarks.KernelBench.classes import KernelBenchEvaluationResult
 
 REPO_TOP_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 KB_ROOT = os.path.join(REPO_TOP_PATH, "external", "KernelBench")
@@ -160,7 +161,7 @@ def prompt_base(ref_arch_src: str, triton=False, context=None) -> str:
 
 
 def exec_result_to_exeution_feedback(exec_result: dict) -> str:
-    if isinstance(exec_result, KernelExecResult):
+    if isinstance(exec_result, KernelBenchEvaluationResult):
         metadata = exec_result.metadata
         correctness = exec_result.correctness
         runtime = exec_result.runtime
@@ -193,7 +194,7 @@ Here is your wall clock time: {runtime} milliseconds.
     return evaluation_feedback
  
 
-def prompt_refinement_from_last_kernel(ref_arch_src: str, last_kernel_src: str, last_exec_result: KernelExecResult, triton=False, context=None) -> str:
+def prompt_refinement_from_last_kernel(ref_arch_src: str, last_kernel_src: str, last_exec_result: KernelBenchEvaluationResult, triton=False, context=None) -> str:
     prompt = prompt_base(ref_arch_src, triton=triton, context=context)
     execution_feedback = exec_result_to_exeution_feedback(last_exec_result)
 
@@ -210,7 +211,7 @@ Your generated architecture ModelNew and kernel was evaluated on GPU and checked
     return prompt
 
 
-def prompt_refinement_from_history(ref_arch_src: str, history: list[tuple[str, KernelExecResult]], triton=False, rule_path=None) -> str:
+def prompt_refinement_from_history(ref_arch_src: str, history: list[tuple[str, KernelBenchEvaluationResult]], triton=False, rule_path=None) -> str:
     prompt = prompt_base(ref_arch_src, triton, rule_path)
 
     for kernel_src, exec_result in history:
@@ -230,7 +231,7 @@ Your generated architecture ModelNew and kernel was evaluated on GPU and checked
     return prompt
 
 
-def prompt_idea_generation(ref_arc_src: str, config, last_kernel_src: str, last_exec_result: KernelExecResult, triton=False) -> str:
+def prompt_idea_generation(ref_arc_src: str, config, last_kernel_src: str, last_exec_result: KernelBenchEvaluationResult, triton=False) -> str:
     prompt = prompt_main(ref_arc_src, config, triton)
     execution_feedback = exec_result_to_exeution_feedback(last_exec_result)
 
@@ -246,7 +247,7 @@ Your generated architecture ModelNew and kernel was evaluated on GPU and checked
     prompt += "Generate an idea for how to improve the kernel. Please do not output code yet, just the idea."
     return prompt
 
-def prompt_refinement_from_idea(ref_arc_src: str, config, last_kernel_src: str, last_exec_result: KernelExecResult, idea: str, triton=False) -> str:
+def prompt_refinement_from_idea(ref_arc_src: str, config, last_kernel_src: str, last_exec_result: KernelBenchEvaluationResult, idea: str, triton=False) -> str:
     prompt = prompt_main(ref_arc_src, config, triton)
     execution_feedback = exec_result_to_exeution_feedback(last_exec_result)
 

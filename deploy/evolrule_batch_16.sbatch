@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition preempt
-#SBATCH --time 1-23:59 # set time
-#SBATCH --job-name=reasoning_bank
+#SBATCH --time 0-23:00 # set time
+#SBATCH --job-name=evolrule
 #SBATCH --chdir=/home/gyeongwk/Kernel-Coder # working directory
 
 #SBATCH --gres=gpu:A6000:4
@@ -18,4 +18,4 @@ source ~/anaconda3/etc/profile.d/conda.sh
 source ~/.bashrc
 conda activate kernel
 
-bash scripts/reasoning_bank_parallel.sh
+bash scripts/evolrule_batch_16.sh

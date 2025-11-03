@@ -7,7 +7,11 @@ python KernelCoder/main.py \
     --num_iterations 1 \
     --server_type litellm \
     --model_name anthropic/claude-sonnet-4-5-20250929 \
+    --memory_model_name anthropic/claude-sonnet-4-5-20250929 \
+    --memory_embedding_model_name gemini/gemini-embedding-001 \
+    --memory memory \
     --max_tokens 8192 \
     --temperature 0.7 \
     --hardware A6000_babel \
-    --num_eval_devices 4
+    --num_eval_devices 4 \
+    --num_cpu_workers 16

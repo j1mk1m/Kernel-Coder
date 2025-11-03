@@ -23,6 +23,19 @@ class KernelBenchEvaluationResult(EvaluationResult):
     runtime: float = -1.0
     runtime_stats: dict = field(default_factory=list)
 
+    def __gt__(self, other):
+        if isinstance(other, KernelBenchEvaluationResult):
+            if self.correctness and not other.correctness:
+                return True
+            elif not self.correctness and other.correctness:
+                return False
+            elif self.runtime != -1.0 and other.runtime != -1.0:
+                return self.runtime < other.runtime
+            else:
+                return False
+        return False
+
+
 
 @dataclass
 class KernelBenchSolution(Solution):
