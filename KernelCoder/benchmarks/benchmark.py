@@ -64,13 +64,14 @@ class Traces:
 
 
 class Benchmark:
-    def __init__(self, name: str, run_dir, llm_client: callable):
+    def __init__(self, name: str, run_dir, llm_client, config):
         """
         Benchmark setup
         """
         self.name = name
         self.run_dir = run_dir
         self.llm_client = llm_client
+        self.config = config
     
     def get_prompt(self, task: Task, context:str=None) -> str:
         pass
@@ -78,7 +79,7 @@ class Benchmark:
     def get_refinement_prompt(self, task: Task, trace: Traces, context:str=None) -> str:
         pass
 
-    def parse_solution(self, task_id: str, solution_id: str, response: str) -> Solution:
+    def parse_solution(self, task, solution_id: str, response: str) -> Solution:
         pass
 
     def evaluate_solution(self, traces: Traces) -> Traces:

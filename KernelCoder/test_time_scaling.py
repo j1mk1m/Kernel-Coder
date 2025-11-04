@@ -67,7 +67,7 @@ def _batched_generate(config, benchmark, traces, items, llm_client):
     for (task, sol_name, prompt), response in zip(items, responses):
         with open(os.path.join(benchmark.run_dir, f"{sol_name}_response.txt"), "w") as f:
             f.write(response if response is not None else "Failed to generate response")
-        solution = benchmark.parse_solution(task.task_id, sol_name, response)
+        solution = benchmark.parse_solution(task, sol_name, response)
         traces.add_solution(solution)
 
 

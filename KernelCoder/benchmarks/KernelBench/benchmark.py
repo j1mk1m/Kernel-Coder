@@ -20,7 +20,7 @@ from KernelCoder.benchmarks.KernelBench.classes import KernelBenchTask, KernelBe
 
 class KernelBenchBenchmark(Benchmark):
     def __init__(self, name, run_dir, llm_client, config):
-        super().__init__(name, run_dir, llm_client)
+        super().__init__(name, run_dir, llm_client, config)
 
         # Check if CUDA is available
         if not torch.cuda.is_available():
@@ -41,7 +41,8 @@ class KernelBenchBenchmark(Benchmark):
     def get_refinement_prompt(self, task: KernelBenchTask, trace: KernelBenchTraces, context: str=None) -> str:
         return get_refinement_prompt(task.task_id, task.task_description, trace, self.config, self.run_dir, context=context)
 
-    def parse_solution(self, task_id, solution_id: str, response: str) -> KernelBenchSolution:
+    def parse_solution(self, task, solution_id: str, response: str) -> KernelBenchSolution:
+        task_id = task.task_id
         if response is None:
             response = ""
         solution_code = extract_last_code(response, ["python", "cpp"])
