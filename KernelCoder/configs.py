@@ -40,7 +40,7 @@ def add_kernelbench_args(parser):
 def add_evolrule_args(parser):
     parser.add_argument("--autorule_num_samples_per_problem", type=int, default=1)
     parser.add_argument("--autorule_sample_best_and_worst", type=bool, default=True)
-    parser.add_argument("--autorule_num_alignment_samples", type=int, default=50)
+    parser.add_argument("--autorule_num_alignment_samples", type=int, default=20)
     parser.add_argument("--autorule_total_validation_limit", type=int, default=200)
     parser.add_argument("--autorule_alignment_threshold", type=float, default=0.70)
 

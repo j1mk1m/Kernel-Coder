@@ -5,6 +5,7 @@ import os
 import json
 import numpy as np
 import hashlib
+import random
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -232,7 +233,7 @@ Solution:
         full_prompt = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
 
         try:
-            response = self.llm_client.chat_completion(full_prompt)["choices"][0]["message"]["content"]
+            response = self.llm_client.chat_completion(full_prompt, tag="memory_extraction")["choices"][0]["message"]["content"]
 
             entries = self._process_response_into_memory_items(response)
             memory_path = os.path.join(self.run_dir, f"{task.task_id}_epoch_{epoch}_memory.json")
@@ -279,7 +280,7 @@ Problem:
         
         full_prompt = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
 
-        response = self.llm_client.chat_completion(full_prompt)["choices"][0]["message"]["content"]
+        response = self.llm_client.chat_completion(full_prompt, tag="memory_extraction")["choices"][0]["message"]["content"]
 
         entries = self._process_response_into_memory_items(response)
 
@@ -311,7 +312,7 @@ class Rules(KnowledgeBase):
     Kernel:
     {kernel_src}
     """
-        response = self.llm_client.text_completion(prompt)
+        response = self.llm_client.text_completion(prompt, tag="rule_alignment")
         response = response["choices"][0]["text"]
         return "Yes" in response
 
@@ -334,7 +335,7 @@ Task description:
 Solutions:
 {traj_string}
     """
-                response = self.llm_client.text_completion(prompt)["choices"][0]["text"]
+                response = self.llm_client.text_completion(prompt, tag="rule_extraction")["choices"][0]["text"]
                 with open(file_path, "w") as f:
                     f.write(response)
 
@@ -349,13 +350,13 @@ Example 2:
 - The kernel uses shared memory tiling to reduce global memory access.
 Example 3:
 - The kernel uses thread block sizes that are multiples of warp size (32).
-Return the list as a JSON array of strings. Do not use ``json``, just output the JSON array directly. If there are no rule-like statements, return an empty JSON array
+Return the list as a JSON array of strings. Do not use ``json``, just output the JSON array directly. If there are no rule-like statements, return an empty JSON array. List at most 3 rules.
 
 [Reasoning]
 {response}
 """
 
-                response = self.llm_client.text_completion(prompt)["choices"][0]["text"]
+                response = self.llm_client.text_completion(prompt, tag="rule_extraction")["choices"][0]["text"]
                 with open(file_path, "w") as f:
                     f.write(response)
 
@@ -385,7 +386,7 @@ Return the merged list as a JSON array of strings. Do not use ``json``, just out
 [Rules]
 {rules_str}
 """
-            rule_response = self.llm_client.text_completion(prompt, max_tokens=16384)
+            rule_response = self.llm_client.text_completion(prompt, max_tokens=16384, tag="rule_merging")
             rule_response = rule_response["choices"][0]["text"]
             with open(file_path, "w") as f:
                 f.write(rule_response)
@@ -416,7 +417,10 @@ Return the merged list as a JSON array of strings. Do not use ``json``, just out
             if os.path.exists(os.path.join(alignment_dir, f"rule_{rule_num}_alignment.json")):
                 result = json.load(open(os.path.join(alignment_dir, f"rule_{rule_num}_alignment.json")))
             else:
-                for task, trajectory in trajectories.items():
+                tmp_trajectories = list(trajectories.items())
+                if len(tmp_trajectories) > self.config.autorule_num_alignment_samples:
+                    tmp_trajectories = random.sample(tmp_trajectories, self.config.autorule_num_alignment_samples)
+                for task, trajectory in tmp_trajectories:
                     rule_satisfied = []
                     for (s, e, t) in trajectory:
                         satisfied = self._rule_is_satisfied(rule, s.solution_code)
@@ -456,6 +460,7 @@ Return the merged list as a JSON array of strings. Do not use ``json``, just out
             json.dump(filtered_rules, f, indent=2)
 
         self.rules.extend(filtered_rules)
+        self.llm_client.save_usage_data()
 
 
 def get_memory(config, run_dir: str):
