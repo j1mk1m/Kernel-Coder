@@ -4,7 +4,7 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 
-REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 PLOT_DIR = os.path.join(REPO_TOP_DIR, "plots")
 RUNS_DIR = os.path.join(REPO_TOP_DIR, "runs")
 
@@ -232,6 +232,82 @@ def plot_everything(metrics_by_label, metrics_by_label_by_sample, axis, name, pl
 
 
 def main():
+    parser = ArgumentParser()
+    parser.add_argument("--metrics_files", type=str, nargs="+", required=True, 
+                       help="List of paths to metrics.json files")
+    parser.add_argument("--labels", type=str, nargs="+", default=None,
+                       help="Optional list of labels for each metrics file (if not provided, will prompt)")
+    parser.add_argument("--name", type=str, default="Comparison",
+                       help="Name for the analysis (used in plot titles and directory)")
+    parser.add_argument("--plot_dir", type=str, default=None,
+                       help="Directory to save plots (default: plots/comparison/{name})")
+    parser.add_argument("--axis", type=str, default="Method",
+                       help="Axis label for plots (e.g., 'Method', 'Level', 'Model')")
+    args = parser.parse_args()
+
+    metrics_files = args.metrics_files
+    labels = args.labels if args.labels else []
+    
+    # Prompt for labels if not provided
+    if len(labels) < len(metrics_files):
+        print(f"\nPlease provide labels for {len(metrics_files)} metrics files:")
+        for i, metrics_file in enumerate(metrics_files):
+            if i < len(labels):
+                print(f"  {i+1}. {metrics_file} -> {labels[i]}")
+            else:
+                label = input(f"  {i+1}. {metrics_file} -> Label: ").strip()
+                labels.append(label)
+    
+    # Load metrics from each file
+    metrics_by_label = {}  # dict of label -> metrics
+    metrics_by_label_by_sample = {}  # dict of label -> num_samples -> metrics
+    
+    for metrics_file, label in zip(metrics_files, labels):
+        if not os.path.exists(metrics_file):
+            print(f"Warning: Metrics file {metrics_file} does not exist, skipping...")
+            continue
+        
+        print(f"Loading metrics from {metrics_file} with label '{label}'...")
+        with open(metrics_file, "r") as f:
+            metrics = json.load(f)
+        
+        # Handle best_by_sample structure if present
+        if isinstance(metrics, dict) and "best_by_sample" in metrics:
+            metrics = metrics["best_by_sample"]
+        
+        # Check if this is a test-time scaling method (has numeric keys)
+        if isinstance(metrics, dict) and any(k.isdigit() for k in metrics.keys()):
+            # Get the metrics for the maximum number of samples
+            numeric_keys = [k for k in metrics.keys() if k.isdigit()]
+            if numeric_keys:
+                max_sample_key = str(max(list(map(int, numeric_keys))))
+                metrics_by_label[label] = metrics[max_sample_key]
+                metrics_by_label_by_sample[label] = metrics
+            else:
+                # Fallback: use the metrics as-is
+                metrics_by_label[label] = metrics
+        else:
+            # Regular metrics structure
+            metrics_by_label[label] = metrics
+    
+    if not metrics_by_label:
+        print("Error: No valid metrics loaded. Exiting.")
+        return
+    
+    # Set up plot directory
+    if args.plot_dir:
+        plot_dir = args.plot_dir
+    else:
+        plot_dir = os.path.join(PLOT_DIR, "comparison", args.name)
+    
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    print(f"\nGenerating plots in {plot_dir}...")
+    plot_everything(metrics_by_label, metrics_by_label_by_sample, args.axis, args.name, plot_dir)
+    print(f"Plots saved to {plot_dir}")
+
+
+def main_deprecated():
     # Code to get failure modes
     parser = ArgumentParser()
     parser.add_argument("--axis", type=str, choices=["method", "level", "model"], required=True, help="Axis to plot")
@@ -338,75 +414,6 @@ def main():
     plot_everything(metrics_by_label, metrics_by_label_by_sample, args.axis, name, plot_dir)
 
 
-def sft_analysis_across_epochs():
-    epochs = [4, 10, 20, 30, 40, 50]
-
-    metrics_by_level = {}
-
-    for level in [1, 2]:
-        metrics_by_epoch = {}
-
-        run_dir = os.path.join(RUNS_DIR, f"base_level{level}_Qwen2.5-7B-Instruct")
-        metrics = load_metrics(run_dir)
-        metrics_by_epoch[0] = metrics
-
-        for epoch in epochs:
-            run_dir = os.path.join(RUNS_DIR, f"base_level{level}_Qwen2.5-7B-Instruct-SFT1-{epoch}")
-            if not os.path.exists(os.path.join(run_dir, "metrics.json")):
-                print(f'Run directory {run_dir} does not exist or does not have metrics.json')
-                continue
-            metrics = load_metrics(run_dir)
-            metrics_by_epoch[epoch] = metrics
-
-        metrics_by_level[f"Level {level}"] = metrics_by_epoch
-    
-    plot_dir = os.path.join(PLOT_DIR, "sft_analysis", "SFT1")
-    os.makedirs(plot_dir, exist_ok=True)
-    plot_fast_p_by_epochs(metrics_by_level, p="0.0", name="SFT1", plot_dir=plot_dir)
-    plot_fast_p_by_epochs(metrics_by_level, p="1.0", name="SFT1", plot_dir=plot_dir)
-
-
-def sft_analysis_across_datasets():
-    for level in [1, 2]:
-        metrics_by_dataset = {}
-        for dataset in ["SFT1", "SFT2", "SFT3", "SFT4"]:
-            run_dir = os.path.join(RUNS_DIR, f"base_level{level}_Qwen2.5-7B-Instruct-{dataset}-40")
-            if not os.path.exists(os.path.join(run_dir, "metrics.json")):
-                print(f'Run directory {run_dir} does not exist or does not have metrics.json')
-                continue
-            metrics = load_metrics(run_dir)
-            metrics_by_dataset[dataset] = metrics
-
-        plot_dir = os.path.join(PLOT_DIR, "sft_analysis", f"level{level}")
-        os.makedirs(plot_dir, exist_ok=True)
-        plot_fast_p_barchart(metrics_by_dataset, p="0.0", axis="Dataset", name=f"Level {level}", plot_dir=plot_dir)
-        plot_fast_p_barchart(metrics_by_dataset, p="1.0", axis="Dataset", name=f"Level {level}", plot_dir=plot_dir)
-
-
-def grpo_analysis_across_epochs():
-    steps = [22, 44, 66, 88]
-
-    metrics_by_level = {}
-
-    for level in [1, 2]:
-        metrics_by_step = {}
-        metrics_by_step[0] = load_metrics(os.path.join(RUNS_DIR, "runs_SFT", f"base_level{level}_Qwen2.5-7B-Instruct-SFT3-40"))
-        for epoch, step in enumerate(steps):
-            run_dir = os.path.join(RUNS_DIR, f"base_level{level}_Qwen2.5-7B-Instruct-GRPO-step{step}")
-            if not os.path.exists(os.path.join(run_dir, "metrics.json")):
-                print(f'Run directory {run_dir} does not exist or does not have metrics.json')
-                continue
-            metrics = load_metrics(run_dir)
-            metrics_by_step[epoch + 1] = metrics
-
-        metrics_by_level[f"Level {level}"] = metrics_by_step
-
-    plot_dir = os.path.join(PLOT_DIR, "grpo_analysis")
-    os.makedirs(plot_dir, exist_ok=True)
-    plot_fast_p_by_epochs(metrics_by_level, p="0.0", name="GRPO", plot_dir=plot_dir)
-    plot_fast_p_by_epochs(metrics_by_level, p="1.0", name="GRPO", plot_dir=plot_dir)
-
-
 def evolrule_analysis_across_epochs():
     parser = ArgumentParser()
     parser.add_argument("--base_run_dir", type=str, required=True)
@@ -435,8 +442,6 @@ def evolrule_analysis_across_epochs():
 
 
 if __name__ == "__main__":
-    # main()
-    # grpo_analysis_across_epochs()
-    evolrule_analysis_across_epochs()
+    main()
 
 

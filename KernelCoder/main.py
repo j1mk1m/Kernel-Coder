@@ -30,10 +30,11 @@ from configs import parse_main_args
 
 def main_loop(config, llm_client, memory, benchmark, dataset, trace_cls, train=True):
     traces = trace_cls(dataset, benchmark.run_dir)
+    batch_size = config.batch_size if train else 250
 
     for i in range(config.num_epochs):
-        for t in range(0, len(dataset), config.batch_size):
-            tasks: List[Task] = dataset[t:t+config.batch_size]
+        for t in range(0, len(dataset), batch_size):
+            tasks: List[Task] = dataset[t:t+batch_size]
             # Roll out batch : test time scaling
             for iteration in range(config.num_iterations):
                 items = []

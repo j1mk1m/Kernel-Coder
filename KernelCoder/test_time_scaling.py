@@ -53,7 +53,7 @@ def _batched_generate(config, benchmark, traces, items, llm_client):
     # Parallel LLM calls (I/O-bound -> threads are fine and avoid pickling issues)
     def _infer(prompt: str):
         try:
-            response = llm_client.text_completion(prompt)["choices"][0]["text"]
+            response = llm_client.text_completion(prompt, tag="kernel_generation")["choices"][0]["text"]
             return response
         except Exception as e:
             logger.error(f"Error generating solution: {e}")
