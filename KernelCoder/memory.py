@@ -21,7 +21,7 @@ class KnowledgeBase:
     def retrieve(self, query):
         pass
 
-    def extract(self, trajectories: dict[Task, List[Tuple[Solution, EvaluationResult, str]]], **kwargs) -> None:
+    def extract(self, trajectories: dict[Task, List[Tuple[Task, Solution, EvaluationResult, str]]], **kwargs) -> None:
         pass
 
 
