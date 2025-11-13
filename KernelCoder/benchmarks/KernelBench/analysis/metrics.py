@@ -299,9 +299,13 @@ def parse_evaluation_id(evaluation_id: str) -> Tuple[int, int, int]:
     """
     m = re.match(r"level_(\d+)_problem_(\d+)_solution_(\d+)", evaluation_id)
     if not m:
-        raise ValueError(f"Invalid evaluation_id format: {evaluation_id}")
+        m = re.match(r"level_(\d+)_problem_(\d+)_sample_(\d+)", evaluation_id)
+        if not m:
+            m = re.match(r"level_(\d+)_problem_(\d+)_epoch_(\d+)_sample_(\d+)", evaluation_id)
+            if not m:
+                raise ValueError(f"Invalid evaluation_id format: {evaluation_id}")
+            return int(m.group(1)), int(m.group(2)), int(m.group(4))
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
-
 
 def build_unified_eval_results_from_traces(traces: KernelBenchTraces) -> Dict[str, Dict[str, dict]]:
     """

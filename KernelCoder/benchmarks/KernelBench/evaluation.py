@@ -21,7 +21,7 @@ import ast
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 EXTERNAL = os.path.join(REPO_ROOT, "external")
-KERNEL_EVAL_BUILD_DIR = os.path.join(REPO_ROOT, "cache")
+KERNEL_EVAL_BUILD_DIR = "/data/user_data/gyeongwk/Kernel-Coder/cache"
 sys.path.append(REPO_ROOT)
 sys.path.append(EXTERNAL)
 

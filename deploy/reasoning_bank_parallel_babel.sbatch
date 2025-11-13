@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --partition general
-#SBATCH --time 0-23:00 # set time
+#SBATCH --partition preempt
+#SBATCH --time 1-23:59 # set time
 #SBATCH --job-name=reasoning_bank
 #SBATCH --chdir=/home/gyeongwk/Kernel-Coder # working directory
 

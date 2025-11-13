@@ -1,0 +1,17 @@
+python KernelCoder/main.py \
+    --run_name evolrule_parallel_4_batch_all \
+    --benchmark KernelBench \
+    --num_epochs 1 \
+    --batch_size 250 \
+    --num_parallel 4 \
+    --num_iterations 1 \
+    --server_type litellm \
+    --model_name anthropic/claude-sonnet-4-5-20250929 \
+    --memory_model_name anthropic/claude-sonnet-4-5-20250929 \
+    --memory rules \
+    --autorule_alignment_threshold 0.7 \
+    --max_tokens 8192 \
+    --temperature 0.7 \
+    --hardware A6000_babel \
+    --num_eval_devices 4 \
+    --num_cpu_workers 16
