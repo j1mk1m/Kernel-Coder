@@ -38,6 +38,8 @@ from KernelBench.src.dataset import construct_kernelbench_dataset, fetch_ref_arc
 
 # Local imports
 from KernelCoder.benchmarks.benchmark import Task, Traces
+from KernelCoder.benchmarks.KernelBench.benchmark import KernelBenchBenchmark, KernelBenchTraces
+from KernelCoder.benchmarks.KernelBench.dataset import KernelBenchDataset
 from configs import parse_test_time_scaling_args 
 from benchmarks import get_benchmark
 
@@ -48,12 +50,23 @@ def _batched_generate(config, benchmark, traces, items, llm_client):
     items: List[Tuple[Task, str]]
     """
     # Prepare prompts
+    sol_names = [sol_name for _, sol_name, _ in items]
     prompts = [prompt for _, _, prompt in items]
 
     # Parallel LLM calls (I/O-bound -> threads are fine and avoid pickling issues)
-    def _infer(prompt: str):
+    def _infer(item):
+        sol_name, prompt = item
         try:
-            response = llm_client.text_completion(prompt, tag="kernel_generation")["choices"][0]["text"]
+            response_path = os.path.join(benchmark.run_dir, sol_name + "_response.txt")
+            if not os.path.exists(response_path):
+                response = llm_client.text_completion(prompt, tag="kernel_generation")
+                if response["choices"][0]["text"] is None:
+                    print(response)
+                response = response["choices"][0]["text"]
+                with open(response_path, "w") as f:
+                    f.write(response if response is not None else "Failed to generate response")
+            else:
+                response = open(response_path, "r").read()
             return response
         except Exception as e:
             logger.error(f"Error generating solution: {e}")
@@ -61,14 +74,13 @@ def _batched_generate(config, benchmark, traces, items, llm_client):
 
     num_workers = getattr(config, "request_workers", None) or min(32, len(prompts) or 1)
     with ThreadPool(num_workers) as pool:
-        responses = pool.map(_infer, prompts)
+        responses = pool.map(_infer, zip(sol_names, prompts))
 
     # Parse and add to traces
     for (task, sol_name, prompt), response in zip(items, responses):
-        with open(os.path.join(benchmark.run_dir, f"{sol_name}_response.txt"), "w") as f:
-            f.write(response if response is not None else "Failed to generate response")
         solution = benchmark.parse_solution(task, sol_name, response)
-        traces.add_solution(solution)
+        if solution is not None:
+            traces.add_solution(solution)
 
 
 def base(config, benchmark, dataset, trace_cls, llm_client):
@@ -177,8 +189,19 @@ if __name__ == "__main__":
                                    default_temperature=config.temperature,
                                    default_max_tokens=config.max_tokens)
     
-    benchmark, train_dataset, eval_dataset, trace_cls = get_benchmark(config, run_dir, llm_client)
+    if config.benchmark == "KernelBench":
+        for level in range(1, 4):
+            run_dir = os.path.join(RUNS_DIR, config.run_name + f"_level_{level}")
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, "config.yaml"), "w") as f:
+                yaml.dump(vars(config), f)
 
-    test_time_scaling(config, run_dir, benchmark, eval_dataset, trace_cls, llm_client)
-    llm_client.save_usage_data()
+            benchmark = KernelBenchBenchmark("KernelBench", run_dir, llm_client, config)
+            dataset = KernelBenchDataset(config, eval=True, level=level)
+            test_time_scaling(config, run_dir, benchmark, dataset, KernelBenchTraces, llm_client)
+            llm_client.save_usage_data()
+    else:
+        benchmark, train_dataset, eval_dataset, trace_cls = get_benchmark(config, run_dir, llm_client)
+        test_time_scaling(config, run_dir, benchmark, eval_dataset, trace_cls, llm_client)
+        llm_client.save_usage_data()
 

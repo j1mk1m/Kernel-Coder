@@ -41,8 +41,12 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import matplotlib
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+RUNS_DIR = os.path.join(REPO_ROOT, "runs")
+
 # ---------- Parsing helpers ----------
 
+AUTHORS = ["claude-opus-4-1", "gemini-2.5-pro", "gpt-5", "gpt-o3", "reasoningbank", "evolrule"]
 
 def load_author_map(path: Optional[str]) -> Dict[str, str]:
     if not path:
@@ -60,6 +64,9 @@ def infer_author_from_solution(solution: str) -> str:
     If none match, return the solution itself (treat solution as author).
     """
     s = str(solution)
+    for author in AUTHORS:
+        if author in s:
+            return author
     if "_" in s:
         return s.split("_", 1)[0]
     return s
@@ -190,19 +197,19 @@ def compute_ratios_by_author(
 
     for _gk, runs in groups.items():
         best_by_author = select_min_latency_per_author(runs)
-        print(best_by_author)
         if not best_by_author:
             continue
 
-        bl_author_eff, bl_lat = choose_baseline(best_by_author, baseline_author)
+        bl_author_eff, bl_lat = choose_baseline(best_by_author, "torch" if "gemm" in _gk[0] else baseline_author)
 
-        for author in {r.author for r in runs}:  # all authors who attempted
+        # for author in {r.author for r in runs}:  # all authors who attempted
+        for author, run in best_by_author.items():
             if author == bl_author_eff:
                 # skip the baseline author itself here
                 continue
             totals_by_author[author] += 1
 
-            run = best_by_author.get(author)
+            # run = best_by_author.get(author)
             if run is None or bl_lat <= 0 or run.latency_ms is None or run.latency_ms <= 0:
                 # author had no valid PASSED latency → always lose (no r recorded)
                 continue
@@ -394,6 +401,34 @@ def make_win_at_p_plot(
     else:
         plt.show()
 
+def get_baseline_runs() -> List[Run]:
+    paths = glob.glob(os.path.join(RUNS_DIR, "flashinfer_baseline", "**", "*.jsonl"))
+    return collect_runs(paths, {})
+
+
+def compute_metrics(runs: List[Run], output_path) -> dict:
+    baseline_runs = get_baseline_runs()
+    groups = group_runs_by_workload(baseline_runs + runs)
+    ratios_by_author, totals_by_author = compute_ratios_by_author(groups, "flashinfer")
+
+    p_grid = build_p_grid(ratios_by_author)
+
+    # Order authors by median r descending (optional, just to make tables nicer)
+    def median(x: List[float]) -> float:
+        if not x:
+            return 0.0
+        xs = sorted(x)
+        m = len(xs) // 2
+        return xs[m] if len(xs) % 2 else 0.5 * (xs[m - 1] + xs[m])
+
+    authors_order = sorted(
+        ratios_by_author.keys(), key=lambda a: median(ratios_by_author[a]), reverse=True
+    )
+
+    write_curves_csv(output_path, p_grid, ratios_by_author, totals_by_author, authors_order)
+
+    return {}
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -520,7 +555,7 @@ def main():
             ratios_by_author,
             totals_by_author,
             authors_order,
-            include=args.plot_authors,
+            include=args.plot_authors if args.plot_authors is not None else AUTHORS,
             top_k=args.plot_top,
             min_groups=args.plot_min_groups,
         )

@@ -6,10 +6,17 @@ from KernelCoder.benchmarks.KernelBench.benchmark import KernelBenchTask
 
 
 class KernelBenchDataset(Dataset):
-    def __init__(self, config, eval=False):
+    def __init__(self, config, eval=False, level=None):
         self.dataset = []
+
         if config.test:
             self.dataset = [KernelBenchTask(task_id=f"level_1_problem_{problem}", level=1, problem=problem, task_description=fetch_ref_arch_from_level_problem_id(1, problem, config.dataset_src)[0]) for problem in range(1, 3)] 
+        elif level is not None:
+            if level == 3:
+                count = 50
+            else:
+                count = 100
+            self.dataset = [KernelBenchTask(task_id=f"level_{level}_problem_{problem}", level=level, problem=problem, task_description=fetch_ref_arch_from_level_problem_id(level, problem, config.dataset_src)[0]) for problem in range(1, count+1)]
         elif eval:
             self.dataset.extend([KernelBenchTask(task_id=f"level_1_problem_{problem}", level=1, problem=problem, task_description=fetch_ref_arch_from_level_problem_id(1, problem, config.dataset_src)[0]) for problem in level1_representative_subset_problem_ids])
             self.dataset.extend([KernelBenchTask(task_id=f"level_2_problem_{problem}", level=2, problem=problem, task_description=fetch_ref_arch_from_level_problem_id(2, problem, config.dataset_src)[0]) for problem in level2_representative_subset_problem_ids])

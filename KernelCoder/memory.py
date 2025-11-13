@@ -105,11 +105,12 @@ class Memory(KnowledgeBase):
         answer = "Consider the following tips:" + "\n".join([self._memory_to_string(memory) for memory in relevant_memory])
         return answer
 
-    def extract(self, epoch: int, trajectories: dict[Task, List[Tuple[Solution, EvaluationResult, str]]], **kwargs) -> None:
+    def extract(self, epoch: int, trajectories: dict[str, List[Tuple[Task, Solution, EvaluationResult, str]]], **kwargs) -> None:
         logger.info(f"Extracting memory")
         assert len(trajectories) == 1, "Memory extraction only supports a single task at a time"
-        task, trajectories = list(trajectories.items())[0]
-        trajectories = [trajectory for solution, evaluation, trajectory in trajectories]
+        task_id, trajectories = list(trajectories.items())[0]
+        task = trajectories[0][0]
+        trajectories = [trajectory for _, solution, evaluation, trajectory in trajectories]
         memory_path = os.path.join(self.run_dir, f"{task.task_id}_epoch_{epoch}_memory.json")
         if os.path.exists(memory_path):
             print(f"Memory already exists for {task.task_id} at epoch {epoch}")
@@ -317,14 +318,15 @@ class Rules(KnowledgeBase):
         return "Yes" in response
 
 
-    def extract(self, epoch: int, trajectories: dict[Task, List[Tuple[Solution, EvaluationResult, str]]], batch_num=0, **kwargs) -> None:
+    def extract(self, epoch: int, trajectories: dict[str, List[Tuple[Task, Solution, EvaluationResult, str]]], batch_num=0, **kwargs) -> None:
         batch_dir = os.path.join(self.run_dir, f"epoch_{epoch}_batch_{batch_num}")
         os.makedirs(batch_dir, exist_ok=True)
         all_rules = []
         logger.info(f"Extracting rules for epoch {epoch} batch {batch_num}")
-        for task, trajectory in trajectories.items():
-            traj_string = "\n".join([t for s, e, t in trajectory])
-            file_path = os.path.join(batch_dir, f"{task.task_id}_comparative_analysis.txt")
+        for task_id, trajectory in trajectories.items():
+            task = trajectory[0][0]
+            traj_string = "\n".join([t for task, s, e, t in trajectory])
+            file_path = os.path.join(batch_dir, f"{task_id}_comparative_analysis.txt")
             if os.path.exists(file_path):
                 response = open(file_path, "r").read()
             else:
@@ -422,7 +424,7 @@ Return the merged list as a JSON array of strings. Do not use ``json``, just out
                     tmp_trajectories = random.sample(tmp_trajectories, self.config.autorule_num_alignment_samples)
                 for task, trajectory in tmp_trajectories:
                     rule_satisfied = []
-                    for (s, e, t) in trajectory:
+                    for (_, s, e, t) in trajectory:
                         satisfied = self._rule_is_satisfied(rule, s.solution_code)
                         rule_satisfied.append((s, e, t, satisfied))
                     

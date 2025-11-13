@@ -3,7 +3,7 @@ import os
 
 
 def add_inference_args(parser, rl_training=False):
-    parser.add_argument("--server_type", type=str, default="vllm")
+    parser.add_argument("--server_type", type=str, default="litellm")
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--vllm_host", type=str, default="localhost") # server_type is vllm
@@ -37,6 +37,12 @@ def add_kernelbench_args(parser):
     parser.add_argument("--measure_performance", type=bool, default=True)
 
 
+def add_flashinferbench_args(parser):
+    parser.add_argument("--base_traceset_path", type=str, default="/data/user_data/gyeongwk/flashinfer-trace")
+    parser.add_argument("--language", type=str, default="CUDA")
+    parser.add_argument("--target_gpu", type=str, default="H100")
+
+
 def add_evolrule_args(parser):
     parser.add_argument("--autorule_num_samples_per_problem", type=int, default=1)
     parser.add_argument("--autorule_sample_best_and_worst", type=bool, default=True)
@@ -51,6 +57,7 @@ def parse_test_time_scaling_args():
 
     parser.add_argument("--benchmark", type=str, default="KernelBench")
     add_kernelbench_args(parser)
+    add_flashinferbench_args(parser)
 
     # Methods
     parser.add_argument("--method", type=str, default="base")
@@ -77,6 +84,7 @@ def parse_main_args():
     # Benchmark
     parser.add_argument("--benchmark", type=str, default="KernelBench")
     add_kernelbench_args(parser)
+    add_flashinferbench_args(parser)
 
     # Memory
     parser.add_argument("--memory", type=str, default="memory")
@@ -85,7 +93,7 @@ def parse_main_args():
     add_evolrule_args(parser)
 
     # Training
-    parser.add_argument("--num_epochs", type=int, default=2)
+    parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
 
     # Test-time Scaling 

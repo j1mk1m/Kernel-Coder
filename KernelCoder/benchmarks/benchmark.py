@@ -38,7 +38,7 @@ class Traces:
     def get_solution(self, solution_id: str) -> Solution:
         solutions = [solution for solution in self.solutions if solution.solution_id == solution_id]
         if len(solutions) == 0:
-            raise ValueError(f"Solution {solution_id} not found")
+            return None
         return solutions[0]
     
     def get_solutions(self, task_id: str) -> List[Solution]:
