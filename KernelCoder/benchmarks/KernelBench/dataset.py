@@ -6,12 +6,14 @@ from KernelCoder.benchmarks.KernelBench.benchmark import KernelBenchTask
 
 
 class KernelBenchDataset(Dataset):
-    def __init__(self, config, eval=False, level=None):
+    def __init__(self, config, eval=False):
         self.dataset = []
+
+        level = config.level
 
         if config.test:
             self.dataset = [KernelBenchTask(task_id=f"level_1_problem_{problem}", level=1, problem=problem, task_description=fetch_ref_arch_from_level_problem_id(1, problem, config.dataset_src)[0]) for problem in range(1, 3)] 
-        elif level is not None:
+        elif level > 0:
             if level == 3:
                 count = 50
             else:

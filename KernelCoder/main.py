@@ -12,7 +12,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-setup_logging(level="WARNING", log_file="usage.log")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXTERNAL = os.path.join(REPO_ROOT, "external")
@@ -23,7 +22,7 @@ sys.path.append(EXTERNAL)
 sys.path.append(os.path.join(EXTERNAL, "KernelBench"))
 
 
-from benchmarks import get_benchmark
+from benchmarks import get_benchmark, get_dataset, get_trace_cls
 from memory import get_memory
 from test_time_scaling import _batched_generate
 from configs import parse_main_args
@@ -92,12 +91,19 @@ if __name__ == "__main__":
                                    default_api_base=default_base_api,
                                    default_temperature=config.temperature,
                                    default_max_tokens=config.max_tokens)
+
+    setup_logging(level="INFO", log_file=os.path.join(run_dir, "usage.log"))
      
-    benchmark, train_dataset, eval_dataset, trace_cls = get_benchmark(config, run_dir, llm_client)
+    benchmark = get_benchmark(config, run_dir, llm_client)
+    train_dataset = get_dataset(config, eval=False)
+    trace_cls = get_trace_cls(config)
     memory = get_memory(config, run_dir) 
 
     main_loop(config, llm_client, memory, benchmark, train_dataset, trace_cls, train=True)
-    os.makedirs(os.path.join(run_dir, "eval"), exist_ok=True)
-    benchmark.run_dir = os.path.join(run_dir, "eval")
-    main_loop(config, llm_client, memory, benchmark, eval_dataset, trace_cls, train=False)
+
+    if config.eval:
+        eval_dataset = get_dataset(config, eval=True)
+        os.makedirs(os.path.join(run_dir, "eval"), exist_ok=True)
+        benchmark.run_dir = os.path.join(run_dir, "eval")
+        main_loop(config, llm_client, memory, benchmark, eval_dataset, trace_cls, train=False)
     

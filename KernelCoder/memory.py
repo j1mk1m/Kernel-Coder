@@ -42,7 +42,8 @@ class Memory(KnowledgeBase):
         self.query_embeddings = {}
         self.load_memory()
         self.config = config
-        self.llm_client = create_llm_client(data_file=os.path.join(self.run_dir, "memory_llm_usage.json"), default_model=config.memory_model_name, default_temperature=1.0)
+        base_api_url = f"http://{config.vllm_host}:{config.vllm_port}/v1" if config.server_type == "vllm" else None
+        self.llm_client = create_llm_client(data_file=os.path.join(self.run_dir, "memory_llm_usage.json"), default_model=config.memory_model_name, default_temperature=1.0, default_api_base=base_api_url, default_max_tokens=config.max_tokens)
         self.embedding_model = create_llm_client(data_file=os.path.join(self.run_dir, "memory_embedding_usage.json"), default_model=config.memory_embedding_model_name)
     
     def _add_to_memory(self, memory_items: List[MemoryItem]) -> None:
@@ -298,7 +299,8 @@ class Rules(KnowledgeBase):
         self.rules = []
         self.config = config
         self.run_dir = run_dir
-        self.llm_client = create_llm_client(data_file=os.path.join(self.run_dir, "rules_llm_usage.json"), default_model=config.memory_model_name, default_temperature=1.0)
+        base_api_url = f"http://{config.vllm_host}:{config.vllm_port}/v1" if config.server_type == "vllm" else None
+        self.llm_client = create_llm_client(data_file=os.path.join(self.run_dir, "rules_llm_usage.json"), default_model=config.memory_model_name, default_temperature=1.0, default_api_base=base_api_url, default_max_tokens=config.max_tokens)
 
     def retrieve(self, query):
         return "When writing kernels, consider the following tips:\n" + "\n".join(self.rules)
@@ -338,6 +340,7 @@ Solutions:
 {traj_string}
     """
                 response = self.llm_client.text_completion(prompt, tag="rule_extraction")["choices"][0]["text"]
+
                 with open(file_path, "w") as f:
                     f.write(response)
 
@@ -388,7 +391,10 @@ Return the merged list as a JSON array of strings. Do not use ``json``, just out
 [Rules]
 {rules_str}
 """
-            rule_response = self.llm_client.text_completion(prompt, max_tokens=16384, tag="rule_merging")
+
+            with open(os.path.join(batch_dir, "rule_merging_prompt.txt"), "w") as f:
+                f.write(prompt)
+            rule_response = self.llm_client.text_completion(prompt, max_tokens=32768, tag="rule_merging")
             rule_response = rule_response["choices"][0]["text"]
             with open(file_path, "w") as f:
                 f.write(rule_response)
