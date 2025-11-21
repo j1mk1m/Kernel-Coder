@@ -175,6 +175,7 @@ def choose_baseline(best_by_author: Dict[str, Run], baseline_author: str) -> Tup
         return (bl_key, best_by_author[bl_key].latency_ms)
 
     # Fallback to fastest author in this group
+    return None, None
     fastest_author = min(best_by_author.items(), key=lambda kv: kv[1].latency_ms)[0]
     return (fastest_author, best_by_author[fastest_author].latency_ms)
 
@@ -201,15 +202,16 @@ def compute_ratios_by_author(
             continue
 
         bl_author_eff, bl_lat = choose_baseline(best_by_author, "torch" if "gemm" in _gk[0] else baseline_author)
+        if bl_author_eff is None: continue
 
         # for author in {r.author for r in runs}:  # all authors who attempted
-        for author, run in best_by_author.items():
+        for author in AUTHORS:
             if author == bl_author_eff:
                 # skip the baseline author itself here
                 continue
             totals_by_author[author] += 1
 
-            # run = best_by_author.get(author)
+            run = best_by_author.get(author)
             if run is None or bl_lat <= 0 or run.latency_ms is None or run.latency_ms <= 0:
                 # author had no valid PASSED latency → always lose (no r recorded)
                 continue

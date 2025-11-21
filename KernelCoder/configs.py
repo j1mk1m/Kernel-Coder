@@ -17,7 +17,7 @@ def add_kernelbench_args(parser):
     # Dataset
     parser.add_argument("--dataset_src", type=str, default="local")
     parser.add_argument("--dataset_name", type=str, default="ScalingIntelligence/KernelBench")
-    parser.add_argument("--level", type=int, default=1)
+    parser.add_argument("--level", type=int, default=0)
 
     # Evaluation
     parser.add_argument("--eval_mode", type=str, default="local") # should be local
@@ -106,6 +106,7 @@ def parse_main_args():
     
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--test", action="store_true")
+    parser.add_argument("--eval", action="store_true")
 
     args = parser.parse_args()
     if args.num_parallel > 1:

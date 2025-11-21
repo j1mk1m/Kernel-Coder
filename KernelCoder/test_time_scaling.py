@@ -21,7 +21,6 @@ from typing import List
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-setup_logging(level="WARNING", log_file="usage.log")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXTERNAL = os.path.join(REPO_ROOT, "external")
@@ -38,10 +37,8 @@ from KernelBench.src.dataset import construct_kernelbench_dataset, fetch_ref_arc
 
 # Local imports
 from KernelCoder.benchmarks.benchmark import Task, Traces
-from KernelCoder.benchmarks.KernelBench.benchmark import KernelBenchBenchmark, KernelBenchTraces
-from KernelCoder.benchmarks.KernelBench.dataset import KernelBenchDataset
 from configs import parse_test_time_scaling_args 
-from benchmarks import get_benchmark
+from benchmarks import get_benchmark, get_dataset, get_trace_cls
 
 
 def _batched_generate(config, benchmark, traces, items, llm_client):
@@ -49,6 +46,7 @@ def _batched_generate(config, benchmark, traces, items, llm_client):
     Generate solutions in parallel for a batch of (task, solution_name) pairs.
     items: List[Tuple[Task, str]]
     """
+    logger.info(f"Generating solutions in parallel for {len(items)} tasks")
     # Prepare prompts
     sol_names = [sol_name for _, sol_name, _ in items]
     prompts = [prompt for _, _, prompt in items]
@@ -66,13 +64,14 @@ def _batched_generate(config, benchmark, traces, items, llm_client):
                 with open(response_path, "w") as f:
                     f.write(response if response is not None else "Failed to generate response")
             else:
+                logger.info(f"Solution {sol_name} already exists, skipping generation")
                 response = open(response_path, "r").read()
             return response
         except Exception as e:
             logger.error(f"Error generating solution: {e}")
             return None
 
-    num_workers = getattr(config, "request_workers", None) or min(32, len(prompts) or 1)
+    num_workers = getattr(config, "request_workers", None) or min(8, len(prompts) or 1)
     with ThreadPool(num_workers) as pool:
         responses = pool.map(_infer, zip(sol_names, prompts))
 
@@ -189,19 +188,14 @@ if __name__ == "__main__":
                                    default_temperature=config.temperature,
                                    default_max_tokens=config.max_tokens)
     
-    if config.benchmark == "KernelBench":
-        for level in range(1, 4):
-            run_dir = os.path.join(RUNS_DIR, config.run_name + f"_level_{level}")
-            os.makedirs(run_dir, exist_ok=True)
-            with open(os.path.join(run_dir, "config.yaml"), "w") as f:
-                yaml.dump(vars(config), f)
-
-            benchmark = KernelBenchBenchmark("KernelBench", run_dir, llm_client, config)
-            dataset = KernelBenchDataset(config, eval=True, level=level)
-            test_time_scaling(config, run_dir, benchmark, dataset, KernelBenchTraces, llm_client)
-            llm_client.save_usage_data()
+    benchmark = get_benchmark(config, run_dir, llm_client)
+    if config.level == 0:
+        dataset = get_dataset(config, eval=True)
     else:
-        benchmark, train_dataset, eval_dataset, trace_cls = get_benchmark(config, run_dir, llm_client)
-        test_time_scaling(config, run_dir, benchmark, eval_dataset, trace_cls, llm_client)
-        llm_client.save_usage_data()
+        dataset = get_dataset(config, eval=True, level=config.level)
+    
+    trace_cls = get_trace_cls(config)
+
+    test_time_scaling(config, run_dir, benchmark, dataset, trace_cls, llm_client)
+    llm_client.save_usage_data()
 

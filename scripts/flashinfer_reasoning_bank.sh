@@ -1,8 +1,8 @@
 python KernelCoder/main.py \
-    --run_name flashinfer_reasoning_bank_sequential \
+    --run_name flashinfer_reasoning_bank_sequential_cuda \
     --benchmark "FlashInferBench" \
     --base_traceset_path "/data/user_data/gyeongwk/flashinfer-trace" \
-    --language "triton" \
+    --language "cuda" \
     --target_gpu "A6000" \
     --memory memory \
     --memory_model_name gemini/gemini-2.5-pro \
@@ -10,7 +10,7 @@ python KernelCoder/main.py \
     --num_epochs 1 \
     --batch_size 1 \
     --num_parallel 1 \
-    --num_iterations 10 \
+    --num_iterations 5 \
     --server_type litellm \
     --model_name gemini/gemini-2.5-pro \
     --max_tokens 32768 \
