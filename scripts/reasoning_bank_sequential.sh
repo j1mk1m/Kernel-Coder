@@ -1,15 +1,15 @@
 python KernelCoder/main.py \
-    --run_name evolrule_parallel_4_batch_1 \
+    --run_name reasoning_bank_sequential_4 \
     --benchmark KernelBench \
     --num_epochs 1 \
     --batch_size 1 \
-    --num_parallel 4 \
-    --num_iterations 1 \
+    --num_parallel 1 \
+    --num_iterations 4 \
     --server_type litellm \
     --model_name anthropic/claude-sonnet-4-5-20250929 \
     --memory_model_name anthropic/claude-sonnet-4-5-20250929 \
-    --memory rules \
-    --autorule_alignment_threshold 0.7 \
+    --memory_embedding_model_name gemini/gemini-embedding-001 \
+    --memory memory \
     --max_tokens 8192 \
     --temperature 0.7 \
     --hardware A6000_babel \

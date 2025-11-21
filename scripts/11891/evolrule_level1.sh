@@ -1,0 +1,20 @@
+python KernelCoder/main.py \
+    --run_name 11891_evolrule_parallel_8_batch_level1 \
+    --benchmark KernelBench \
+    --level 1 \
+    --num_epochs 1 \
+    --batch_size 250 \
+    --num_parallel 8 \
+    --num_iterations 1 \
+    --server_type vllm \
+    --vllm_host babel-t9-32 \
+    --vllm_port 8082 \
+    --model_name hosted_vllm/Qwen/QwQ-32B \
+    --memory_model_name hosted_vllm/Qwen/QwQ-32B \
+    --memory rules \
+    --autorule_alignment_threshold 0.7 \
+    --max_tokens 32768 \
+    --temperature 0.7 \
+    --hardware A6000_babel \
+    --num_eval_devices 4 \
+    --num_cpu_workers 16

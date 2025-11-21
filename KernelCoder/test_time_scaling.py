@@ -10,224 +10,167 @@ import yaml
 import os
 import torch
 import multiprocessing as mp
+from multiprocessing.dummy import Pool as ThreadPool
 from datasets import load_dataset
 import wandb
-from llm_utils import create_llm_client
+from llm_utils import create_llm_client, setup_logging
 import sys
+import logging
+from typing import List
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXTERNAL = os.path.join(REPO_ROOT, "external")
 RUNS_DIR = os.path.join(REPO_ROOT, "runs")
-sys.path.append(REPO_ROOT)
-sys.path.append(os.path.join(REPO_ROOT, "KernelCoder"))
-sys.path.append(EXTERNAL)
+sys.path.insert(0, REPO_ROOT)
+sys.path.insert(0, os.path.join(REPO_ROOT, "KernelCoder"))
+sys.path.insert(0, EXTERNAL)
+sys.path.insert(0, os.path.join(EXTERNAL, "KernelBench"))
+
 
 # KernelBench imports
 from KernelBench.src.utils import set_gpu_arch, WorkArgs
 from KernelBench.src.dataset import construct_kernelbench_dataset, fetch_ref_arch_from_level_problem_id
 
 # Local imports
+from KernelCoder.benchmarks.benchmark import Task, Traces
 from configs import parse_test_time_scaling_args 
-from generation import batch_generate
-from evaluation import batch_eval
+from benchmarks import get_benchmark, get_dataset, get_trace_cls
 
 
-def base(config, level, problem_id_range: range, llm_client: callable, run_dir: str, rule_path=None):
+def _batched_generate(config, benchmark, traces, items, llm_client):
+    """
+    Generate solutions in parallel for a batch of (task, solution_name) pairs.
+    items: List[Tuple[Task, str]]
+    """
+    logger.info(f"Generating solutions in parallel for {len(items)} tasks")
+    # Prepare prompts
+    sol_names = [sol_name for _, sol_name, _ in items]
+    prompts = [prompt for _, _, prompt in items]
+
+    # Parallel LLM calls (I/O-bound -> threads are fine and avoid pickling issues)
+    def _infer(item):
+        sol_name, prompt = item
+        try:
+            response_path = os.path.join(benchmark.run_dir, sol_name + "_response.txt")
+            if not os.path.exists(response_path):
+                response = llm_client.text_completion(prompt, tag="kernel_generation")
+                if response["choices"][0]["text"] is None:
+                    print(response)
+                response = response["choices"][0]["text"]
+                with open(response_path, "w") as f:
+                    f.write(response if response is not None else "Failed to generate response")
+            else:
+                logger.info(f"Solution {sol_name} already exists, skipping generation")
+                response = open(response_path, "r").read()
+            return response
+        except Exception as e:
+            logger.error(f"Error generating solution: {e}")
+            return None
+
+    num_workers = getattr(config, "request_workers", None) or min(8, len(prompts) or 1)
+    with ThreadPool(num_workers) as pool:
+        responses = pool.map(_infer, zip(sol_names, prompts))
+
+    # Parse and add to traces
+    for (task, sol_name, prompt), response in zip(items, responses):
+        solution = benchmark.parse_solution(task, sol_name, response)
+        if solution is not None:
+            traces.add_solution(solution)
+
+
+def base(config, benchmark, dataset, trace_cls, llm_client):
     """
     Base approach
     """
-    workload = []
+    traces = trace_cls(dataset, benchmark.run_dir)
+    # Batched single-sample generation for each task
+    items = []
+    for task in dataset:
+        sol_name = f"{task.task_id}_solution_0"
+        if not traces.check_for_solution(sol_name):
+            items.append((task, sol_name, benchmark.get_prompt(task)))
 
-    for problem_id in range(problem_id_range.start, problem_id_range.stop + 1): # end index is inclusive
-        workload.append(
-            WorkArgs(
-                level=level,
-                problem_id=int(problem_id),
-                sample_id=0
-            )
-        )
+    if items:
+        _batched_generate(config, benchmark, traces, items, llm_client)
     
-    batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
+    traces = benchmark.evaluate_solution(traces)
+    metrics = benchmark.analyze(traces)
     
-    eval_file_path = os.path.join(run_dir, f"eval_results.json")
-    batch_eval(workload, config, run_dir, eval_file_path)
 
-
-def best_of_n(config, level, problem_id_range: range, llm_client: callable, run_dir: str, rule_path=None):
+def best_of_n(config, benchmark, dataset, trace_cls, llm_client):
     """
     Best-of-N approach
-    Generate num_samples for each problem independently
+    Generate num_samples for each problem independently using the new Benchmark API.
     """
-    # Define workloads
-    eval_file_path = os.path.join(run_dir, f"eval_results.json")
-
+    traces = trace_cls(dataset, benchmark.run_dir)
+    
+    # Build batch of generation items across all tasks and samples
     for sample_id in range(config.num_parallel):
-        workload = []
-        for problem_id in range(problem_id_range.start, problem_id_range.stop + 1): # end index is inclusive
-            workload.append(
-                WorkArgs(
-                    level=level,
-                    problem_id=int(problem_id),
-                    sample_id=sample_id
-                )
-            )
-        
-        batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
-        batch_eval(workload, config, run_dir, eval_file_path) 
+        items = []
+        for task in dataset:
+            sol_name = f"{task.task_id}_solution_{sample_id}"
+            if not traces.check_for_solution(sol_name):
+                items.append((task, sol_name, benchmark.get_prompt(task)))
+
+        if items:
+            _batched_generate(config, benchmark, traces, items, llm_client)
+
+        traces = benchmark.evaluate_solution(traces)
+
+    metrics = benchmark.analyze(traces)
 
 
-
-def iterative_refinement(config, level, problem_id_range: range, llm_client: callable, run_dir: str, rule_path=None):
+def iterative_refinement(config, benchmark, dataset, trace_cls, llm_client):
     """
-    Iterative refinement approach
+    Iterative refinement approach using the new Benchmark API.
     """
-    eval_file_path = os.path.join(run_dir, f"eval_results.json")
 
+    traces = trace_cls(dataset, benchmark.run_dir)
     num_iterations = config.num_iterations
     for iteration in range(num_iterations):
-        print(f"[Iterative Refinement] Iteration {iteration + 1} of {num_iterations}")
-        
-        # Generate samples
-        workload = []
-        for problem_id in range(problem_id_range.start, problem_id_range.stop + 1): # end index is inclusive
+        logger.info(f"[Iterative Refinement] Iteration {iteration + 1} of {num_iterations}")
+
+        items = []
+        for task in dataset:
             for sample_id in range(config.num_parallel):
-                workload.append(
-                    WorkArgs(
-                        level=level,
-                        problem_id=int(problem_id),
-                        sample_id=sample_id + iteration * config.num_parallel
-                    )
-                )
+                sol_name = f"{task.task_id}_solution_{sample_id + iteration * config.num_parallel}"
+                if not traces.check_for_solution(sol_name):
+                    prompt = benchmark.get_prompt(task) if iteration == 0 else benchmark.get_refinement_prompt(task, traces)
+                    items.append((task, sol_name, prompt))
 
-        batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
-        batch_eval(workload, config, run_dir, eval_file_path)
+        if items:
+            _batched_generate(config, benchmark, traces, items, llm_client)
 
+        # Evaluate after each iteration to inform subsequent refinement rounds
+        traces = benchmark.evaluate_solution(traces)
 
-def metr(config, level, problem_id_range: range, llm_client: callable, run_dir: str, rule_path=None):
-    """
-    METR approach
-    1. Generate 8 samples in parallel
-    2. When a thread is done, sample from currently evaluated kernels based on efficiency
-    3. Generate new attempt based on the sample 
-    4. Repeat until num_samples are generated
-    """
-    eval_file_path = os.path.join(run_dir, f"eval_results.json")
-
-    # 0. Add the reference architecture as the first sample
-    print(f"[METR] Adding reference architecture as the first sample")
-    for problem_id in range(problem_id_range.start, problem_id_range.stop + 1): # end index is inclusive
-        ref_arch_src, _ = fetch_ref_arch_from_level_problem_id(level, problem_id, config.dataset_src)
-        kernel_path = os.path.join(run_dir, f"level_{level}_problem_{problem_id}_sample_{0}_kernel.py")
-        with open(kernel_path, "w") as f:
-            f.write(ref_arch_src)
-
-    workload = []
-    for problem_id in range(problem_id_range.start, problem_id_range.stop + 1): # end index is inclusive
-        workload.append(
-            WorkArgs(
-                level=level,
-                problem_id=int(problem_id),
-                sample_id=0
-            )
-        )
-    
-    batch_eval(workload, config, run_dir, eval_file_path) 
-
-    # 1. Generate 8 samples in parallel
-    print(f"[METR] Generating {config.num_parallel} samples in parallel")
-    workload = []
-    for problem_id in range(problem_id_range.start, problem_id_range.stop + 1): # end index is inclusive
-        for sample_id in range(1, config.num_parallel + 1):
-            workload.append(
-                WorkArgs(
-                    level=level,
-                    problem_id=int(problem_id),
-                    sample_id=sample_id
-                )
-            )
-    
-    batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
-    batch_eval(workload, config, run_dir, eval_file_path)
-
-    # 2. Continue generating samples until we reach num_samples
-    for sample_id in range(config.num_parallel + 1, config.num_samples + 1):
-        print(f"[METR] Generating sample {sample_id} of {config.num_samples}")
-        workload = []
-        for problem_id in range(problem_id_range.start, problem_id_range.stop + 1): # end index is inclusive
-            workload.append(
-                WorkArgs(
-                    level=level,
-                    problem_id=int(problem_id),
-                    sample_id=sample_id
-                )
-            )
-            
-        batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
-        batch_eval(workload, config, run_dir, eval_file_path)
+    metrics = benchmark.analyze(traces)
 
 
-def stanford(config, level, problem_id_range: range, llm_client: callable, run_dir: str, rule_path=None):
-    """
-    Stanford approach: Beam Search variant
-    """
-    eval_file_path = os.path.join(run_dir, f"eval_results.json")
-
-    for iteration in range(config.num_iterations):
-        print(f"[Stanford] Iteration {iteration + 1} of {config.num_iterations}")
-        
-        workload = []
-        for problem_id in range(problem_id_range.start, problem_id_range.stop + 1): # end index is inclusive
-            for sample_id in range(config.num_parallel):
-                workload.append(
-                    WorkArgs(
-                        level=level,
-                        problem_id=int(problem_id),
-                        sample_id=sample_id + iteration * config.num_parallel
-                    )
-                )
-        
-        batch_generate(workload, config, llm_client, run_dir, rule_path=rule_path)
-        batch_eval(workload, config, run_dir, eval_file_path)
-
-
-def main(config):
+def test_time_scaling(config, run_dir, benchmark, dataset, trace_cls, llm_client):
     """
     Test-Time Scaling for Particular Level
     """
-    tags = ["test-time-scaling"] + config._tags.split(",")
-    tags.extend([config.run_name, config.method, config.prompt, str(config.level)])
-    wandb.init(
-        project="KernelBench",
-        entity="j1mk1m",
-        tags=tags
-    )
-    wandb.log({"run_name": config.run_name, "method": config.method, "prompt": config.prompt, "level": config.level, "model_name": config.model_name})
-    print(f"Starting Test-Time Scaling with config: {config}")
+    logger.info(f"Starting Test-Time Scaling with config: {config}")
+ 
+    # Run the test-time scaling approach
+    match config.method:
+        case "base":
+            base(config, benchmark, dataset, trace_cls, llm_client)
+        case "best-of-N":
+            best_of_n(config, benchmark, dataset, trace_cls, llm_client)
+        case "iterative refinement":
+            iterative_refinement(config, benchmark, dataset, trace_cls, llm_client)
+        case _:
+            raise ValueError(f"Invalid method: {config.method}")
+ 
 
-    # Check if CUDA is available
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA device not available. Evaluation requires GPU.")
-
-    if mp.get_start_method(allow_none=True) is None:
-        mp.set_start_method("spawn")
-
-    # 1. Set up
-    # Set up dataset
-    if config.dataset_src == "huggingface":
-        dataset = load_dataset(config.dataset_name)
-        curr_level_dataset = dataset[f"level_{config.level}"]
-    elif config.dataset_src == "local":
-        curr_level_dataset = construct_kernelbench_dataset(config.level)
-
-    num_problems_in_level = len(curr_level_dataset)
-
-    if config.subset == (None, None):
-        problem_id_range = range(1, num_problems_in_level)
-    else:
-        assert config.subset[0] >= 1 and config.subset[1] <= num_problems_in_level, f"Subset range {config.subset} out of range for Level {config.level}"
-        problem_id_range = range(config.subset[0], config.subset[1])
-
-    print(f"Level {config.level} problems: {problem_id_range}")
+if __name__ == "__main__": 
+    config = parse_test_time_scaling_args()
 
     # set up run directory
     run_dir = os.path.join(RUNS_DIR, config.run_name)
@@ -235,12 +178,7 @@ def main(config):
 
     with open(os.path.join(run_dir, "config.yaml"), "w") as f:
         yaml.dump(vars(config), f)
- 
-    assert config.store_type == "local", "supporting local file-system based storage for now" # database integreation coming soon, need to migrate from CUDA Monkeys code
 
-    # set GPU arch to configure what target to build for
-    set_gpu_arch(config.gpu_arch)
-    assert config.num_eval_devices <= torch.cuda.device_count(), f"Number of GPUs requested ({config.num_eval_devices}) is greater than the number of available GPUs ({torch.cuda.device_count()})"
 
     # Create inference function with config parameters
     default_base_api = f"http://{config.vllm_host}:{config.vllm_port}/v1" if config.server_type == "vllm" else None
@@ -250,25 +188,14 @@ def main(config):
                                    default_temperature=config.temperature,
                                    default_max_tokens=config.max_tokens)
     
-    rule_path = config.autorule_path if config.autorule else None
+    benchmark = get_benchmark(config, run_dir, llm_client)
+    if config.level == 0:
+        dataset = get_dataset(config, eval=True)
+    else:
+        dataset = get_dataset(config, eval=True, level=config.level)
+    
+    trace_cls = get_trace_cls(config)
 
-    # Run the test-time scaling approach
-    match config.method:
-        case "base":
-            base(config, config.level, problem_id_range, llm_client, run_dir, rule_path)
-        case "best-of-N":
-            best_of_n(config, config.level, problem_id_range, llm_client, run_dir, rule_path)
-        case "iterative refinement":
-            iterative_refinement(config, config.level, problem_id_range, llm_client, run_dir, rule_path)
-        case "METR":
-            metr(config, config.level, problem_id_range, llm_client, run_dir, rule_path)
-        case "Stanford":
-            stanford(config, config.level, problem_id_range, llm_client, run_dir, rule_path)
-        case _:
-            raise ValueError(f"Invalid method: {config.method}")
- 
-
-if __name__ == "__main__": 
-    args = parse_test_time_scaling_args()
-    main(args)
+    test_time_scaling(config, run_dir, benchmark, dataset, trace_cls, llm_client)
+    llm_client.save_usage_data()
 

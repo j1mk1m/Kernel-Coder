@@ -1,8 +1,8 @@
 python KernelCoder/main.py \
-    --run_name evolrule_parallel_4_batch_1 \
+    --run_name evolrule_parallel_4_batch_16 \
     --benchmark KernelBench \
     --num_epochs 1 \
-    --batch_size 1 \
+    --batch_size 16 \
     --num_parallel 4 \
     --num_iterations 1 \
     --server_type litellm \
