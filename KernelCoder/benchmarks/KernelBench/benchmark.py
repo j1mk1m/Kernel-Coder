@@ -3,7 +3,6 @@ import os
 import torch
 import multiprocessing as mp
 from datasets import load_dataset
-import wandb
 from llm_utils import create_llm_client
 import sys
 import json

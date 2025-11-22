@@ -21,7 +21,6 @@ import ast
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 EXTERNAL = os.path.join(REPO_ROOT, "external")
-KERNEL_EVAL_BUILD_DIR = "/data/user_data/gyeongwk/Kernel-Coder/cache"
 sys.path.append(REPO_ROOT)
 sys.path.append(EXTERNAL)
 
@@ -54,7 +53,7 @@ def evaluate_single_sample_worker(work_args: EvaluationWorkArgs, configs, run_di
     ref_arch_name = task.task_id
     kernel_name = solution.solution_id
 
-    build_dir = os.path.join(KERNEL_EVAL_BUILD_DIR, configs.run_name, evaluation_id)
+    build_dir = os.path.join(configs.build_dir, configs.run_name, evaluation_id)
 
     try:  
         eval_result = eval_kernel_against_ref(
@@ -182,7 +181,7 @@ def batch_eval(
                         results.append((evaluation_id, task.task_id, solution.solution_id, result))
                     
                         # Remove cache dir for this evaluation
-                        build_dir = os.path.join(KERNEL_EVAL_BUILD_DIR, config.run_name, evaluation_id)
+                        build_dir = os.path.join(config.build_dir, config.run_name, evaluation_id)
                         if os.path.isdir(build_dir):
                             shutil.rmtree(build_dir, ignore_errors=True)
                     except Exception as e:
@@ -191,7 +190,7 @@ def batch_eval(
                         )
                         result = KernelExecResult(compiled=False, correctness=False, metadata={"other_error": str(e)})
                         results.append((evaluation_id, task.task_id, solution.solution_id, result))
-                        build_dir = os.path.join(KERNEL_EVAL_BUILD_DIR, config.run_name, evaluation_id)
+                        build_dir = os.path.join(config.build_dir, config.run_name, evaluation_id)
                         if os.path.isdir(build_dir):
                             shutil.rmtree(build_dir, ignore_errors=True)
 

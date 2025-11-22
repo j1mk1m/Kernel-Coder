@@ -3,6 +3,7 @@ import os
 
 
 def add_inference_args(parser, rl_training=False):
+    parser.add_argument("--model_name", type=str, default="anthropic/claude-haiku-4-5-20251001")
     parser.add_argument("--server_type", type=str, default="litellm")
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -20,15 +21,12 @@ def add_kernelbench_args(parser):
     parser.add_argument("--level", type=int, default=0)
 
     # Evaluation
-    parser.add_argument("--eval_mode", type=str, default="local") # should be local
-    parser.add_argument("--eval_server_host", type=str, default="localhost") # eval_mode is remote
-    parser.add_argument("--eval_server_port", type=int, default=12345) # eval_mode is remote
-
     parser.add_argument("--hardware", type=str, default="A6000_babel") # GPU hardware type: this should match baseline hardware name
     parser.add_argument("--gpu_arch", type=str, default="Ampere") # GPU architecture: make sure matches hardware type
     parser.add_argument("--num_eval_devices", type=int, default=1) # number of GPUs used for evaluation
 
     parser.add_argument("--build_cache_with_cpu", type=bool, default=False)
+    parser.add_argument("--build_dir", type=str, default="/data/user_data/gyeongwk/Kernel-Coder/cache")
     parser.add_argument("--num_cpu_workers", type=int, default=1)
 
     parser.add_argument("--num_correct_trials", type=int, default=5)
@@ -68,7 +66,6 @@ def parse_test_time_scaling_args():
     parser.add_argument("--num_best", type=int, default=1)
 
     # Inference Server
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     add_inference_args(parser)
     
     parser.add_argument("--verbose", action="store_true")
@@ -101,7 +98,6 @@ def parse_main_args():
     parser.add_argument("--num_iterations", type=int, default=1)
  
     # Inference Server
-    parser.add_argument("--model_name", type=str, default="anthropic/claude-haiku-4-5-20251001")
     add_inference_args(parser)
     
     parser.add_argument("--verbose", action="store_true")

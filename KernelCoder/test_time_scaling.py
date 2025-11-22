@@ -8,15 +8,10 @@ Implements basic test-time scaling approaches
 
 import yaml
 import os
-import torch
-import multiprocessing as mp
 from multiprocessing.dummy import Pool as ThreadPool
-from datasets import load_dataset
-import wandb
 from llm_utils import create_llm_client, setup_logging
 import sys
 import logging
-from typing import List
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

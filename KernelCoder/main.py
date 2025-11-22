@@ -4,7 +4,6 @@ import os
 import torch
 import multiprocessing as mp
 from datasets import load_dataset
-import wandb
 from llm_utils import create_llm_client, setup_logging
 import sys
 from torch.utils.data import DataLoader

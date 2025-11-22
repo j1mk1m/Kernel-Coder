@@ -1,10 +1,7 @@
 from KernelCoder.benchmarks.KernelBench.benchmark import KernelBenchBenchmark, KernelBenchTraces
 from KernelCoder.benchmarks.KernelBench.dataset import KernelBenchDataset
-try:
-    from KernelCoder.benchmarks.flashinferbench.benchmark import FlashInferBenchBenchmark, FlashInferBenchTraces
-    from KernelCoder.benchmarks.flashinferbench.dataset import FlashInferBenchDataset
-except ImportError:
-    print("FlashInferBench not installed")
+from KernelCoder.benchmarks.flashinferbench.benchmark import FlashInferBenchBenchmark, FlashInferBenchTraces
+from KernelCoder.benchmarks.flashinferbench.dataset import FlashInferBenchDataset
 
 
 def get_benchmark(config, run_dir, llm_client):
