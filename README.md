@@ -5,6 +5,10 @@
 conda create -n kernel python=3.12
 conda activate kernel
 pip install -r requirements.txt 
+
+# To use VLLM for local hosting
+pip install --upgrade uv
+uv pip install vllm --torch-backend=auto
 ```
 
 ### Repo Structure

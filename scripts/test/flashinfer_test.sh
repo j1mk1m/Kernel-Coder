@@ -8,9 +8,9 @@ python KernelCoder/test_time_scaling.py \
     --num_parallel 1 \
     --num_iterations 1 \
     --server_type vllm \
-    --vllm_host babel-t9-32 \
+    --vllm_host babel-w9-20 \
     --vllm_port 8082 \
-    --model_name hosted_vllm/Qwen/QwQ-32B \
+    --model_name hosted_vllm/Qwen/Qwen2.5-Coder-7B-Instruct \
     --max_tokens 16384 \
     --temperature 0.7 \
     --test

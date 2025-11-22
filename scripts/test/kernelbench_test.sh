@@ -1,13 +1,13 @@
 python KernelCoder/test_time_scaling.py \
-    --run_name test_time_scaling_test \
+    --run_name kernelbench_test \
     --benchmark "KernelBench" \
     --method "base" \
     --num_parallel 1 \
     --num_iterations 1 \
     --server_type vllm \
-    --vllm_host babel-t9-32 \
+    --vllm_host babel-w9-20 \
     --vllm_port 8082 \
-    --model_name hosted_vllm/Qwen/QwQ-32B \
+    --model_name hosted_vllm/Qwen/Qwen2.5-Coder-7B-Instruct \
     --max_tokens 8192 \
     --temperature 0.7 \
     --hardware A6000_babel \
