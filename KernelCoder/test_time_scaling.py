@@ -8,6 +8,7 @@ Implements basic test-time scaling approaches
 
 import yaml
 import os
+import multiprocessing as mp
 from multiprocessing.dummy import Pool as ThreadPool
 from llm_utils import create_llm_client, setup_logging
 import sys

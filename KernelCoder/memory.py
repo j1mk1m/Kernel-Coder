@@ -315,7 +315,7 @@ class Rules(KnowledgeBase):
     Kernel:
     {kernel_src}
     """
-        response = self.llm_client.text_completion(prompt, tag="rule_alignment")
+        response = self.llm_client.text_completion(prompt, tag="rule_alignment", max_tokens=256)
         response = response["choices"][0]["text"]
         return "Yes" in response
 

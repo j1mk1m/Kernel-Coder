@@ -1,7 +1,11 @@
 from KernelCoder.benchmarks.KernelBench.benchmark import KernelBenchBenchmark, KernelBenchTraces
 from KernelCoder.benchmarks.KernelBench.dataset import KernelBenchDataset
-from KernelCoder.benchmarks.flashinferbench.benchmark import FlashInferBenchBenchmark, FlashInferBenchTraces
-from KernelCoder.benchmarks.flashinferbench.dataset import FlashInferBenchDataset
+try:
+    from KernelCoder.benchmarks.flashinferbench.benchmark import FlashInferBenchBenchmark, FlashInferBenchTraces
+    from KernelCoder.benchmarks.flashinferbench.dataset import FlashInferBenchDataset
+except Exception as e:
+    print("FlashInferBench not found")
+    pass
 
 
 def get_benchmark(config, run_dir, llm_client):
@@ -15,8 +19,7 @@ def get_benchmark(config, run_dir, llm_client):
 
 def get_dataset(config, eval=False, **kwargs):
     if config.benchmark == "KernelBench":
-        if kwargs.get("level") is not None:
-            return KernelBenchDataset(config, eval=False, level=kwargs["level"])
+        return KernelBenchDataset(config, eval=False)
         return KernelBenchDataset(config, eval=eval)
     elif config.benchmark == "FlashInferBench":
         return FlashInferBenchDataset(config, eval=eval)
