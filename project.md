@@ -1,7 +1,13 @@
 # Project
 
 ### Plan
-- [x] Baseline test-time scaling methods (best-of-N, iterative refinement on Qwen2.5-Coder-7B-Instruct and QwQ-32B)
+- [ ] Baseline test-time scaling methods (best-of-N, iterative refinement)
+    - [ ] Qwen2.5-Coder-7B-Instruct 
+        - [ ] Level 1
+        - [ ] Level 2
+    - [ ] QwQ-32B
+        - [ ] Level 1
+        - [ ] Level 2
 - [ ] AutoRule rule extraction with QwQ-32B
 - [ ] Use rules from prev step as prompt
 	- [ ] Use rules as part of feedback for iterative refinement (new)

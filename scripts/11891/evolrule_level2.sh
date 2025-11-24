@@ -1,5 +1,5 @@
 python KernelCoder/main.py \
-    --run_name 11891_evolrule_parallel_8_batch_level2 \
+    --run_name evolrule_parallel_8_batch_level2 \
     --benchmark KernelBench \
     --level 2 \
     --num_epochs 1 \

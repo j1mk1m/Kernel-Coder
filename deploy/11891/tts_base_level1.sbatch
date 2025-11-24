@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --partition preempt
 #SBATCH --time 0-23:00 # set time
-#SBATCH --job-name=evolrule
+#SBATCH --job-name=tts_base
 #SBATCH --chdir=/home/gyeongwk/Kernel-Coder # working directory
 
-#SBATCH --gres=gpu:A6000:4
+#SBATCH --gres=gpu:A6000:1
 #SBATCH --mem=64GB
 #SBATCH --cpus-per-task=8 # cpus
 
@@ -18,4 +18,4 @@ source ~/anaconda3/etc/profile.d/conda.sh
 source ~/.bashrc
 conda activate kernel
 
-bash scripts/11891/evolrule.sh
+bash scripts/11891/tts_base_level1.sh
