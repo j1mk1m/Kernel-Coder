@@ -1,0 +1,927 @@
+You can assume the input tensors are on the GPU (all tensors are on GPU in production runs). Also, you can assume that the input is contiguous and in the correct format. 
+
+You can also assume that the following imports are already present, so you don't need to include them in your code:
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+The following constraints apply to your code:
+
+1. Your code must be able to be run after importing the above modules and using the given get_inputs() and get_init_inputs() functions.
+2. Your code must not produce any compilation errors (if you write CUDA kernels, make sure they are correct).
+3. Your code must not have any syntax errors.
+4. You may import any modules from PyTorch.
+5. You can assume that all inputs to the model are on the GPU (i.e., you can .cuda() any tensors you create).
+6. All tensors created inside your code (e.g., for parameters) should be on the GPU.
+7. The model's parameters (weights, biases) should be properly initialized and moved to the GPU.
+
+Additionally, you can use the following function to make sure that all tensors are contiguous and on the GPU:
+
+def make_contiguous(tensors):
+    return [t.cuda().contiguous() for t in tensors]
+
+**You must output the code for ModelNew class and any helper functions or CUDA kernels needed.**
+
+Wait, the user mentioned that all tensors are on the GPU already. So in get_inputs(), they might already be on GPU? The original get_init_inputs() and get_inputs() functions might not put tensors on the GPU. Wait, according to the user's note: "You can assume the input tensors are on the GPU (all tensors are on GPU in production runs). Also, you can assume that the input is contiguous and in the correct format."
+
+Therefore, the inputs to the forward function are already on the GPU, so in the ModelNew code, I don't need to move them to the GPU.
+
+Now, looking at the original architecture:
+
+The model has three operators: Linear (GEMM), GroupNorm, and HardTanh.
+
+I need to decide which operators to replace with custom CUDA kernels. Possible candidates:
+
+1. The Linear layer (GEMM): This is a matmul + bias add. Since it's a GEMM, maybe using a custom kernel can be faster, but PyTorch's implementation is already optimized. However, fusing with subsequent operations might help.
+
+2. GroupNorm: Group normalization involves normalizing along groups of channels, which can be a good candidate for a custom kernel because it might have less optimized implementation in PyTorch, especially for certain shapes.
+
+3. HardTanh: A simple element-wise activation function. Writing a custom kernel for this might not be worth it, but if fused with other operations, it could save time.
+
+Alternatively, fusing these operations into a single kernel could reduce memory traffic and kernel launch overhead. However, fusing GEMM, GroupNorm, and HardTanh into a single kernel would be complex. Alternatively, fusing the Linear (GEMM + bias) with GroupNorm and HardTanh could be possible, but that might be very involved.
+
+Alternatively, replacing the individual operators with optimized CUDA kernels.
+
+First, let's consider replacing the Linear layer with a custom matmul + bias add. The default PyTorch Linear uses cuBLAS, which is already highly optimized. However, maybe by fusing the bias addition into the kernel, we can avoid an extra kernel launch. Let's see:
+
+The standard Linear is: x = x @ weight + bias. The matrix multiplication is done via cuBLAS, and then the bias is added via element-wise addition. If we can combine those into a single kernel, perhaps with better memory access patterns, but I'm not sure if that would be faster. The bias addition is very cheap compared to the GEMM, so maybe not worth it. Alternatively, using cuBLAS's GEMM with bias is possible, but I think PyTorch already uses that. Let me check.
+
+Wait, PyTorch's Linear layer does use cuBLAS's gemm with bias, so maybe the Linear is already optimized. So perhaps the Linear isn't a good candidate.
+
+Next, GroupNorm. The GroupNorm computation can be broken down into:
+
+For each group:
+- Compute mean of the group
+- Compute variance
+- Normalize
+- Scale and shift by gamma and beta
+
+This involves per-group operations. Implementing this in a CUDA kernel might allow for better parallelism or coalesced memory access, especially for the given parameters. Let's think about the dimensions. The input is (batch_size, out_features), and num_groups is 16, so out_features must be divisible by num_groups. Here, out_features is 8192, so 8192 /16=512 features per group. So each group has 1024 (batch) *512 features. 
+
+The GroupNorm computation for each group would involve:
+
+For each group's channel slice:
+- Compute mean over the elements in that group's channels (since the group norm is over the features in each group)
+Wait, actually, group norm's mean and variance are computed over the C/H/W dimensions, but in this case, since it's 1D (batch, features), it would compute mean over the batch and features within the group. Wait, no:
+
+Wait, the group norm computes the mean and variance over the C/(num_groups) dimension, and the batch dimension? Wait, the group norm's calculation is as follows:
+
+GroupNorm divides the channels into groups and computes the mean and variance within each group across the batch and spatial dimensions (but here it's 1D). For each group, the mean is computed over all elements except the channel dimension. Since the input is (N, C), the mean and variance are computed over N * (C/group) elements for each group.
+
+So for each group, the computation is over N * (C/group) elements. So in this case, for each of the 16 groups, 1024 * 512 elements. So that's a lot of elements, so the computation can be parallelized.
+
+Implementing a custom CUDA kernel for group norm could be beneficial, especially for high-dimensional data. Let me see if that's feasible.
+
+The third operator is HardTanh, which is an element-wise operation. The existing PyTorch implementation is probably already efficient, but combining it with the GroupNorm in a fused kernel might save some memory accesses.
+
+Alternatively, fusing GroupNorm and HardTanh into a single kernel could reduce memory traffic and kernel launch overhead. Let's consider that.
+
+Alternatively, maybe the Linear can be fused with GroupNorm and HardTanh? That might be more complex, but let's think:
+
+The Linear does x = x @ weight + bias, then group norm, then hardtanh.
+
+If we can combine these three into a single kernel, that might be beneficial. Let's see:
+
+First, the GEMM would compute the output of the linear layer (with bias). Then, group norm operates on that, then hardtanh. If we can do all of this in a single kernel, perhaps we can save time.
+
+But writing such a kernel would be complex, but possible. Let's see:
+
+The steps would be:
+
+1. Compute the matrix multiplication (x @ weight) + bias. This requires a GEMM followed by bias addition.
+
+2. Perform group norm on the resulting tensor.
+
+3. Apply HardTanh.
+
+If we can perform these steps in a single kernel, we can eliminate intermediate memory writes and reduce kernel launches. Let's consider how to structure this.
+
+The GEMM is the most compute-intensive part. The group norm and hardtanh are element-wise or group-wise computations. Combining them might not be straightforward.
+
+Alternatively, first compute the GEMM and bias add in a fused way, then compute group norm and hardtanh in another kernel.
+
+Let me think about possible kernels:
+
+Option 1: Replace Linear with a custom kernel that does matmul + bias add. Since PyTorch's Linear already does this, maybe not helpful. But perhaps using a different implementation? Unlikely, so perhaps skip.
+
+Option 2: Replace GroupNorm with a custom kernel. Let's try this first.
+
+Option 3: Replace GroupNorm and HardTanh with a single fused kernel. That could be better.
+
+So perhaps the best path is to implement a custom kernel for GroupNorm and HardTanh together, fusing those two operations.
+
+Let me outline the steps for a GroupNorm+HardTanh kernel.
+
+First, for each group:
+
+- Compute mean of the group's elements (over all batch and the channels in the group)
+
+Wait, the group norm formula is as follows:
+
+For each group g (assuming the channels are divided into G groups):
+
+For each element x in the group's channels:
+
+The mean μ_g is the average over all elements in the group (across batch and channels in the group).
+
+The variance σ²_g is the average of squared deviations from the mean.
+
+Then, the normalized value is (x - μ_g)/(sqrt(σ²_g + ε)), then scaled by gamma and beta parameters.
+
+Wait, the parameters gamma and beta are learned, but in the given model, the GroupNorm is initialized with default parameters (assuming the parameters are set via the constructor). Wait, in the original code, the GroupNorm is created with num_groups and out_features, so gamma and beta are parameters that need to be initialized. Since in the model, the parameters are part of the GroupNorm layer, which is a PyTorch module, so when we replace the GroupNorm with a custom kernel, we need to handle the parameters.
+
+Wait, the problem is that when we create a custom kernel for GroupNorm, we need to pass the gamma and beta parameters. Since in PyTorem, the GroupNorm layer has parameters (gamma and beta), which are stored as .weight and .bias in the module. So in the custom implementation, we need to replicate this.
+
+Therefore, in order to replace the GroupNorm with a custom kernel, we need to define those parameters in the model.
+
+Therefore, the ModelNew would need to include the parameters (gamma and beta) as part of the model's state. So in the ModelNew, instead of using the nn.GroupNorm module, we need to define the parameters ourselves and then use the custom kernel.
+
+Similarly, the Linear layer has parameters (weight and bias), which are stored in the model. So if we replace the Linear layer with a custom kernel, we need to define those parameters.
+
+Alternatively, perhaps replacing the GroupNorm and HardTanh together with a custom kernel would be better.
+
+Let me proceed step by step.
+
+First, let's consider the GroupNorm implementation.
+
+The standard PyTorch GroupNorm is:
+
+def forward(self, x):
+    x = F.group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
+    return x
+
+So the parameters are weight (gamma) and bias (beta), which are of size (out_features, ), since each channel has its own gamma and beta.
+
+The computation is:
+
+x = (x - mean) / sqrt(var + eps) * gamma + beta
+
+Then, apply HardTanh.
+
+So fusing these two would involve:
+
+After computing the normalized x, apply the gamma and beta scaling and shifting, then clamp to [hardtanh_min, hardtanh_max].
+
+Therefore, the fused kernel can compute group norm and apply hardtanh in a single step.
+
+Let me outline the steps for the fused kernel:
+
+For each element in the input tensor (after linear layer):
+
+1. Split into groups.
+
+2. For each group:
+
+   a. Compute mean over the group's elements (over all batch and within the group's channels).
+
+   b. Compute variance.
+
+   c. Compute normalized value: (x - mean)/sqrt(var + eps)
+
+   d. Multiply by gamma and add beta.
+
+3. Apply HardTanh: clamp to [min, max].
+
+The challenge is to implement this efficiently in CUDA.
+
+Now, to structure the kernel:
+
+The input tensor is of shape (batch_size, out_features).
+
+Let me think about the dimensions:
+
+Let batch_size = N, out_features = C, num_groups = G.
+
+Each group has C/G channels.
+
+Each group has N * (C/G) elements.
+
+So for each group g, we need to compute the mean and variance over N * (C/G) elements.
+
+The parameters gamma and beta are of size (C, ), so for each channel, there is a gamma and beta.
+
+The steps in the kernel:
+
+First, for each element in the input:
+
+1. Determine which group it belongs to. The group index can be determined by channel index divided by (C/G).
+
+But in CUDA, we need to process this in parallel.
+
+Possible approach:
+
+The kernel can process each element, but the mean and variance computation requires reduction over the group.
+
+So, the computation would need to be:
+
+First, compute the mean and variance for each group.
+
+Then, compute the normalized value for each element, apply gamma and beta, then apply the hardtanh.
+
+This requires two passes: first to compute the means and variances (reduction over groups), then to compute the normalized values and apply the activation.
+
+However, this requires storing the intermediate means and variances, which could be done using shared memory or atomic operations, but for large tensors, this might be challenging.
+
+Alternatively, using a parallel reduction approach for the mean and variance.
+
+Alternatively, we can structure the kernel to compute the means and variances first.
+
+But in CUDA, this is challenging because reduction operations require synchronization or using atomic operations.
+
+Alternatively, we can precompute the means and variances in separate kernel launches, then launch another kernel to compute the normalized values and apply the activation.
+
+However, this would require multiple kernel launches, which might negate some of the benefits.
+
+Alternatively, using a kernel that first computes the means and variances for each group, stores them in an array, then proceeds to compute the normalized values and apply the activation.
+
+This approach is feasible.
+
+Let me outline this approach:
+
+First, compute for each group the mean and variance:
+
+1. Allocate arrays to store mean and variance for each group (size G).
+
+2. Launch a kernel to compute the mean and variance for each group.
+
+Then, in a second kernel, compute the normalized values using the precomputed means and variances, apply gamma/beta, then apply HardTanh.
+
+This requires two kernel launches, but if the number of groups is small (like 16 in this case), it might be manageable.
+
+Alternatively, perhaps we can combine these into a single kernel, but that might be complex.
+
+Alternatively, maybe the PyTorch implementation is already optimized, so replacing it with a custom kernel may not be worth it, but let's proceed.
+
+Let's proceed with the plan of two separate kernels: one for computing the means and variances, and another for applying the normalization and activation.
+
+However, this would involve two kernel launches, which may have overhead. Alternatively, can we do everything in a single kernel?
+
+Alternatively, we can compute the means and variances in a way that each thread block handles a group.
+
+Let me think of a kernel structure:
+
+Suppose each thread block is responsible for processing a group.
+
+For each group g:
+
+- The block processes all elements in that group.
+
+Each thread in the block handles a portion of the elements in the group.
+
+First, compute the sum of the elements in the group, then compute the mean.
+
+Then compute the sum of squared differences, then the variance.
+
+This can be done with reduction within the block.
+
+Once the block has the sum and sum_squared, it can compute mean and variance, and write them to global memory.
+
+Then, after all blocks have completed, each thread can read their group's mean and variance, and compute the normalized value, apply gamma and beta, and apply the hardtanh.
+
+This approach would require:
+
+- A first kernel for reduction per group (each block handles a group).
+
+- A second kernel for applying the normalization and activation.
+
+But since the groups are processed in blocks, the number of blocks must be equal to the number of groups.
+
+Given that num_groups is 16, which is small, this is manageable.
+
+So steps for the first kernel:
+
+Kernel 1 (Compute means and variances):
+
+Input:
+
+- Input tensor (N, C)
+
+- gamma (C)
+
+- beta (C)
+
+- Output arrays: means (size G), variances (size G)
+
+Each block is assigned to a group g (0 to G-1).
+
+Within a block, each thread processes a portion of the elements in the group's channels.
+
+First, compute the sum of x over the group's elements.
+
+Then compute the sum of squares.
+
+Then, in the block, perform reduction to get total_sum and total_squares.
+
+Then compute mean = total_sum / (N * (C/G)).
+
+Compute variance = (total_squares - mean^2 * N*(C/G)) / (N*(C/G)).
+
+Wait, variance is usually computed as E[x²] - (E[x])².
+
+Alternatively, variance = (sum of squares - (sum)^2 / N) / (N).
+
+Yes, so variance = (sum_sq - (sum)^2 / count) / count.
+
+Wait, actually, the formula for variance is:
+
+var = (sum_sq - (sum)^2 / count) / (count)
+
+Therefore, in the block:
+
+count = N * (C/G)
+
+sum = total_sum
+
+sum_sq = total_squares
+
+var = (sum_sq - (sum * sum) / count) / count
+
+Once mean and var are computed, they are stored in the means and variances arrays.
+
+Then, in the second kernel:
+
+Kernel 2 (Apply normalization and HardTanh):
+
+For each element x in the input:
+
+1. Determine which group g the element is in.
+
+2. Read mean[g] and var[g].
+
+3. Compute normalized_x = (x - mean) / sqrt(var + eps).
+
+4. Apply scaling: normalized_x * gamma[channel] + beta[channel].
+
+5. Apply HardTanh: clamp to [min_val, max_val].
+
+Then write the result to the output.
+
+This can be done per-element, in parallel.
+
+The eps is a small constant to prevent division by zero. The original GroupNorm uses 1e-5 by default, but in the given model's initialization, the parameters are passed via get_init_inputs(). Wait, in the original code, the GroupNorm is created with the default eps (since it's not specified). However, in the given code for the Model, the GroupNorm is initialized with:
+
+self.group_norm = nn.GroupNorm(num_groups, out_features)
+
+Which uses the default eps=1e-5. So we need to include that.
+
+But in the custom kernel, we have to set that.
+
+So, the custom kernel will need to have an epsilon value. Since in the original model, it's using the default, we can hardcode it as 1e-5, unless the user expects it to be a parameter, but in the given problem statement, the parameters for the model are given via get_init_inputs() as [in_features, out_features, num_groups, hardtanh_min, hardtanh_max]. The GroupNorm parameters (gamma and beta) are initialized by PyTorch, but when replacing with a custom kernel, we need to define those parameters in the model.
+
+Therefore, the ModelNew would need to have parameters for gamma and beta for the group norm.
+
+Similarly, the Linear layer's weight and bias are parameters.
+
+Therefore, in the ModelNew, we can structure it as follows:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, hardtanh_min, hardtanh_max):
+        super().__init__()
+        # Define parameters for Linear layer
+        self.weight = nn.Parameter(torch.empty(out_features, in_features).cuda())
+        self.bias = nn.Parameter(torch.empty(out_features).cuda())
+        # Initialize them like PyTorch's Linear
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        bound = 1 / math.sqrt(in_features)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+        # Parameters for GroupNorm
+        self.gamma = nn.Parameter(torch.ones(out_features).cuda())
+        self.beta = nn.Parameter(torch.zeros(out_features).cuda())
+
+        # HardTanh parameters
+        self.min_val = hardtanh_min
+        self.max_val = hardtanh_max
+
+        # Load the custom CUDA kernel
+        # ... code for loading the kernels ...
+
+    def forward(self, x):
+        # Compute Linear: matmul + bias
+        # Custom kernel for Linear?
+        # Alternatively, use PyTorch's implementation for Linear, then pass to group norm kernel.
+
+        # For now, let's use PyTorch's Linear for GEMM + bias, then apply custom group norm + hardtanh
+
+        x = F.linear(x, self.weight, self.bias)
+
+        # Now apply custom group norm and hardtanh
+        x = self.group_norm_and_hardtanh(x, self.gamma, self.beta, self.min_val, self.max_val)
+
+        return x
+
+    def group_norm_and_hardtanh_cuda(...):
+        # calls the CUDA kernel
+
+Wait, but the problem requires to use custom CUDA kernels for some operators. So perhaps replacing the Linear with a custom kernel as well? Or just the group norm and hardtanh.
+
+Let me focus on replacing the GroupNorm and HardTanh with a custom fused kernel first.
+
+Therefore, the steps are:
+
+1. Define a custom CUDA kernel that takes the input tensor, gamma, beta, min_val, max_val, and computes group norm followed by hardtanh.
+
+2. The kernel is split into two parts: first compute the group means and variances, then compute the normalized values and apply the activation.
+
+But as mentioned earlier, this requires two kernel launches (compute stats, then apply), or a more complex single kernel approach.
+
+Let me try to write the code for this.
+
+First, the CUDA code for the custom kernel.
+
+First, the two-step approach:
+
+First kernel: compute means and variances per group.
+
+Second kernel: apply normalization and activation.
+
+So, in the CUDA code, we need to:
+
+1. Allocate arrays for means and variances.
+
+But in PyTorch, we can use tensors for this.
+
+Alternatively, in the kernel code, the first kernel writes to global memory arrays.
+
+So, in the first kernel:
+
+Each block is assigned to a group g.
+
+Within the block:
+
+- Iterate over all elements in the group.
+
+- Compute the sum and sum of squares.
+
+Then reduce within the block to get the total sum and sum_sq.
+
+Then compute mean and var.
+
+Store mean and var in global arrays.
+
+Wait, but in CUDA, we can have shared memory per block.
+
+So here's the code outline for the first kernel (compute means and variances):
+
+__global__ void compute_group_stats(const float* x_data, float* means, float* vars,
+                                   int batch_size, int num_groups, int channels,
+                                   int channels_per_group, float eps) {
+    // Each block handles one group
+    int g = blockIdx.x;
+    if (g >= num_groups) return;
+
+    // Each thread in the block handles a portion of the elements in the group
+    extern __shared__ float shared[];
+    float* sum = shared;
+    float* sum_sq = shared + blockDim.x;
+
+    // Initialize shared memory for sum and sum_sq
+    sum[threadIdx.x] = 0.0f;
+    sum_sq[threadIdx.x] = 0.0f;
+
+    __syncthreads();
+
+    // Each thread processes a chunk of elements
+    int elements_per_group = batch_size * channels_per_group;
+    int stride = blockDim.x * gridDim.x; // Assuming gridDim.x is number of threads per block?
+
+    Wait, perhaps a better way: Each thread in the block processes some elements.
+
+Alternatively, each thread in the block processes (elements_per_group / blockDim.x) elements.
+
+Alternatively, use a loop over all elements in the group.
+
+Wait, the group has batch_size * channels_per_group elements.
+
+Each thread in the block can process a few elements.
+
+The steps:
+
+First, for each thread in the block:
+
+for (int i = threadIdx.x; i < elements_per_group; i += blockDim.x) {
+    // compute the index in x_data
+    // Need to map the group index and element within the group to the x's indices.
+
+Wait, how are the elements arranged in memory?
+
+The input x is a tensor of shape (N, C), stored in row-major order (so for each sample, all features are contiguous).
+
+The group g has channels from g * channels_per_group to (g+1)*channels_per_group.
+
+Thus, for a group g, the elements are located at all samples (N) and channels in that group.
+
+The total elements in a group is N * channels_per_group.
+
+So the index in the flattened x array for a particular element in group g can be computed as:
+
+For a given element index within the group (from 0 to elements_per_group-1):
+
+The sample index is: sample = element // channels_per_group
+
+The channel index within the group is: channel_in_group = element % channels_per_group
+
+The global channel index is: g * channels_per_group + channel_in_group
+
+Thus, the global index in the x array is:
+
+sample * C + (g * channels_per_group + channel_in_group)
+
+Therefore, the value at position (sample, global_channel) is x[sample * C + global_channel]
+
+Therefore, in the kernel, for a given group g and element index within the group i:
+
+sample = i / channels_per_group
+
+channel_in_group = i % channels_per_group
+
+global_channel = g * channels_per_group + channel_in_group
+
+x_val = x_data[sample * C + global_channel]
+
+Then, each thread in the block can process an element i and accumulate the sum and sum_sq.
+
+But for large elements_per_group, this could be slow.
+
+Alternatively, the threads can read in parallel.
+
+But for the reduction, the shared memory can be used.
+
+First, each thread in the block processes a portion of the elements in the group.
+
+Each thread reads an element, adds its value to the sum (in shared memory), and the square to sum_sq.
+
+Wait, but to do this, we need to loop over all elements, but with threads processing chunks.
+
+Alternatively, using a loop:
+
+for (int i = threadIdx.x; i < elements_per_group; i += blockDim.x) {
+    int sample = i / channels_per_group;
+    int channel_in_group = i % channels_per_group;
+    int global_channel = g * channels_per_group + channel_in_group;
+    int idx = sample * channels + global_channel;
+    float val = x_data[idx];
+    atomicAdd(&sum[threadIdx.x], val); // Not sure, maybe better to use a parallel reduction.
+
+Wait, using atomicAdd is slow. Instead, the threads can accumulate into their own private variables and then write to shared memory.
+
+Alternatively, each thread computes a partial sum and partial sum_sq for its assigned elements, then write to shared memory, then do a reduction within the block.
+
+Alternatively, use a parallel reduction approach.
+
+The exact implementation would require careful handling.
+
+Alternatively, let's think of the first kernel as follows:
+
+Each block handles a group.
+
+The threads in the block process all elements in the group in parallel.
+
+First, each thread loads a chunk of elements, computes their contribution to the sum and sum_sq, then stores these in shared memory.
+
+Then, the block performs a parallel reduction on the shared memory.
+
+Let me structure this.
+
+Inside the compute_group_stats kernel:
+
+Each block is a group g.
+
+The block size is chosen such that blockDim.x is sufficient to cover the elements in the group. But for large elements_per_group, this may not be feasible.
+
+Alternatively, use a block size of 256 threads, and each thread handles multiple elements.
+
+Alternatively, let's use a block size of 256, and have each thread handle (elements_per_group / 256) elements.
+
+Wait, here's an outline:
+
+Compute the total number of elements in the group: elements_per_group = batch_size * channels_per_group.
+
+Each thread in the block handles a chunk of elements:
+
+int elements_per_thread = (elements_per_group + blockDim.x -1) / blockDim.x;
+
+for (int i = 0; i < elements_per_thread; i++) {
+
+    int global_i = threadIdx.x * elements_per_thread + i;
+
+    if (global_i >= elements_per_group) break;
+
+    // compute sample and channel_in_group as before.
+
+    float val = x_data[ ... ];
+
+    // accumulate to private variables
+
+    sum += val;
+
+    sum_sq += val * val;
+
+}
+
+After all threads have computed their partial sums, they write to shared memory:
+
+sum_partial = sum;
+
+sum_sq_partial = sum_sq;
+
+__syncthreads();
+
+Then perform a parallel reduction on the shared memory to compute the total_sum and total_sum_sq for the group.
+
+Once that is done, the first thread in the block can compute the mean and variance.
+
+Then write to the means and vars arrays:
+
+means[g] = mean;
+
+vars[g] = var;
+
+This approach requires a parallel reduction within the block for the sum and sum_sq.
+
+The reduction can be done using a binary reduction tree.
+
+This is a bit involved, but manageable.
+
+Once the stats are computed, the second kernel can process each element.
+
+The second kernel: apply normalization and HardTanh.
+
+Each thread processes an element in the input tensor.
+
+For each element (sample, channel):
+
+- Determine which group g it belongs to (g = channel / channels_per_group)
+
+- Get mean = means[g], var = vars[g]
+
+- Compute normalized_x = (x_val - mean) / sqrt(var + eps)
+
+- Apply gamma and beta: normalized_x * gamma[channel] + beta[channel]
+
+- Clamp to [min_val, max_val]
+
+Store the result in the output tensor.
+
+This is straightforward per-element operation.
+
+Now, the code for the CUDA kernels:
+
+First, the compute_group_stats kernel.
+
+Then, the apply_group_norm_and_hardtanh kernel.
+
+Additionally, we need to handle the parameters gamma and beta, which are of size C.
+
+In the custom kernel, these parameters are passed as tensors.
+
+Now, putting this into code:
+
+First, let's write the CUDA source code.
+
+First, the first kernel (compute_group_stats):
+
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <typename scalar_t>
+__global__ void compute_group_stats_kernel(
+    const scalar_t* x_data,
+    scalar_t* means,
+    scalar_t* vars,
+    int batch_size,
+    int num_groups,
+    int channels,
+    int channels_per_group,
+    float eps) {
+
+    int g = blockIdx.x;
+    if (g >= num_groups) return;
+
+    // Each thread in the block processes a portion of the elements in the group
+    __shared__ scalar_t shared_sums[2 * 256]; // Assuming blockDim.x up to 256
+    int tid = threadIdx.x;
+
+    // Initialize shared memory to zero
+    shared_sums[tid] = 0.0;
+    shared_sums[tid + blockDim.x] = 0.0;
+    __syncthreads();
+
+    int elements_per_group = batch_size * channels_per_group;
+    int elements_per_thread = (elements_per_group + blockDim.x - 1) / blockDim.x;
+
+    scalar_t sum = 0.0;
+    scalar_t sum_sq = 0.0;
+
+    for (int i = 0; i < elements_per_thread; i++) {
+        int global_i = tid * elements_per_thread + i;
+        if (global_i >= elements_per_group) break;
+
+        // Compute sample and channel_in_group
+        int sample = global_i / channels_per_group;
+        int channel_in_group = global_i % channels_per_group;
+        int global_channel = g * channels_per_group + channel_in_group;
+        int idx = sample * channels + global_channel;
+
+        scalar_t val = x_data[idx];
+        sum += val;
+        sum_sq += val * val;
+    }
+
+    // Write partial sums to shared memory
+    atomicAdd(&shared_sums[tid], sum);
+    atomicAdd(&shared_sums[tid + blockDim.x], sum_sq);
+
+    __syncthreads();
+
+    // Perform block-wise reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sums[tid] += shared_sums[tid + s];
+            shared_sums[tid + blockDim.x] += shared_sums[tid + blockDim.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        scalar_t total_sum = shared_sums[0];
+        scalar_t total_sum_sq = shared_sums[blockDim.x];
+
+        int count = batch_size * channels_per_group;
+        scalar_t mean = total_sum / count;
+        scalar_t variance = (total_sum_sq - mean * total_sum) / count;
+        variance = variance / count; // Wait, no, the variance formula is (sum_sq - (sum)^2 / count)/count ?
+
+        Wait, variance = (sum_sq - (sum^2)/count)/count ?
+
+        Wait, the correct variance is:
+
+        variance = (sum_sq - (sum)^2 / count) / count ?
+
+        Let me double-check:
+
+        variance = E[x^2] - (E[x])^2 = (sum_sq / count) - (sum / count)^2
+
+        So variance = (sum_sq - (sum^2)/count)/count ?
+
+        Wait, no:
+
+        (sum_sq / count) - (sum / count)^2 = [sum_sq - (sum)^2 / count ] / count.
+
+        So yes, variance = (sum_sq - (sum^2)/count) / count.
+
+        Therefore:
+
+        variance = (total_sum_sq - (total_sum * total_sum) / count) / count;
+
+        So:
+
+        variance = (total_sum_sq - (total_sum * total_sum) / count) / count;
+
+        Then, add eps:
+
+        variance += eps;
+
+        Wait, no, the formula is:
+
+        normalized_x = (x - mean) / sqrt(variance + eps)
+
+        So variance here is the variance computed as above, then add eps to the variance before sqrt?
+
+        Wait, the standard formula for group norm is:
+
+        variance = (sum_sq - (sum^2)/count) / count
+
+        then, variance_clamped = variance + eps
+
+        so sqrt(variance_clamped)
+
+        So in code:
+
+        variance = (total_sum_sq - (total_sum * total_sum)/count) / count;
+
+        Then, the denominator is sqrt(variance + eps).
+
+        So, proceeding:
+
+        variance = (total_sum_sq - (total_sum * total_sum)/count) / count;
+
+        Then:
+
+        means[g] = mean;
+
+        vars[g] = variance;
+
+    }
+}
+
+Wait, but in the code above, after the reduction, the first thread (tid 0) has the total_sum and total_sum_sq.
+
+Wait, in the code above, the shared_sums[tid] after reduction is the total_sum, and shared_sums[tid + blockDim.x] is total_sum_sq?
+
+Wait no. The initial step where each thread accumulates their sum and sum_sq into the shared memory via atomicAdd may not be correct.
+
+Wait, the code above first initializes the shared memory to zero.
+
+Then, each thread computes their partial sum and sum_sq.
+
+Then, they perform atomicAdd to shared_sums[tid] for the sum, and shared_sums[tid + blockDim.x] for the sum_sq.
+
+Wait, but this would mean that each thread's partial sums are added to the shared memory at their thread index.
+
+Wait, actually, the code as written has each thread adding their partial sum to shared_sums[tid], and partial sum_sq to shared_sums[tid + blockDim.x]. But since all threads are doing this, it would result in all the partial sums being summed into each position, which is incorrect.
+
+Wait, no, atomicAdd adds the value to the address. So for example, if all threads are adding to shared_sums[0], then it would sum all the partial sums. But in the current code, each thread is adding to their own thread's index, which would not accumulate all the contributions.
+
+This is a mistake. The atomicAdd should be to the same location for all threads.
+
+Wait, this is incorrect. The way the code is structured now, each thread is writing to their own slot in shared_sums, so the total would not be summed.
+
+This is a critical error.
+
+Instead, all threads should add their partial sums to the same location in shared memory.
+
+Therefore, the code should have:
+
+atomicAdd(&shared_sums[0], sum);
+
+atomicAdd(&shared_sums[blockDim.x], sum_sq);
+
+But since shared memory is per block, this would require using a single location for the sum and sum_sq.
+
+Alternatively, better to have each thread write their partial sums to shared memory and then do a parallel reduction.
+
+Alternatively, the initial approach of using atomicAdd is incorrect. Let me correct this.
+
+Let me restructure the kernel:
+
+Each thread computes their own partial sum and sum_sq.
+
+They then write these into their own location in shared memory.
+
+Then, after a syncthreads, perform a parallel reduction.
+
+Wait, here's the corrected approach:
+
+After each thread computes their partial sum and sum_sq:
+
+    shared_sums[tid] = sum;
+
+    shared_sums[tid + blockDim.x] = sum_sq;
+
+    __syncthreads();
+
+Then perform a reduction across the block.
+
+Wait, but this requires using shared memory properly.
+
+Alternatively, here's a better approach:
+
+Each thread computes a partial sum and partial sum_sq, and writes them into their thread's position in shared memory.
+
+Then, perform a parallel reduction across the block to compute the total_sum and total_sum_sq.
+
+The reduction can be done in two separate reductions for sum and sum_sq.
+
+Let me structure this:
+
+First, each thread writes their partial sums to shared memory:
+
+    shared_sums[tid] = sum;
+
+    shared_sums[tid + blockDim.x] = sum_sq;
+
+    __syncthreads();
+
+Then, the block performs a reduction on the first half (sums) and second half (sum_sq).
+
+For the sum:
+
+    for (int s = blockDim.x / 2; s > 0; s >>=1) {
+
+        if (tid < s) {
+
+            shared_sums[tid] += shared_sums[tid + s];
+
+        }
+
+        __syncthreads();
+
+    }
+
+Similarly for the sum_sq:
+
+    for (int s = blockDim.x / 2; s > 0; s >>=1) {
+
+        if (tid < s) {
+
+            shared_sums[tid + blockDim.x] += shared_sums[tid + blockDim.x + s];
+
+        }
+
+        __syncthreads();
+

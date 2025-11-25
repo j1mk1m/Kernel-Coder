@@ -1,0 +1,246 @@
+The code is expected to run with the following command: 
+
+    python3 -m torchdynamo Example.py --backend="eager"
+
+    where Example.py is the file implementing the code you generate.
+
+    The code must work with PyTorch 2.1.2 and CUDA 12.1.
+
+    Also note that the cross entropy loss computation is the only operation in this model. So you need to replace that with a custom CUDA kernel. To optimize the given cross entropy loss computation using a custom CUDA kernel, we can implement the entire forward pass in a single kernel. This avoids the overhead of multiple PyTorch operations and can exploit parallelism efficiently. Below is the optimized code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for cross entropy loss
+cross_entropy_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+template <typename scalar_t>
+__global__ void cross_entropy_loss_forward_kernel(
+    const scalar_t* __restrict__ predictions,
+    const int64_t* __restrict__ targets,
+    scalar_t* __restrict__ output,
+    int batch_size,
+    int num_classes,
+    int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    scalar_t max_val = -INFINITY;
+    for (int c = 0; c < num_classes; ++c) {
+        if (predictions[idx * num_classes + c] > max_val) {
+            max_val = predictions[idx * num_classes + c];
+        }
+    }
+
+    scalar_t sum = 0.0;
+    for (int c = 0; c < num_classes; ++c) {
+        sum += exp(predictions[idx * num_classes + c] - max_val);
+    }
+
+    scalar_t log_prob = -max_val - log(sum);
+    log_prob += predictions[idx * num_classes + targets[idx]];
+
+    atomicAdd(output, -log_prob / batch_size);
+}
+
+torch::Tensor cross_entropy_loss_cuda(
+    torch::Tensor predictions,
+    torch::Tensor targets) {
+    const int batch_size = predictions.size(0);
+    const int num_classes = predictions.size(1);
+    const int dim = 1;  // Fixed dimension for reduction
+
+    auto output = torch::zeros(1, predictions.options().dtype(torch::kFloat32));
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size + block_size - 1) / block_size;
+
+    AT_DISPATCH_FLOATING_TYPES(predictions.scalar_type(), "cross_entropy_loss_forward", ([&] {
+        cross_entropy_loss_forward_kernel<scalar_t><<<num_blocks, block_size>>>(
+            predictions.data_ptr<scalar_t>(),
+            targets.data_ptr<int64_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            num_classes,
+            dim);
+    }));
+
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+cross_entropy_loss_header = """
+torch::Tensor cross_entropy_loss_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+# Load the inline CUDA code
+cross_entropy_loss = load_inline(
+    name="cross_entropy_loss",
+    cpp_sources=cross_entropy_header,
+    cuda_sources=cross_entropy_loss_source,
+    functions=["cross_entropy_loss_cuda"],
+    verbose=True,
+    extra_cflags=["-DWITH_CUDA"],
+    extra_cuda_cflags=["-DWITH_CUDA"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cross_entropy_loss = cross_entropy_loss
+
+    def forward(self, predictions, targets):
+        return self.cross_entropy_loss.cross_entropy_loss_cuda(predictions, targets)
+
+def get_inputs():
+    batch_size = 32768
+    num_classes = 4096
+    return [torch.rand(batch_size, num_classes).cuda(), torch.randint(0, num_classes, (batch_size,)).cuda()]
+
+def get_init_inputs():
+    return []
+```
+
+Key optimizations made in the custom CUDA kernel:
+
+1. **Single Kernel Execution**: The entire computation (logits normalization, log-softmax, and loss computation) is done in a single CUDA kernel to minimize kernel launch overhead.
+
+2. **Parallel Reduction**: Each thread handles one sample in the batch, computing the log-probability for its sample independently.
+
+3. **Stable Computation**: Uses the max trick to prevent numerical instability in the exponentiation step, similar to PyTorch's implementation.
+
+4. **Atomic Operation**: Uses atomicAdd for accumulating the loss to avoid race conditions when summing across threads.
+
+5. **Memory Efficiency**: Avoids intermediate tensors by computing all steps in-place where possible.
+
+6. **Template Dispatch**: Uses ATen's AT_DISPATCH_FLOATING_TYPES to handle different floating-point types (float, double).
+
+The kernel first computes the max value for each sample to stabilize the exponentiation, then computes the sum of exponentials, then calculates the log-softmax term, and finally accumulates the negative log probability. The result is divided by the batch size to compute the average loss. This implementation should provide better performance than the PyTorch version for large batch sizes and number of classes.
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cross_entropy_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+template <typename scalar_t>
+__global__ void cross_entropy_loss_forward(
+    const scalar_t* __restrict__ predictions,
+    const int64_t* __restrict__ targets,
+    scalar_t* output,
+    int batch_size,
+    int num_classes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    scalar_t max_val = -INFINITY;
+    for (int c = 0; c < num_classes; ++c) {
+        scalar_t val = predictions[idx * num_classes + c];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    scalar_t sum_exp = 0;
+    for (int c = 0; c < num_classes; ++c) {
+        sum_exp += exp(predictions[idx * num_classes + c] - max_val);
+    }
+
+    int target = targets[idx];
+    scalar_t log_prob = -max_val - log(sum_exp) + predictions[idx * num_classes + target];
+
+    atomicAdd(output, -log_prob);
+}
+
+torch::Tensor cross_entropy_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    const int batch_size = predictions.size(0);
+    const int num_classes = predictions.size(1);
+
+    auto output = torch::zeros(1, predictions.options());
+
+    const int block_size = 256;
+    const int grid_size = (batch_size + block_size - 1) / block_size;
+
+    AT_DISPATCH_FLOATING_TYPES(predictions.scalar_type(), "cross_entropy_loss", ([&] {
+        cross_entropy_loss_forward<scalar_t><<<grid_size, block_size>>>(
+            predictions.data_ptr<scalar_t>(),
+            targets.data_ptr<int64_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            num_classes);
+    }));
+
+    output.div_(batch_size);
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+cross_entropy_loss_header = """
+torch::Tensor cross_entropy_loss_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+cross_entropy_loss = load_inline(
+    name="cross_entropy_loss",
+    cpp_sources=cross_entropy_loss_header,
+    cuda_sources=cross_entropy_loss_source,
+    functions=["cross_entropy_loss_cuda"],
+    verbose=True,
+    extra_cflags=["-DWITH_CUDA"],
+    extra_cuda_cflags=["-DWITH_CUDA"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_func = cross_entropy_loss.cross_entropy_loss_cuda
+
+    def forward(self, predictions, targets):
+        return self.forward_func(predictions, targets)
+
+def get_inputs():
+    batch_size = 32768
+    num_classes = 4096
+    predictions = torch.rand(batch_size, num_classes, device='cuda', dtype=torch.float32)
+    targets = torch.randint(0, num_classes, (batch_size,), device='cuda', dtype=torch.int64)
+    return [predictions, targets]
+
+def get_init_inputs():
+    return []
+```
+
+**Explanation**
+
+The provided implementation replaces PyTorch's cross-entropy loss with a custom CUDA kernel for better performance. Here's the breakdown:
+
+1. **Kernel Design**:
+   - **Single Kernel Execution**: The entire forward computation (logits normalization, log-softmax, loss accumulation) is done in a single kernel to minimize kernel launch overhead.
+   - **Thread Mapping**: Each thread handles one sample in the batch, processing independently to maximize parallelism.
+   - **Numerical Stability**: Uses the max trick to prevent overflow/underflow in exponentiation.
+
+2. **Optimizations**:
+   - **Atomic Operation**: Uses `atomicAdd` to safely accumulate the loss across threads.
+   - **Memory Access**: Direct access to tensor data pointers for speed.
+   - **Loop Unrolling**: Implicitly optimized through CUDA's thread-level parallelism.
+
+3. **PyTorch Integration**:
+   - Uses `AT_DISPATCH_FLOATING_TYPES` to handle different data types (float, double).
+   - Properly synchronizes CUDA streams with `cudaDeviceSynchronize()`.
+
+4. **Input Handling**:
+   - Explicitly moves inputs to GPU in `get_inputs()` for better performance.
+   - Uses `device='cuda'` and explicit data types in tensor creation.
+
+This implementation should provide significant speedups over the PyTorch implementation for large batch sizes and number of classes by reducing Python overhead and leveraging GPU parallelism more effectively.
+```
+
+Please determine whether the given text is related to computer science, if yes please return "YES", else return "NO".

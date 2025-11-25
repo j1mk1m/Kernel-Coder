@@ -1,0 +1,618 @@
+The following is a list of operators in the given architecture, along with their approximate execution times on A100 GPU (NVIDIA Ampere Architecture):
+- Linear layer (Gemm): 6.0 ms
+- LogSumExp (logsumexp): 0.3 ms
+- Each LeakyReLU: 0.02 ms
+- Each GELU: 0.03 ms
+
+Total approximate execution time: 6.38 ms
+
+The goal is to reduce the total execution time. The minimum required speedup is 1.3X. Your code should run on a single GPU. If you need to split the kernel into multiple streams, you can do so but must synchronize correctly. 
+
+You can choose to optimize any of the operators, combine operators into a single kernel, or change the algorithm. 
+
+You are expected to demonstrate knowledge of CUDA best practices such as memory access patterns, kernel fusion, thread coarsening, and avoiding redundant computations.
+
+When writing CUDA kernels, you must use the latest PyTorch API (i.e., the ones using `torch.utils.cpp_extension.load_inline`). 
+
+When writing CUDA code, you must use the latest C++/CUDA syntax and features (CUDA 12+). 
+
+When writing fused CUDA kernels, you can use the `CUDA graph` feature for performance, but it's optional. 
+
+Your fused kernels should avoid unnecessary memory allocations (e.g., intermediate tensors). 
+
+Make sure to handle input and output tensors correctly in fused operations, including memory allocation and cleanup.
+
+Now, proceed to rewrite the given architecture with optimized CUDA kernels to meet or exceed the required speedup. 
+
+---
+
+Okay, I need to optimize the given Model to achieve at least 1.3X speedup. Let me look at the original architecture and the execution times.
+
+The original steps are: Linear (6.0ms), LogSumExp (0.3ms), two LeakyReLUs (0.02 each, total 0.04), and two GELUs (0.03 each, total 0.06). Total is 6.38ms. To get 1.3X, target is around 4.9ms. 
+
+The biggest time consumer is the Linear layer (Gemm) at 6ms. Maybe fusing some of the following operations into the Linear kernel can help. Since after the linear layer comes logsumexp, which reduces the dimension, but wait, the logsumexp is over dim=1, so the output after linear is (batch_size, out_features), then logsumexp reduces to (batch_size, 1). Then the subsequent activations (leaky_relu and gelu) are applied to that 1-element dimension? Wait, no. Wait the logsumexp is over dim=1, so the output of that is (batch_size, 1). Then the next activations (leaky_relu and gelu) would each take that tensor and apply their operations element-wise. So all subsequent operations are on a much smaller tensor. 
+
+Wait, but the problem is that the Linear is the most expensive part. The logsumexp is 0.3ms, which is small compared to 6ms. The subsequent activations are negligible. So maybe the key is to fuse the Linear with the logsumexp, since logsumexp is the next step. Let me see:
+
+The logsumexp is computed as log(sum(exp(x))), over dim=1. So maybe we can compute the linear's output and then compute the logsumexp in the same kernel. However, the linear is a matrix multiplication (x @ W^T + bias), then the logsumexp over dim=1. Let's see:
+
+The linear layer's computation is x (B, in) * W (out, in) → gives (B, out). Then logsumexp over dim 1 (each row) gives (B, 1). 
+
+If we can compute the logsumexp in the same kernel as the matrix multiplication, that might save time. But the matrix multiplication is already a big computation. Let's see how the logsumexp can be integrated.
+
+Alternatively, perhaps fusing the linear layer with the logsumexp, and then the subsequent activations (leaky relu and gelu) into a single kernel. Let's think step by step.
+
+First, the Linear layer is the main bottleneck. Let me think about the matrix multiplication. The standard Linear layer in PyTorch uses cuBLAS, which is highly optimized. However, maybe there's some optimization we can do here. Alternatively, fusing the matrix multiplication with the logsumexp.
+
+Wait, the logsumexp requires computing for each row (each sample) the sum of exponentials of all elements in that row, then taking log. So for each element in the output of the linear layer (which is B x out_features), we can compute the sum over the out_features dimension for each row. But that would require a reduction over the features.
+
+Wait, the logsumexp is over dim=1. Let me clarify the dimensions:
+
+Suppose the input x is (B, in_features). The linear layer has weights (out_features, in_features) and bias (out_features,). The linear's output is (B, out_features). Then logsumexp over dim=1 (the out_features dimension) would give (B, 1). 
+
+So the logsumexp is a reduction over the second dimension (features) of the linear output. So the problem is that after the matrix multiply, we have to compute this reduction. 
+
+Now, if I can compute this reduction as part of the matrix multiply, that might save time. Let me see:
+
+The matrix multiplication is: for each element in the output (B x out_features), the value is sum_{k} x[i,k] * W[j,k] + bias[j], for each output j. Wait, actually the linear layer is x * W^T + bias. So the weight matrix is of shape (out_features, in_features), so when multiplied by x (B x in_features), the result is (B x out_features). 
+
+The logsumexp over dim=1 (the out_features dimension) for each row (each B) would compute for each row i:
+
+log( sum_{j=0}^{out_features-1} exp( (x_i * W^T + bias)[j] ) )
+
+So the question is, can we compute the sum over j for each i during the matrix multiplication? That might be possible, but it's a reduction over the output features. Wait, but the matrix multiplication produces all the j terms, so to compute the sum over j of exp( (x_i * W^T + bias)[j] ), we can't do that in the same step as the matrix multiplication unless we can precompute the sum during the matrix multiplication.
+
+Alternatively, perhaps we can compute the sum over j of exp( (W_j * x_i + b_j) ), but that would require accumulating for each i the sum over all j of exp( (W_j * x_i + b_j) ). Hmm, that might be possible with a different approach.
+
+Alternatively, maybe we can represent the logsumexp over all the outputs of the linear layer. Let me think:
+
+Let me denote the linear output as y = xW^T + b. Then logsumexp over dim=1 (each row) is log( sum_{j} exp(y_ij) ) for each row i.
+
+So for each row i, the logsumexp is log( sum_{j=0}^{out_features-1} exp(y_ij) )
+
+Therefore, the problem is that after computing all y_ij, we need to compute this sum for each row. However, the computation of the linear layer produces all y_ij, so the logsumexp requires a reduction over the features for each sample. 
+
+Therefore, the idea is to compute the matrix multiply and then the logsumexp in a single kernel. Let's see how that could be done.
+
+The matrix multiply is a dense computation, and the logsumexp is a reduction. So perhaps, in the kernel, for each row, after computing all y_ij, we can compute the sum of exp(y_ij) for each row, then take the log. However, the matrix multiply is O(B * out * in), while the logsumexp is O(B * out). So if the logsumexp is part of the same kernel, maybe some of the memory accesses can be optimized.
+
+Alternatively, perhaps the logsumexp can be computed in a way that overlaps with the matrix computation. For example, during the matrix multiply, for each row, accumulate the sum of exponentials. Let me think in terms of the matrix multiply steps.
+
+The matrix multiply for one row i is:
+
+for each output j in 0..out-1:
+    y_ij = sum_{k=0}^{in-1} x_ik * W_jk + b_j
+
+Then, the logsumexp for row i is log( sum_j exp(y_ij) )
+
+So perhaps, for each row i, we can compute the sum_j exp(y_ij) as part of the computation of the y_ij terms. However, since the y_ij terms depend on all k, but the sum over j would require all j terms to be computed first. Therefore, the logsumexp can't be computed in parallel with the matrix multiply; it can only be done after all y_ij for that row are computed. 
+
+Hmm. So maybe the logsumexp is a separate step but can be fused with the subsequent activations. Alternatively, we can combine the matrix multiply with the logsumexp, and then the activations, into one kernel.
+
+Alternatively, since the subsequent activations (LeakyRelu and GELU) are applied after the logsumexp, which is a scalar per row, maybe those can be fused with the logsumexp step. 
+
+Wait, after the logsumexp, the tensor becomes (B,1). So all the activations are applied to each element of that tensor. Since it's a single element per sample, the LeakyRelu and GELU would be trivial, but perhaps they can be done in the same step as the logsumexp.
+
+So here's an idea: create a kernel that does the following steps for each row i:
+
+1. Compute the matrix multiply row (i, :) to get y_ij for all j.
+
+2. Compute the logsumexp over j for that row, resulting in a scalar value.
+
+3. Apply the leaky_relu twice and then gelu twice to that scalar.
+
+Then, the output is (B,1). This way, all operations are done in a single kernel. 
+
+This approach would eliminate the intermediate tensor allocations and the multiple kernel launches. The matrix multiply and logsumexp can be fused, and the activations can be done in the same step. 
+
+Let me think about the steps:
+
+First, for each row in the input x, the matrix multiply must compute all the elements in the output row. Since the logsumexp requires all those elements, the matrix multiply has to be done first for each row. So the kernel would process each row independently. 
+
+The kernel would process each row in parallel. Each thread block could handle a row. Wait, but with B=1024 and out_features=8192, each row has 8192 elements, so each thread block would need to handle a row. But with 1024 rows, that would require 1024 blocks. 
+
+Alternatively, we can process each row's computation using a block of threads. Let me think of the kernel structure.
+
+The kernel would process each row of the input (each sample). Each thread block is assigned a row. Within the block, threads can compute the matrix multiply for that row, then compute the logsumexp, and then apply the activations.
+
+Wait, but the matrix multiply for a single row (of in_features=8192) would require a lot of threads. Let's see: the row has 8192 elements. To compute the dot product with each weight vector (each of length 8192), but wait, the linear layer's weights are out_features x in_features, so each output element is a dot product between the input row and a weight vector. So for each output element j, y_ij = x_i * W_j^T + b_j. 
+
+Wait, the input is (B, in_features). The weight matrix is (out_features, in_features). So the linear layer's output is (B, out_features), where each element y_ij is sum_{k=0}^{in_features-1} x_ik * W_jk + b_j. 
+
+Therefore, for a single row (i), the computation for all j requires computing each y_ij as a dot product between x_i and W_j's row. 
+
+Computing this for all j (8192 elements) would be computationally intensive. The total FLOPs for the matrix multiply is B * out * in. Here, 1024 * 8192 * 8192 = around 6.8 billion FLOPs. 
+
+But the problem is that after computing all y_ij for each row, we need to compute the sum of exp(y_ij) for each row. The logsumexp is log(sum(exp(y_ij))), and then the activations.
+
+So, perhaps, for each row, the steps are:
+
+1. Compute all y_ij (j=0..out_features-1)
+
+2. Compute sum_j exp(y_ij)
+
+3. Take log of that sum → gives the logsumexp value.
+
+4. Apply leaky_relu twice and gelu twice to that value.
+
+The challenge is doing this efficiently in a kernel. Let's consider:
+
+For step 1, the computation of y_ij for all j for a row can be parallelized. Each thread in a block could compute a subset of the j terms. 
+
+For example, for a row, each thread could compute one j. But since out_features is 8192, we might need a large number of threads. Alternatively, use a block of threads to compute a chunk of j's.
+
+Alternatively, use a tiled approach where threads compute partial sums for a subset of the input features. 
+
+Wait, the computation of each y_ij is a dot product between x_i and W_j's row. So for each j, y_ij = x_i · W_j + b_j. 
+
+To compute all y_ij for a row i, we can process each j in parallel. Each thread can compute one y_ij. 
+
+But with 8192 j's, that would require 8192 threads per row. Since a block can have up to 1024 threads (typical max is 1024 per block), so for 8192 j's, we would need 8 blocks per row, which complicates things. 
+
+Alternatively, perhaps each block is responsible for a row, and the block has enough threads to handle all j's. But 8192 threads per block is too much (max threads per block is 1024 in CUDA). So this isn't feasible. 
+
+Hmm, this suggests that we need a different approach. Maybe the matrix multiplication is best left to cuBLAS, but then fuse the logsumexp and the subsequent activations into a single kernel.
+
+Alternatively, perhaps the logsumexp can be fused with the activations. Let's see:
+
+After the matrix multiply, we have the output y of shape (B, out). The logsumexp reduces this to (B,1). The next activations are applied to each element of that (B,1) tensor. 
+
+The LeakyReLU and GELU are element-wise operations, so they can be applied in the same kernel that does the logsumexp. 
+
+Thus, the idea is to compute the logsumexp and then the activations in a single kernel. 
+
+So, steps:
+
+1. Compute the linear layer (matrix multiply + bias) using cuBLAS (since it's already optimized).
+
+2. Then, compute logsumexp over dim=1 and apply the activations in a fused kernel.
+
+This way, the first step is fast with cuBLAS, and the second step is a custom kernel that does logsumexp and the activations. 
+
+The question is: what is the time of the logsumexp and activations? The original times are 0.3 + 0.02*2 + 0.03*2 = 0.3+0.04+0.06 = 0.4ms. If we can compute this in, say, 0.1ms, that's a saving of 0.3ms. The total would then be 6.0 + 0.1 = 6.1ms, which isn't enough. Hmm. 
+
+Alternatively, maybe the logsumexp can be computed in a more efficient way. Let's think about the logsumexp computation. The logsumexp is a reduction over the features. 
+
+The logsumexp for a row i is log( sum_{j} exp(y_ij) ). 
+
+This can be computed in parallel for each row. Each row can be processed by a thread block. 
+
+The steps for the logsumexp and activations kernel would be:
+
+For each row i:
+
+- Compute the sum of exp(y_ij) for all j in 0..out_features-1. This is a reduction over j for each row. 
+
+- Take the log of that sum to get the logsumexp value. 
+
+- Apply the leaky_relu twice, then gelu twice. 
+
+Wait, but applying functions multiple times? Let me check the original code:
+
+After the logsumexp, the code does:
+
+x = leaky_relu(x, 0.01)  # first leaky relu
+
+x = leaky_relu(x, 0.01)  # second leaky relu
+
+x = gelu(x)  # first gelu
+
+x = gelu(x)  # second gelu
+
+Wait, but applying the same activation twice in a row? For example, leaky_relu twice would just be the same as applying it once, since applying the same nonlinearity again won't change the result. Because leaky_relu is applied element-wise. 
+
+Wait, is that true?
+
+Suppose x is already passed through leaky_relu. Then applying it again would have no effect for elements that were positive. For elements that were negative, the first application would set them to 0.01*x, then the second application would do the same again? Wait, no. Wait, the leaky_relu is defined as x if x >0 else negative_slope*x. So if the first leaky_relu outputs 0.01*x (for x negative), then applying it again would give 0.01*(0.01*x) = 0.0001*x. So the second application actually reduces the value further. 
+
+Therefore, the two leaky_relu calls are not redundant. They actually compute x = leaky_relu(leaky_relu(x, 0.01), 0.01). Similarly for the two GELUs. 
+
+Thus, those two passes are necessary. 
+
+But the activations are applied to the logsumexp result (a scalar per row). Since the logsumexp is a scalar, applying two leaky_relu's and two GELU's is just applying four functions sequentially on that scalar. 
+
+Therefore, in the kernel, once we have the logsumexp value for a row, we can compute all four activations in a single thread. 
+
+Thus, the fused kernel for the logsumexp and activations would process each row independently. 
+
+Let me outline the steps for the kernel:
+
+1. For each row i:
+
+   a. Compute the sum over j of exp(y_ij). 
+
+   b. Compute the log of that sum. 
+
+   c. Apply the two leaky_relu and two GELU operations. 
+
+2. Write the result to the output tensor. 
+
+The key is to compute the sum efficiently. 
+
+To compute the sum over j of exp(y_ij), for each row i:
+
+The y tensor is (B, out_features). Each row has out_features elements. 
+
+To compute the sum of exp(y_ij) for each row i, we can use a reduction kernel. For each row, we can have a block of threads process the row, with each thread processing a chunk of the elements. 
+
+Here's a possible approach:
+
+Each block processes a single row. The block has, say, 256 threads. The row has 8192 elements. Each thread takes 8192 / 256 = 32 elements. 
+
+Each thread computes the sum of exp(y_ij) for its assigned elements, then they do a block-wide reduction to get the total sum for the row. 
+
+Then, once the sum is computed, the log is taken, and the activations are applied. 
+
+The steps in code would be:
+
+- For each row i in parallel (each block handles a row):
+
+   - Initialize a partial sum to zero.
+
+   - Each thread in the block processes a chunk of the elements in the row's y array.
+
+   - Compute the exponential of each element in their chunk and add to their partial sum.
+
+   - Use a reduction within the block to sum all partial sums to get the row's total sum.
+
+   - Compute log(sum) → logsumexp_val.
+
+   - Apply the activations: leaky_relu twice and gelu twice.
+
+   - Write the result to the output tensor's i-th element.
+
+This should be feasible. 
+
+The time for this kernel would depend on the number of elements per row (8192), but since each row can be processed in parallel with other rows, and the block reduction is efficient, this might save time over the original approach which required separate kernels for logsumexp and the activations. 
+
+Additionally, avoiding the intermediate tensor allocation (the y tensor from the linear layer) might help, but since the linear layer's output is already an intermediate tensor, we can't eliminate that. However, using a custom kernel for the logsumexp and activations might be faster than separate PyTorch operations. 
+
+Now, considering the original execution times:
+
+- The linear layer is 6ms. 
+
+- The logsumexp is 0.3ms, and the activations are 0.04+0.06 = 0.1ms. Total post-linear is 0.4ms. 
+
+If the fused kernel can do logsumexp + activations in, say, 0.1ms, that would save 0.3ms. So total execution time would be 6.0 + 0.1 = 6.1ms. But the required speedup is 1.3x, so 6.38 /1.3 ~ 4.9ms. So this approach might not be sufficient. 
+
+Hmm, perhaps we need to also optimize the matrix multiplication. But cuBLAS is already highly optimized. Unless we can find a way to do the matrix multiply in a way that also helps the logsumexp. 
+
+Wait, let me think again about the logsumexp formula. 
+
+logsumexp(y_i) = log( sum_j exp( y_ij ) )
+
+Where y_ij is the linear output. 
+
+The linear output is y_ij = x_i · W_j + b_j. 
+
+Let me see if we can rewrite the logsumexp in terms of the weights and the input x_i. 
+
+sum_j exp( (x_i · W_j) + b_j ) 
+
+= exp( x_i · W_j + b_j ) summed over j. 
+
+Hmm, perhaps we can find a way to precompute some terms. 
+
+Alternatively, maybe we can compute the logsumexp without explicitly forming the y tensor. 
+
+Wait, the logsumexp is over all j of exp( (x_i · W_j) + b_j ), so it's equivalent to log( sum_j exp( (x_i · W_j) + b_j ) )
+
+But perhaps we can compute this sum more efficiently by reorganizing the computation. 
+
+Wait, for each row i, the sum is over j of exp( (x_i · W_j) + b_j )
+
+This can be written as exp(b_j) * exp(x_i · W_j), but that might not help. 
+
+Alternatively, if the weight matrix is stored in a way that allows vectorization, but I don't see an obvious optimization here. 
+
+Alternatively, considering that the logsumexp is a scalar per row, maybe the matrix multiplication can be restructured to compute the required sum more efficiently. 
+
+But I'm not sure. Let's think of the current approach again. 
+
+The main idea is to fuse the logsumexp and the activations into a single kernel, which can save some time. 
+
+Alternatively, perhaps the matrix multiply can be optimized. For instance, if the out_features and in_features are both 8192, then the weight matrix is 8192x8192. The matrix multiplication is x (1024 x 8192) multiplied by the weight matrix (8192 x 8192) transpose. Wait, no: the linear layer's computation is x * W^T, so the weight matrix is stored as (out_features, in_features). So the matrix multiply is (B, in) * (out, in)^T → (B, out). 
+
+The matrix multiply involves a large number of operations, but cuBLAS is already optimized. However, perhaps we can use a custom kernel for the linear layer that also computes the logsumexp and activations. Let's consider that. 
+
+Suppose we create a kernel that does the following for each row i:
+
+- Compute all y_ij for j=0..out-1.
+
+- While computing those, compute the sum of exp(y_ij).
+
+- Then compute the log and apply activations.
+
+The problem is that computing all y_ij for each row is necessary. But with the matrix multiply being the bulk of the computation, maybe the logsumexp can be computed efficiently as part of the same kernel. 
+
+Let's think of the matrix multiply as:
+
+For each row i:
+
+    for j in 0..out-1:
+
+        y_ij = dot(x_i, W_j) + b_j
+
+We can compute y_ij and simultaneously accumulate the sum of exp(y_ij) for each row. 
+
+But since each y_ij requires a dot product between the input row and W_j's row, this would require a lot of computations. 
+
+Alternatively, the kernel can compute the sum of exp(y_ij) while computing the y_ij terms. 
+
+Let me structure this:
+
+Each thread block processes a single row i. 
+
+Each thread in the block is responsible for a portion of the features. 
+
+Wait, perhaps a tiled approach. 
+
+Alternatively, since each y_ij requires a dot product between x_i and W_j's row, we can compute each y_ij in a way that allows the sum of exp(y_ij) to be accumulated. 
+
+But this might not save time compared to using cuBLAS for the matrix multiply and then a custom kernel for logsumexp and activations. 
+
+Hmm. 
+
+Alternatively, since the logsumexp is a reduction over the output features, perhaps we can compute the logsumexp without storing the entire y tensor. 
+
+The logsumexp can be computed as log( sum_j exp(x_i·W_j + b_j) )
+
+Let me denote z_j = W_j · x_i + b_j → the same as y_ij. 
+
+So the sum is over j of exp(z_j). 
+
+The question is: can we compute this sum without first computing all z_j? 
+
+Probably not, because each term requires the full dot product. 
+
+So the only way is to compute all z_j for each row, then sum the exponentials. 
+
+Therefore, the kernel approach would need to compute the dot products for each j. 
+
+This seems computationally intensive, but perhaps with optimized parallelism. 
+
+Let me outline a kernel structure for a single row:
+
+Each block is responsible for a row. 
+
+The block has, say, 256 threads. 
+
+The row has 8192 features, so each thread handles 8192/256 = 32 elements of the features. 
+
+Wait, no, each thread would process a certain number of j's. Wait, the j's are the output features (8192), so each thread could process a portion of the j's. 
+
+Wait, each thread can process a chunk of j indices. For example, with 256 threads, each thread handles 8192/256 = 32 j's. 
+
+Each thread would process 32 j's. 
+
+For each j in their chunk:
+
+    compute the dot product between x_i (input row) and W_j (the j-th row of the weight matrix).
+
+    add the bias b_j to get z_j.
+
+    compute exp(z_j).
+
+    accumulate the exp(z_j) into a shared memory array or a register.
+
+Wait, but the dot product for each j requires 8192 multiplications and additions. That's a lot per j. 
+
+Wait, for each j in the chunk, to compute the dot product between x_i (length 8192) and W_j (length 8192), the computational cost is 8192 FLOPs per j. 
+
+So for a thread handling 32 j's, that's 32 * 8192 FLOPs = 262,144 FLOPs per thread. 
+
+But with 256 threads per block, that's 256 * 262k = ~67 million FLOPs per row. 
+
+The total for all rows would be 1024 rows * 67 million ≈ 68 billion FLOPs. 
+
+But the original matrix multiply via cuBLAS would be B * out * in = 1024 * 8192 * 8192 ≈ 6.8e10 FLOPs. So this approach would require the same amount of computation, but perhaps with worse efficiency because of the way the kernel is structured. 
+
+This suggests that using cuBLAS for the matrix multiply is better in terms of performance. 
+
+Therefore, the better approach is to use cuBLAS for the linear layer and then a custom kernel for the logsumexp and activations. 
+
+So the plan is:
+
+1. Keep the linear layer as a standard PyTorch Linear layer (using cuBLAS).
+
+2. Create a custom kernel that takes the output of the linear layer (y), and computes logsumexp over dim=1, then applies the two leaky_relu and two GELU activations. 
+
+This way, the time for steps 2-6 is replaced by a single kernel. 
+
+The original time for steps 2-6 is 0.3 + 0.02*2 + 0.03*2 = 0.4ms. The fused kernel should be faster. 
+
+Now, let's think about implementing this kernel. 
+
+The kernel will take as inputs:
+
+- The linear layer's output tensor (y) of shape (B, out_features).
+
+- The output tensor will be (B, 1).
+
+The kernel steps per row:
+
+For each row i in 0..B-1:
+
+   Compute the sum of exp(y[i][j]) over j=0..out_features-1.
+
+   Compute log_sum_exp = log(sum).
+
+   Apply first leaky_relu: val = leaky_relu(log_sum_exp, 0.01)
+
+   Apply second leaky_relu: val = leaky_relu(val, 0.01)
+
+   Apply first GELU: val = gelu(val)
+
+   Apply second GELU: val = gelu(val)
+
+   Store val in output[i][0]
+
+The key is to compute the sum efficiently. 
+
+The kernel can be structured as follows:
+
+Each thread block processes a single row. 
+
+Each block will:
+
+   - Read the row's data (out_features elements).
+
+   - Compute the sum of exp(y_j) for all j.
+
+   - Compute the log and apply activations.
+
+   - Write the result to the output.
+
+The reduction of the sum can be done in shared memory. 
+
+Here's a possible CUDA kernel:
+
+__global__ void fused_logsumexp_and_activations(
+    const float* __restrict__ y,  // input tensor (B, out_features)
+    float* __restrict__ output,   // output tensor (B,1)
+    int B, int out_features
+) {
+    int row = blockIdx.x;
+    if (row >= B) return;
+
+    // Each block handles a row. Compute the sum of exp(y[row][j]) over j.
+
+    extern __shared__ float shared[];
+    float* sdata = shared;
+
+    // Each thread in the block processes a chunk of j's.
+
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+
+    // Each thread processes out_features / blockDim.x elements.
+
+    int stride = blockDim.x;
+    for (int j = tid; j < out_features; j += stride) {
+        float y_val = y[row * out_features + j];
+        sum += expf(y_val);
+    }
+
+    // Perform block reduction to get the total sum.
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        __syncthreads();
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+    }
+
+    if (tid == 0) {
+        float total_sum = sdata[0];
+        float log_sum_exp = logf(total_sum);
+
+        // Apply activations
+        float val = log_sum_exp;
+        val = (val > 0) ? val : 0.01f * val;
+        val = (val > 0) ? val : 0.01f * val;
+        val = 0.5f * val * (1.0f + tanh( M_SQRT1_2 * (val + 0.044715f * val*val*val) ));
+        val = 0.5f * val * (1.0f + tanh( M_SQRT1_2 * (val + 0.044715f * val*val*val) ));
+
+        output[row] = val;
+    }
+}
+
+Wait, but in this code, the sdata array needs to be initialized. Let me rework the code properly. 
+
+Wait, in the above code, the threads first compute their partial sums and store them in shared memory. 
+
+Let me adjust the code:
+
+The steps for the block reduction:
+
+1. Each thread computes a partial sum of their chunk of the row's elements.
+
+2. They write their partial sum to shared memory.
+
+3. Then perform a block-wide reduction using shared memory.
+
+So the code should be:
+
+__global__ void fused_logsumexp_and_activations(
+    const float* y, float* output, int B, int out_features
+) {
+    int row = blockIdx.x;
+    if (row >= B) return;
+
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+
+    float sum = 0.0f;
+    // Load data into shared memory
+    for (int j = tid; j < out_features; j += blockDim.x) {
+        float y_val = y[row * out_features + j];
+        sum += expf(y_val);
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Block reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum = sdata[0];
+        float log_sum_exp = logf(total_sum);
+
+        // Apply activations
+        // First Leaky ReLU
+        float val = log_sum_exp > 0 ? log_sum_exp : 0.01f * log_sum_exp;
+        // Second Leaky ReLU
+        val = val > 0 ? val : 0.01f * val;
+
+        // First GELU
+        float inner = val + 0.044715f * val * val * val;
+        float tanh_part = tanhf(M_SQRT1_2 * inner);
+        val = 0.5f * val * (1.0f + tanh_part);
+        // Second GELU
+        inner = val + 0.044715f * val * val * val;
+        tanh_part = tanhf(M_SQRT1_2 * inner);
+        val = 0.5f * val * (1.0f + tanh_part);
+
+        output[row] = val;
+    }
+}
+
+Wait, the GELU implementation here uses the approximation with tanh. The standard PyTorch GELU uses this approximation. So that's correct. 
+
+The shared memory size needed is blockDim.x floats. 
+
+The kernel launch parameters would be:
+
+blockDim.x = 256 (or some other value like 1024 if possible)
+
+The number of blocks is B (1024). 
+
+The shared memory per block is blockDim.x * sizeof(float). For 256 threads, that's 256 * 4 = 1024 bytes, which is acceptable. 
+
+Now, the total time for this kernel would depend on the time to compute the sum. 
+
+The matrix multiply with cuBLAS takes 6ms, and this kernel takes let's say 0.2ms, then total is 6.2ms, which is still not enough. 
+
+Hmm, so we need a better optimization. 
+
+Alternatively, perhaps we can reduce the number of operations by approximating the logsumexp. 
+
+Wait, logsumexp is log(sum(exp(y_ij))). If the y_ij values are very large or very small, the sum can be dominated by the maximum term. 
+
+For example, if one term is much larger than others, the logsumexp ≈ max(y_ij) + log(1 + sum(exp(y_ij - max)) ). 
+
+But I'm not sure if this can help in terms of computation. 
+
+Alternatively, since the logsumexp is followed by activations, perhaps some of the steps can be combined or simplified. 
+
+Wait, the logsumexp is followed by two leaky_relus and two GELUs. But since the logsumexp result is a scalar per sample, and the activations are applied sequentially, perhaps the entire sequence can be simplified. 
+
+Let me see the mathematical expression:
+
+Let L be the logsumexp value. 
+
+After two leak

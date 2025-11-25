@@ -1,0 +1,28 @@
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Custom CUDA kernel for max pooling
+__global__ void max_pooling_1d_forward_kernel(const float* input, float* output, int batch_size, int num_features, int sequence_length, int kernel_size, int stride, int padding) {
+    // Kernel logic here...
+}
+
+torch::Tensor max_pooling_1d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding) {
+    auto batch_size = input.size(0);
+    auto num_features = input.size(1);
+    auto sequence_length = input.size(2);
+    auto output_sequence_length = (sequence_length + 2 * padding - kernel_size) / stride + 1;
+
+    auto output = torch::zeros({batch_size, num_features, output_sequence_length}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (output.numel() + block_size - 1) / block_size;
+
+    max_pooling_1d_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, num_features, sequence_length, kernel_size, stride, padding);
+
+    return output;
+}
+
+// Register the function in the module
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("max_pooling_1d_forward", &max_pooling_1d_forward_cuda, "Max Pooling 1D Forward");
+}

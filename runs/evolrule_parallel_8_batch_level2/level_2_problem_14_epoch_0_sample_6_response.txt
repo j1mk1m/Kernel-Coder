@@ -1,0 +1,789 @@
+**Additional Constraints:**
+- The kernel must be written inline using load_inline from torch.
+- The code must be compatible with PyTorch 2.0 and later versions.
+- Do not use any extra dependencies or external libraries.
+- The solution must be fully contained in the code block.
+
+**Notes:**
+- Consider operator fusion to reduce memory allocations and copies.
+- The input tensors are on CUDA. Please ensure your code properly handles device placement.
+- The model parameters (weight) are initialized on the same device as inputs. Make sure the parameters are correctly placed in the model.
+- Use the same batch_size, input_size, hidden_size, scaling_factor variables as in the original code.
+- The new model must have a method called forward, and the get_inputs and get_init_inputs functions must remain compatible.
+
+Alright, let's tackle optimizing the given Model with custom CUDA kernels. The goal is to replace the existing PyTorch operators with fused or optimized CUDA kernels to reduce memory allocations and improve performance.
+
+First, let's analyze the operations in the original forward pass:
+
+1. **Matrix Multiplication (Gemm):** `x = torch.matmul(x, self.weight.T)`
+2. **Element-wise Division:** `x = x / 2`
+3. **Summation over dim=1:** `x = torch.sum(x, dim=1, keepdim=True)`
+4. **Scaling:** `x = x * self.scaling_factor`
+
+The problem suggests operator fusion. Let's see which operations can be combined into a single kernel to minimize memory transfers and CUDA launches.
+
+Looking at steps 1-4, the first three operations (matmul, divide, sum) can be fused into a single kernel. The final scaling can be part of the same kernel or handled separately. Let's see:
+
+- **Matmul + Division + Summation:** The matmul produces an output of shape (batch, hidden_size). Then dividing by 2 is an element-wise operation. However, the summation reduces the second dimension (dim=1), which is the hidden_size dimension. Wait, the summation is over dim=1 (the hidden_size dimension), so after matmul, the tensor is (batch, hidden_size). Summing over dim=1 would produce (batch, 1). The division by 2 can be incorporated into the summation step by dividing each element before summing. However, the scaling (multiplying by scaling_factor) is applied after the sum, so perhaps all except the scaling can be fused.
+
+Wait, the scaling is applied after the sum. So the sequence is:
+
+matmul (output: batch, hidden_size) → divide by 2 → sum over dim1 → multiply by scaling_factor.
+
+So perhaps the first three steps (matmul, divide, sum) can be fused into a single kernel. The scaling is a simple element-wise multiplication, but since the output is already (batch, 1), maybe we can also include the scaling in the same kernel. Let's think:
+
+The matmul is a dense matrix multiplication. The division by 2 can be applied during the computation of each element in the matmul result. Then, the summation over dim=1 can be done per row (i.e., summing across the hidden_size elements of each row). Since the summation is a reduction, it can be computed efficiently using parallel reduction in CUDA.
+
+So, the plan is to create a fused kernel that does:
+
+1. Compute the matrix multiplication of x (batch, input_size) with weight (hidden_size, input_size)^T → (batch, hidden_size)
+2. Divide each element by 2
+3. Sum all elements along the hidden_size dimension (dim=1) for each batch sample, resulting in (batch, 1)
+4. Multiply each element by the scaling factor (a scalar)
+
+But steps 3 and 4 can be combined. The sum over dim=1 is a reduction that produces a vector (batch,1), then multiply by scaling factor (element-wise). So in the kernel, after computing the sum for each batch element, we can multiply by scaling_factor immediately.
+
+Thus, the fused kernel will handle all steps except the matmul? Wait, the matmul is a big operation. Let's see:
+
+The matmul is O(batch * hidden_size * input_size) operations. The rest are O(batch * hidden_size) for the division and sum, plus O(batch) for scaling. Since matmul is the bulk, perhaps fusing the matmul with the subsequent steps is key.
+
+However, matmul itself is a complex operation with its own optimizations. Replacing it with a custom kernel may not be efficient unless we can fuse it with the other operations. Let's think:
+
+Alternatively, perhaps the division and summation can be incorporated into the matmul computation. Let me outline the fused kernel:
+
+The fused kernel will process each element of the matmul result, apply division by 2, then accumulate into the sum across the hidden_size dimension, then multiply by scaling factor.
+
+Wait, but the matmul's output is a batch of hidden_size elements. To compute the sum over hidden_size for each batch sample, we can structure the kernel such that each thread handles a batch element and accumulates over the hidden_size dimension. Let me think of the kernel structure:
+
+The output is (batch_size, 1). Let's have one thread per batch element. Each thread will process all hidden_size elements of that batch's row. So each thread:
+
+- Computes the sum over hidden_size (the j index) of (x[i,j] / 2), then multiplies by scaling_factor. Wait, but how is x computed here?
+
+Wait, x is the result of the matmul. So the kernel needs to first compute the matmul result. However, computing the matmul is computationally intensive. Doing that in a fused kernel might not be efficient unless we can parallelize it effectively.
+
+Alternatively, perhaps we can structure the kernel to compute the matmul, apply the division, sum over the hidden_size dimension, and apply scaling in a single pass.
+
+The matmul computation for a single element (i,j) is sum_{k} x[i,k] * weight[j,k], since weight is (hidden_size, input_size). Wait, the weight is (hidden_size, input_size). The transpose is needed in the matmul, so the matmul is x (batch, input_size) multiplied by weight^T (input_size, hidden_size), resulting in (batch, hidden_size).
+
+But the key is that for each (i,j) element of the matmul result, it's the dot product of the input row and the weight row.
+
+So the fused kernel approach would have to compute the sum over k, then divide by 2, then sum over j, then multiply by scaling factor. Let's see:
+
+The final result for each batch element is scaling_factor * (sum_j ( (sum_k x[i,k] * weight[j,k]) / 2 )) 
+
+Wait, but that's equivalent to scaling_factor / 2 * (sum_{j,k} x[i,k] * weight[j,k])
+
+Wait, the sum over j and k can be reordered:
+
+sum_j [ (sum_k x[i,k] * weight[j,k]) / 2 ] = (1/2) * sum_j sum_k x[i,k] * weight[j,k]
+
+= (1/2) * sum_k x[i,k] * sum_j weight[j,k]
+
+Wait, that's only possible if we can compute the sum over j of weight[j,k], but that's not the case. Hmm, perhaps this approach complicates things.
+
+Alternatively, perhaps the initial approach of fusing matmul with the subsequent operations is not straightforward. Maybe it's better to split into two kernels: first the matmul with division, then the summation and scaling. Let's see:
+
+First, compute matmul(x, weight.T) / 2. This is a matrix multiplication followed by element-wise division by 2. That can be fused into a single kernel. Then, compute the sum over dim=1 and multiply by scaling_factor.
+
+Alternatively, the first part (matmul + divide) can be done in one kernel, then the summation and scaling in another.
+
+Let me think of the first step:
+
+Compute Y = (X * W^T) / 2, where X is (batch, input_size), W is (hidden, input). The output Y is (batch, hidden). This can be implemented in a single kernel that does the matmul and divides by 2. Since matmul is a dense matrix operation, this would require a kernel that handles the matrix multiplication with the division.
+
+However, writing a matrix multiplication kernel is non-trivial and may not be as optimized as PyTorch's own implementation. Maybe better to use the existing matmul and then fuse the division with the summation.
+
+Alternatively, perhaps the division can be incorporated into the matmul computation. Let's see:
+
+Each element Y[i,j] = (sum_k X[i,k] * W[j,k]) / 2. So in the kernel, during the computation of Y[i,j], we can divide by 2 at the same time. This would require a kernel that does the matmul with a division by 2.
+
+But writing a matrix multiplication kernel in CUDA is going to be time-consuming and might not be as fast as using cuBLAS. So perhaps that's not the best approach. Let's consider another angle.
+
+Perhaps the key is to fuse the matmul, division, and summation into one step. Let's see:
+
+The final result after the first three steps (matmul, divide, sum over dim1) is a (batch, 1) tensor where each element is (sum_{j} ( (X * W^T)[i,j] / 2 )).
+
+This can be rewritten as (1/2) * sum_{j,k} X[i,k] * W[j,k] 
+
+Wait, no, actually:
+
+sum_j [ (sum_k X[i,k] * W[j,k] ) / 2 ]
+
+Which is equal to (1/2) * sum_j sum_k X[i,k] * W[j,k] 
+
+= (1/2) * sum_k X[i,k] * (sum_j W[j,k])
+
+Wait, that's only true if we can interchange the sums. The sum over j and k can be interchanged:
+
+sum_j [sum_k X[i,k] * W[j,k] ] = sum_k X[i,k] * sum_j W[j,k]
+
+Yes, because it's linear. So that simplifies to (1/2) * sum_k X[i,k] * (sum_j W[j,k]) 
+
+Then, multiplying by scaling_factor gives scaling_factor * (1/2) * sum_{k} X[i,k] * (sum_j W_jk )
+
+Wait, but the sum over j of W[j,k] is a scalar per k. Let's denote S_k = sum_{j} W[j,k]. Then the expression is scaling_factor * 0.5 * sum_{k} X[i,k] * S_k
+
+This is equivalent to a dot product between X[i,:] and (S_k * 0.5 * scaling_factor) 
+
+Wait, that's an interesting simplification. If we precompute S_k = sum_j W[j,k], then we can compute the final result as scaling_factor / 2 * (X @ S), where S is a vector of size input_size. 
+
+This would eliminate the need for a matrix multiplication and instead compute a vector dot product. 
+
+This is a significant algorithmic optimization. Instead of doing a matrix multiply, which is O(batch * hidden * input), we can precompute S_k = sum_j W[j,k], then the result is scaling_factor / 2 * (X * S).sum(axis=1, keepdims=True)
+
+This reduces the computational complexity from O(batch * hidden * input) to O(batch * input) which is a massive improvement. Since hidden_size is 8192, input_size is also 8192, so the original matmul is 1024*8192*8192 which is around 68 billion operations. The optimized approach would be 1024*8192 ~8 million operations. That's a huge speedup.
+
+However, this requires the model's weight to have this property. But the problem states that we can make algorithmic changes. So this is an important insight.
+
+Therefore, the optimized approach would precompute S = sum_j W[j, :], then the forward pass becomes:
+
+result = scaling_factor / 2 * (X * S).sum(axis=1, keepdim=True)
+
+This completely avoids the matrix multiplication and replaces it with element-wise multiplication and a vector sum. This is a much better approach.
+
+Therefore, the steps are:
+
+1. Precompute S = torch.sum(weight, dim=0) during initialization. Since weight is (hidden_size, input_size), sum over dim 0 (hidden_size) gives a tensor of shape (input_size,).
+
+2. During forward:
+
+   x = x * S
+   x = x.sum(dim=1, keepdim=True)
+   x = x * (scaling_factor / 2.0)
+
+Wait, let's check:
+
+Original steps:
+
+matmul: x * W^T → (batch, hidden_size)
+divided by 2 → (batch, hidden_size)
+sum over dim=1 → (batch,1)
+scaled by scaling_factor → (batch,1)
+
+The optimized path:
+
+Compute S = sum over hidden dim of W → (input_size,)
+
+Then, the product x (batch, input_size) * S (input_size) gives (batch, input_size). Wait, no, element-wise multiply between x and S (which is a vector of length input_size) would be (batch, input_size). Then sum over dim=1 (input_size) gives (batch,1). But according to earlier derivation, the result is scaling_factor/2 * (x * S).sum(dim=1, keepdim=True)
+
+Wait, let me recheck:
+
+Original expression after simplification: scaling_factor / 2 * sum_{k} X[i,k] * S_k, where S_k is sum_j W[j,k]
+
+Therefore, the optimized forward is:
+
+x = (x * S).sum(dim=1, keepdim=True) * (scaling_factor / 2.0)
+
+This is a much simpler computation and should be way faster.
+
+So the key optimization here is to precompute S and replace the matrix multiplication with an element-wise multiplication and a sum.
+
+Therefore, the custom CUDA kernel can be used to implement the (x * S).sum(dim=1, keepdim=True) part. Because for large tensors, even this can be optimized in a single kernel.
+
+Let's think of how to implement this in a CUDA kernel. The operation is:
+
+For each batch element i:
+
+result[i] = sum_{k=0 to input_size-1} (x[i][k] * S[k])
+
+Then multiply by scaling_factor / 2.0.
+
+This is a vector dot product for each row, but since we're summing the products over the input_size dimension. So the kernel can be structured as follows:
+
+Each thread block handles one batch element. Each thread in the block handles a portion of the input_size elements. They can compute partial sums and then combine them via reduction.
+
+Alternatively, since input_size is 8192, we can have each thread handle a chunk. Let's see:
+
+The kernel would look like this:
+
+__global__ void fused_elementwise_sum(
+    const float* x, // input of shape (batch_size, input_size)
+    const float* S, // shape (input_size,)
+    float* out, // shape (batch_size, 1)
+    int batch_size,
+    int input_size,
+    float scale // scaling_factor / 2.0
+) {
+    int batch_idx = blockIdx.x;
+
+    if (batch_idx >= batch_size) return;
+
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < input_size; k += blockDim.x) {
+        sum += x[batch_idx * input_size + k] * S[k];
+    }
+
+    // Now perform reduction within the block
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        __syncthreads();
+        if (threadIdx.x < stride) {
+            sum += shmem[threadIdx.x + stride];
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        out[batch_idx] = sum * scale;
+    }
+}
+
+Wait, but this requires shared memory for the reduction. Let me structure it properly.
+
+Alternatively, use a block of 256 threads. Each thread handles input_size / 256 elements. Then they accumulate their partial sums. Then perform a block-wide reduction.
+
+Alternatively, here's a step-by-step plan:
+
+Each block is responsible for a single batch element. The block has N threads (e.g., 256). The input_size is 8192, so each thread can process 8192 / 256 = 32 elements. Each thread accumulates its 32 elements into a private variable. Then, using shared memory, perform a reduction within the block to get the total sum for that batch element. Finally, the first thread writes the scaled result.
+
+The steps in code:
+
+- Each block corresponds to a batch index.
+- Each thread in the block processes a chunk of the input_size elements.
+- Sum the products x[i][k] * S[k] for their chunk.
+- Use shared memory to perform a block-wise reduction of these partial sums.
+- Multiply by the scale factor (scaling_factor / 2.0) and write to the output.
+
+The kernel would look something like this:
+
+__global__ void fused_elementwise_sum(
+    const float* x,  // (batch_size, input_size)
+    const float* S,  // (input_size,)
+    float* out,      // (batch_size, 1)
+    int batch_size,
+    int input_size,
+    float scale
+) {
+    // Each block handles one batch element
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    // Each thread handles a portion of the input_size
+    extern __shared__ float shared[];
+    float* sdata = shared;
+
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+
+    for (int k = tid; k < input_size; k += blockDim.x) {
+        sum += x[batch_idx * input_size + k] * S[k];
+    }
+
+    // Write to shared memory
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[batch_idx] = sdata[0] * scale;
+    }
+}
+
+The shared memory size needed is blockDim.x * sizeof(float). Since blockDim.x is, say, 256, that's 256 floats.
+
+We can set the block size to 256, so blockDim.x=256.
+
+This kernel would process each batch element in a block, with each thread in the block handling a part of the input_size elements. The reduction is done in shared memory.
+
+Now, the model can be rewritten as follows:
+
+In the ModelNew class:
+
+- Precompute S = torch.sum(self.weight, dim=0). This is a parameter or buffer that can be computed once during initialization.
+
+Wait, but S is derived from the weight parameter. Since the weight is a parameter, its values can change during training, so S must be recomputed whenever the weight changes. However, in this case, if the model is being used in inference, or if the weight is not changing, then precomputing S is okay. But in a typical model, the weight is updated during backpropagation, so S must be re-derived each time.
+
+Wait, but the weight is a parameter, so whenever the model is trained, the weight updates, so S must be computed as the sum over the first dimension each time. However, in the forward pass, we can compute S on the fly as torch.sum(weight, dim=0), but that would require an extra kernel launch. To optimize further, perhaps we can have a buffer in the model that holds S and is updated whenever the weight changes. However, handling that in PyTorch might be tricky. Alternatively, compute S each time in the forward pass using a custom CUDA kernel.
+
+Alternatively, we can compute S in the forward pass using the existing PyTorch functions, but perhaps that's not as fast. Since the sum over dim=0 is a simple operation, maybe it's better to compute it via PyTorch's sum, then use the custom kernel for the rest.
+
+Wait, but the sum over dim=0 is a reduction, which is a simple kernel. Let's see:
+
+In the forward pass of the model:
+
+def forward(self, x):
+    S = torch.sum(self.weight, dim=0)  # (input_size,)
+    # compute the product and sum, then scale
+    ...
+
+This S can be computed on the GPU efficiently, and then used in the custom kernel.
+
+Therefore, in the optimized code:
+
+The custom CUDA kernel will take x (batch_size x input_size), S (input_size), and compute the scaled sum.
+
+The custom kernel's code can be written inline using load_inline.
+
+Now, let's structure the code.
+
+First, in the model's __init__, the weight remains as a parameter. We can precompute S once, but since weight can change during training, it's better to compute S each time in the forward.
+
+Now, writing the CUDA code:
+
+The kernel function is fused_elementwise_sum, which takes x, S, out, batch_size, input_size, and scale (which is scaling_factor / 2).
+
+The kernel is launched with batch_size blocks, each of block size (e.g., 256 threads). The shared memory size is blockDim.x * sizeof(float), so when launching, we have to specify that.
+
+The code for the CUDA kernel:
+
+The header:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_elementwise_sum(
+    const float* x,
+    const float* S,
+    float* out,
+    int batch_size,
+    int input_size,
+    float scale
+) {
+    // Implementation as above
+}
+
+Then, the wrapper function in C++:
+
+torch::Tensor fused_elementwise_sum_cuda(
+    torch::Tensor x,
+    torch::Tensor S,
+    float scale
+) {
+    const int batch_size = x.size(0);
+    const int input_size = x.size(1);
+    auto out = torch::empty({batch_size, 1}, x.options());
+
+    const int block_size = 256;
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    fused_elementwise_sum<<<grid, block, block_size * sizeof(float)>>>(
+        x.data_ptr<float>(),
+        S.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        input_size,
+        scale
+    );
+
+    return out;
+}
+
+Wait, but the kernel requires the input_size as an argument, which is known at runtime. The function takes x and S, which have the necessary dimensions.
+
+Now, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size).cuda())
+        self.scaling_factor = scaling_factor
+
+        # Define the CUDA kernel inline
+        kernel_source = """
+        ... the CUDA kernel code ...
+        """
+        kernel_cpp_source = """
+        ... the declarations ...
+        """
+        # Load the kernel
+        self.fused_elementwise_sum = load_inline(...)
+
+    def forward(self, x):
+        S = torch.sum(self.weight, dim=0)  # (input_size,)
+        x = x * S  # Wait, no, the kernel already handles x*S's sum.
+        # Wait, actually, the kernel computes sum(x_i * S_i) for each batch, then scales.
+
+        # Wait, no, the kernel takes x and S as inputs, and computes the product inside.
+
+        # Wait, the kernel's code is written to compute the product inside, so x is the input tensor, S is the precomputed sum.
+
+        # So in the forward:
+        S = torch.sum(self.weight, dim=0)  # (input_size,)
+        # The kernel will multiply each x[i,k] with S[k], sum over k, and scale.
+
+        # So call the kernel:
+        scale = self.scaling_factor / 2.0
+        out = self.fused_elementwise_sum.fused_elementwise_sum_cuda(x, S, scale)
+        return out.view(-1, 1)  # Ensure the shape is (batch,1)
+
+Wait, the kernel returns a tensor of shape (batch_size, 1), so maybe the output is already correct.
+
+Wait, in the kernel's wrapper function, the out tensor is created as torch.empty({batch_size,1}, ...), so it's already (batch,1). So the return can be directly used.
+
+But in the kernel code, in the __global__ function, the out is written to out[batch_idx], which is a 1D array? Or is out a 2D array?
+
+Looking back at the kernel code:
+
+out[batch_idx] = sdata[0] * scale;
+
+Assuming out is a 1D tensor, but the desired output is (batch_size, 1). So maybe we need to adjust the kernel to write to a 2D array:
+
+out[batch_idx * 1 + 0] = ... or simply:
+
+out[batch_idx] is sufficient if out is a 1D tensor. Then in the wrapper, we can return a view as (batch_size, 1). Alternatively, create out as (batch_size,1).
+
+In the wrapper function:
+
+auto out = torch::zeros({batch_size, 1}, x.options());
+
+Wait, in the code above:
+
+auto out = torch::empty({batch_size, 1}, x.options());
+
+Then, in the kernel:
+
+out[batch_idx] = ... 
+
+But in a 2D tensor, the indices are batch_idx * stride + 0. So as long as the out tensor is 2D, it should be okay. The code in the kernel should have out[batch_idx * 1 + 0] or just out[batch_idx][0], but in CUDA, accessing as a 1D array is easier.
+
+Alternatively, to avoid confusion, perhaps better to treat the out as a 1D array, then reshape in the wrapper.
+
+Alternatively, let's adjust the kernel code to use a 2D array:
+
+out[batch_idx * out_stride + 0] = ... 
+
+But that complicates things. Maybe it's better to have the output as a 1D tensor and then view it as 2D.
+
+Alternatively, in the wrapper function, create the output as (batch_size, 1):
+
+auto out = torch::empty({batch_size, 1}, x.options());
+
+Then in the kernel:
+
+out[batch_idx * 1 + 0] = sdata[0] * scale;
+
+Or using a 2D pointer:
+
+float* out_ptr = out.data_ptr<float>();
+out_ptr[batch_idx * 1 + 0] = sdata[0] * scale;
+
+But since it's a 2D tensor with stride (1, batch_size), the 0 index works.
+
+Alternatively, just index as:
+
+out[batch_idx] = ... 
+
+Wait, in C++, for a 2D tensor, the indices are stored in row-major order, so for out[batch_idx][0], the linear index is batch_idx * cols + 0 = batch_idx.
+
+So writing to out[batch_idx] is okay.
+
+Therefore, the kernel code is correct.
+
+Now, the code for the kernel:
+
+Putting it all together:
+
+The CUDA source code:
+
+elementwise_sum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_elementwise_sum(
+    const float* x,
+    const float* S,
+    float* out,
+    int batch_size,
+    int input_size,
+    float scale
+) {
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    extern __shared__ float sdata[];
+    float sum = 0.0f;
+
+    for (int k = threadIdx.x; k < input_size; k += blockDim.x) {
+        sum += x[batch_idx * input_size + k] * S[k];
+    }
+
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        out[batch_idx] = sdata[0] * scale;
+    }
+}
+
+torch::Tensor fused_elementwise_sum_cuda(
+    torch::Tensor x,
+    torch::Tensor S,
+    float scale
+) {
+    const int batch_size = x.size(0);
+    const int input_size = x.size(1);
+    auto out = torch::empty({batch_size, 1}, x.options());
+
+    const int block_size = 256;
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    fused_elementwise_sum<<<grid, block, block_size * sizeof(float)>>>(
+        x.data_ptr<float>(),
+        S.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        input_size,
+        scale
+    );
+
+    return out;
+}
+"""
+
+Then the C++ header:
+
+elementwise_sum_cpp_source = """
+torch::Tensor fused_elementwise_sum_cuda(
+    torch::Tensor x,
+    torch::Tensor S,
+    float scale
+);
+"""
+
+Then, in the model:
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size).cuda())
+        self.scaling_factor = scaling_factor
+
+        # Load the inline CUDA code
+        self.fused_elementwise_sum = load_inline(
+            name="fused_elementwise_sum",
+            cpp_sources=elementwise_sum_cpp_source,
+            cuda_sources=elementwise_sum_source,
+            functions=["fused_elementwise_sum_cuda"],
+            verbose=True,
+        )
+
+    def forward(self, x):
+        S = torch.sum(self.weight, dim=0)  # (input_size,)
+        scale = self.scaling_factor / 2.0
+        out = self.fused_elementwise_sum.fused_elementwise_sum_cuda(x, S, scale)
+        return out
+
+Wait, but the output is a (batch_size, 1) tensor, so we can return out directly.
+
+Wait, the wrapper function creates out as torch.empty({batch_size, 1}, ...), so the output is already 2D. So the forward can return out as is.
+
+Testing the code:
+
+The original model's forward steps:
+
+x = matmul(x, weight.T) / 2 → (batch, hidden)
+then sum over dim=1 → (batch,1), then scale by scaling_factor.
+
+The optimized version:
+
+S = sum(weight, dim=0) → (input_size,)
+each element of the result is (sum_{k} x[i,k] * S[k]) * (scaling_factor/2)
+
+Which matches the original computation.
+
+Thus, this approach is correct.
+
+Now, the code must be written in Python with the inline CUDA code as specified.
+
+Now, putting it all together, the ModelNew class and the CUDA code.
+
+Now, also, the get_init_inputs function must return [input_size, hidden_size, scaling_factor], which is compatible with the original code.
+
+The variables batch_size, input_size, hidden_size, scaling_factor must remain the same as in the original code.
+
+Now, writing the code:
+
+The final code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size).cuda())
+        self.scaling_factor = scaling_factor
+
+        # Define the CUDA kernel for the fused operation
+        elementwise_sum_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        __global__ void fused_elementwise_sum(
+            const float* x,
+            const float* S,
+            float* out,
+            int batch_size,
+            int input_size,
+            float scale
+        ) {
+            int batch_idx = blockIdx.x;
+            if (batch_idx >= batch_size) return;
+
+            extern __shared__ float sdata[];
+            float sum = 0.0f;
+
+            for (int k = threadIdx.x; k < input_size; k += blockDim.x) {
+                sum += x[batch_idx * input_size + k] * S[k];
+            }
+
+            sdata[threadIdx.x] = sum;
+            __syncthreads();
+
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (threadIdx.x < s) {
+                    sdata[threadIdx.x] += sdata[threadIdx.x + s];
+                }
+                __syncthreads();
+            }
+
+            if (threadIdx.x == 0) {
+                out[batch_idx] = sdata[0] * scale;
+            }
+        }
+
+        torch::Tensor fused_elementwise_sum_cuda(
+            torch::Tensor x,
+            torch::Tensor S,
+            float scale
+        ) {
+            const int batch_size = x.size(0);
+            const int input_size = x.size(1);
+            auto out = torch::empty({batch_size, 1}, x.options());
+
+            const int block_size = 256;
+            dim3 grid(batch_size);
+            dim3 block(block_size);
+
+            fused_elementwise_sum<<<grid, block, block_size * sizeof(float)>>>(
+                x.data_ptr<float>(),
+                S.data_ptr<float>(),
+                out.data_ptr<float>(),
+                batch_size,
+                input_size,
+                scale
+            );
+
+            return out;
+        }
+        """
+
+        elementwise_sum_cpp_source = """
+        torch::Tensor fused_elementwise_sum_cuda(
+            torch::Tensor x,
+            torch::Tensor S,
+            float scale
+        );
+        """
+
+        # Compile the CUDA kernel
+        self.fused_elementwise_sum = load_inline(
+            name="fused_elementwise_sum",
+            cpp_sources=elementwise_sum_cpp_source,
+            cuda_sources=elementwise_sum_source,
+            functions=["fused_elementwise_sum_cuda"],
+            verbose=True,
+        )
+
+    def forward(self, x):
+        # Compute S = sum(weight, dim=0)
+        S = torch.sum(self.weight, dim=0)
+        # Compute the scaling factor divided by 2
+        scale = self.scaling_factor / 2.0
+        # Execute the fused kernel
+        out = self.fused_elementwise_sum.fused_elementwise_sum_cuda(x, S, scale)
+        return out
+
+# Ensure the variables are as per original code
+batch_size = 1024  
+input_size = 8192  
+hidden_size = 8192 
+scaling_factor = 1.5
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+
+def get_init_inputs():
+    return [input_size, hidden_size, scaling_factor]
+```
+
+Wait, but in the __init__ function of ModelNew, the parameters are passed as input_size, hidden_size, scaling_factor. The original Model's __init__ had the same parameters. So this is compatible.
+
+Additionally, in the forward, the inputs are on CUDA because get_inputs() returns tensors on CUDA. The weight is initialized on CUDA in the __init__.
+
+This should work. The kernel is fused to handle the element-wise multiplication with S, sum over input_size dimension, and scaling in one step. This reduces the computation from O(batch*hidden*input) to O(batch*input), which is a massive optimization.
+
+Potential issues to check:
+
+- The CUDA kernel's shared memory allocation: The kernel uses extern __shared__ float sdata[], and the block size is 256, so the shared memory needed is 256 * sizeof(float). The kernel launch specifies the shared memory size as block_size * sizeof(float), which is correct.
+
+- The weight is a parameter, so when S is computed via torch.sum(weight, dim=0), it is done on the GPU. The weight is already on CUDA (initialized with .cuda()), so S is also on CUDA.
+
+- The kernel's input x is passed as a tensor on CUDA, since get_inputs() returns a CUDA tensor.
+
+- The output is a (batch, 1) tensor, which matches the original model's output.
+
+This should be correct and fully functional.
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size).cuda())
+        self.scaling_factor = scaling_factor
+
+        # Define the fused CUDA kernel
+        fused_kernel = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        __global__ void fused_matmul_div_sum_scale(
+            const float* x,
+            const float* weight,
+            float* out,
+            int batch_size,
+            int input_size,
+            int hidden_size,
+            float scaling
+        ) {
+            // Each thread block handles one batch element
+            int batch_idx = blockIdx.x;
+            if (batch_idx >= batch_size) return;
+
+            // Shared memory for intermediate sums
+            extern __shared__ float sdata[];
+            float sum = 0.0f;
+
+            for (int k = threadIdx.x; k < input_size; k += blockDim.x) {
+                float temp = 0.0f;
+                for (int j = 0; j < hidden_size; j++) {
+                    temp += x[batch_idx * input_size + k] * weight[j * input_size + k];
+                }
+                sum += temp / 2.0f;
+            }
+
+            // Reduction within block
+            sdata[threadIdx.x] = sum;
+            __syncthreads();
+
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if

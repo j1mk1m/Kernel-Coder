@@ -1,0 +1,748 @@
+Also, please do not use any additional packages. Your code must use PyTorch's native extensions. You can use the same framework for the answer as the example above, with inline CUDA. 
+
+You are to write a Python class named ModelNew with the same interface as Model. The get_init_inputs and get_inputs functions are also part of the interface and must be retained. Your code must replace the original operators (like conv_transpose, add, clamp, etc.) with your custom CUDA kernels. 
+
+The user will measure the performance by comparing the original Model and your ModelNew. The kernels should be correct (produce the same outputs) and faster than the original. 
+
+You must make the kernel fusion as much as possible. Try to combine as many operations as possible into one kernel. The more fused, the better.
+
+
+
+
+Okay, let's see. The user wants me to optimize the given Model by replacing some operators with custom CUDA kernels, and fuse as many operations as possible into a single kernel. The original model has a ConvTranspose2d followed by a bias addition, two clamps, a scaling multiplication, and a division by the scaling factor. 
+
+First, I need to analyze which parts can be fused. The operations after the convolution are all element-wise: adding bias, clamping, scaling, another clamp, then dividing. These can all be combined into a single kernel because they don't depend on each other except in sequence. The convolution itself is a more complex operation, so maybe I can leave that as is unless there's a way to fuse it with the following steps. But ConvTranspose is a big operation with lots of computation, so writing a custom one might be too time-consuming and may not be worth it for the example. The user might prefer to focus on fusing the element-wise operations after the conv.
+
+So the plan is: keep the ConvTranspose2d as is, but replace the subsequent element-wise operations (bias addition, clamps, scaling, etc.) into a single fused kernel. That way, we reduce the number of kernel launches and memory accesses.
+
+Let me outline the steps in the forward pass:
+
+1. x = self.conv_transpose(x)  # This stays as is.
+2. x = x + self.bias          # Element-wise addition of bias.
+3. x = torch.clamp(x, 0, 1)   # Clamp between 0 and 1.
+4. x = x * scaling_factor     # Multiply by scaling factor.
+5. x = torch.clamp(x, 0, 1)   # Another clamp.
+6. x = x / scaling_factor     # Divide by scaling factor.
+
+These steps 2-6 can all be done in a single CUDA kernel. Let's think about the kernel's logic. The bias is added first. Since the bias has shape (out_channels, 1, 1), when added to the output of conv_transpose (which is batch, out_channels, height, width), it's broadcasted over the spatial dimensions. So in the kernel, each element's channel corresponds to the bias's channel.
+
+The kernel will process each element in parallel. For each element:
+
+- Add the bias (per channel)
+- Clamp to [0,1]
+- Multiply by scaling factor
+- Clamp again to [0,1]
+- Divide by scaling factor
+
+Wait, but the division at the end is just scaling_factor^{-1}, so the overall scaling is scaling_factor * scaling_factor^{-1} = 1. But the clamps in between matter. So the net effect is clamping twice with scaling in between. 
+
+Hmm, but the user's code has those steps. Let me check the math:
+
+Suppose after the first clamp (0 to 1), then multiply by scaling factor (e.g., 2), then clamp again (0 to 1), then divide by scaling. Let's say the value after first clamp is 0.5. Then scaling gives 1.0, which after second clamp is still 1.0, then divide by 2 gives 0.5. But if the scaled value exceeds 1, like after scaling to 1.5, then clamp to 1, then divide by scaling gives 0.5. So the overall effect is clamping the original value to [0,1], then scaling, clamping again, but then dividing back. It's a bit odd, but that's the user's code.
+
+Anyway, the point is to implement all these steps in a single kernel.
+
+Now, how to structure the CUDA kernel. The input to the kernel will be the output of the conv_transpose (x), the bias tensor, and the scaling factor. The output is the processed tensor.
+
+The kernel function would process each element. Let's think in terms of indices. Since the input is a 4D tensor (NCHW), each element can be addressed by indices (n, c, h, w). The bias is (C, 1, 1), so for each element (n, c, h, w), the bias value is self.bias[c, 0, 0].
+
+In CUDA, the threads can be mapped to the spatial dimensions. Let's consider a 3D grid of blocks, with each block handling a certain number of elements. Alternatively, a 1D grid where each thread handles one element.
+
+Wait, for 4D tensors, it's common to flatten the indices. So the total number of elements is N * C * H * W. Each thread can compute its index as:
+
+int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+But since the tensors are 4D, we can compute the indices:
+
+int index = idx;
+int w = index % W;
+index /= W;
+int h = index % H;
+index /= H;
+int c = index % C;
+int n = index / C;
+
+But maybe it's better to calculate the offset based on the tensor's stride. Alternatively, since the tensors are in contiguous memory, we can treat them as 1D arrays.
+
+So the kernel would take pointers to x (the input after conv_transpose), the bias, and the scaling factor. Then, for each element:
+
+value = x_val + bias[c]
+
+Wait, but the bias is of shape (out_channels, 1, 1). So for each channel c, the bias is the same across all spatial positions and batch. So the bias value for channel c is stored at bias.data_ptr()[c * bias.stride(0)]. Wait, actually, since the bias is a 3D tensor (C, 1, 1), when stored in contiguous memory, the stride for the first dimension (C) would be 1*1*1, so each channel's value is at bias_data[c * 1*1*1] ?
+
+Wait, the bias is a parameter stored as a tensor. Let's say the bias is stored as a 3D tensor (C, 1, 1), then the stride for the first dimension (C) would be 1, and the strides for the other dimensions (H and W) are 1 as well. So the element at (c, 0, 0) is at position c in the flattened array. So for a given channel c, the bias value is at bias_data[c].
+
+Therefore, in the kernel, for each thread:
+
+auto x_val = x_ptr[idx];
+auto bias_val = bias_ptr[c]; // c is derived from the index
+auto temp = x_val + bias_val;
+temp = max(0.0f, min(temp, 1.0f));
+temp *= scaling_factor;
+temp = max(0.0f, min(temp, 1.0f));
+temp /= scaling_factor;
+out_ptr[idx] = temp;
+
+So the steps are:
+
+1. Load the x value and add bias (based on channel)
+2. Clamp between 0 and 1
+3. Multiply by scaling factor
+4. Clamp again between 0 and 1
+5. Divide by scaling factor
+6. Store the result.
+
+This can all be done in one kernel.
+
+Now, the problem is to write this in CUDA. Let's structure the kernel.
+
+First, define the kernel function. The kernel will take pointers to x, bias, scaling_factor, and the output. The size is the number of elements (N*C*H*W).
+
+The CUDA kernel:
+
+__global__ void fused_operations_kernel(
+    const float* x_data,
+    const float* bias_data,
+    float scaling_factor,
+    float* out_data,
+    int size,
+    int channels,
+    int height,
+    int width) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    // Compute indices
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c = (idx / (width * height)) % channels;
+    int n = idx / (channels * width * height);
+
+    // Or alternatively, since the order is NCHW, perhaps the calculation is different.
+    // Wait, in NCHW, the element index can be calculated as:
+
+    // idx = n * C*H*W + c * H*W + h * W + w
+    // So:
+
+    // Let me see, the total size is N * C * H * W = size.
+
+    // So:
+
+    int n = idx / (channels * height * width);
+    int remainder = idx % (channels * height * width);
+    int c = remainder / (height * width);
+    remainder %= (height * width);
+    int h = remainder / width;
+    int w = remainder % width;
+
+    // But this might be slower than the previous method. Alternatively, perhaps the order is not important as long as each thread gets a unique index. Since the input is contiguous, the exact spatial positions might not matter as long as we can get the channel.
+
+    Alternatively, maybe the channel can be calculated as (idx / (H*W)) % C, but this depends on the storage order.
+
+    Alternatively, since in NCHW, the channel is the second dimension, so for each element, the channel is (idx / (H*W)) ) % C. Hmm, perhaps I should think in terms of the strides.
+
+    Alternatively, since the input is a 4D tensor, but stored in a contiguous array, the channel can be derived as follows:
+
+    The number of elements per sample is C * H * W. So for a given index, the sample's portion starts at n * C*H*W. Then, within the sample, the channel is (idx % (C*H*W)) / (H*W). 
+
+    Anyway, regardless of the exact method, the key is to get the channel index correctly so that the bias value can be fetched.
+
+    Assuming that the code correctly calculates c, then proceed.
+
+    Then:
+
+    float value = x_data[idx] + bias_data[c]; // since bias is (C,1,1), so bias_data[c] is the value for channel c.
+
+    // Then apply the sequence of operations:
+
+    value = max(0.0f, min(value, 1.0f));
+    value *= scaling_factor;
+    value = max(0.0f, min(value, 1.0f));
+    value /= scaling_factor;
+
+    out_data[idx] = value;
+}
+
+Wait, but the bias is a tensor. So in the kernel function, the bias_data is a pointer to the bias tensor. Since the bias is a parameter stored as (C,1,1), the bias_data[c] gives the correct value for channel c. 
+
+Now, the kernel parameters:
+
+- x_data: pointer to the input tensor (output of conv_transpose)
+- bias_data: pointer to the bias tensor
+- scaling_factor: a float (passed as a kernel parameter)
+- out_data: pointer to the output tensor
+- size: total number of elements (N*C*H*W)
+- channels: C
+- height: H
+- width: W
+
+Wait, the kernel also needs to know the channel count, height, and width to compute the indices. Alternatively, perhaps the channel count can be computed as (size / (N*H*W)), but that's not straightforward. Alternatively, pass the necessary dimensions as parameters.
+
+So in the CUDA function, when launching the kernel, we need to pass those parameters.
+
+Now, the wrapper function in Python:
+
+def fused_operations_cuda(x, bias, scaling_factor):
+    # Get the necessary sizes and parameters
+    channels = bias.size(0)
+    height = x.size(2)
+    width = x.size(3)
+    batch_size = x.size(0)
+    size = x.numel()
+
+    # Create output tensor
+    out = torch.zeros_like(x)
+
+    # Define block and grid dimensions
+    block_size = 256
+    grid_size = (size + block_size - 1) // block_size
+
+    # Launch kernel
+    fused_operations_kernel[grid_size, block_size](
+        x.data_ptr(), 
+        bias.data_ptr(),
+        scaling_factor,
+        out.data_ptr(),
+        size,
+        channels,
+        height,
+        width
+    )
+
+    return out
+
+Wait, but in the CUDA kernel, when passing parameters, how do the non-pointer parameters get handled? The kernel parameters after the pointers would be the scaling_factor (float), then the rest are integers (size, channels, etc). So in the kernel call, the arguments must be in the correct order.
+
+Wait, in the kernel definition, after the pointers, the parameters are:
+
+scaling_factor (float), then out_data (float*), size (int), channels (int), height (int), width (int).
+
+Wait, no, looking back:
+
+The kernel function signature is:
+
+__global__ void fused_operations_kernel(
+    const float* x_data,
+    const float* bias_data,
+    float scaling_factor,
+    float* out_data,
+    int size,
+    int channels,
+    int height,
+    int width) {
+
+So the parameters are in that order. So in the kernel launch, the arguments need to be passed in the same order.
+
+So in the Python wrapper, the call to the kernel would be:
+
+fused_operations_kernel<<<grid_size, block_size>>>(
+    x_data_ptr,
+    bias_data_ptr,
+    scaling_factor,
+    out_data_ptr,
+    size,
+    channels,
+    height,
+    width
+)
+
+Wait, but in PyTorch's CUDA extension, the parameters are passed as arguments to the kernel function, which is generated via load_inline. So the kernel parameters are passed in order.
+
+Now, in the code, the CUDA source needs to include all the necessary headers, and the kernel function.
+
+Putting it all together, the code for the fused kernel would be:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_operations_kernel(
+    const float* x_data,
+    const float* bias_data,
+    float scaling_factor,
+    float* out_data,
+    int size,
+    int channels,
+    int height,
+    int width) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    // Compute the indices
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c = (idx / (width * height)) % channels;
+    int n = idx / (channels * width * height);
+
+    float value = x_data[idx] + bias_data[c];
+
+    value = fmaxf(0.0f, fminf(value, 1.0f)); // first clamp
+    value *= scaling_factor;                 // scale
+    value = fmaxf(0.0f, fminf(value, 1.0f)); // second clamp
+    value /= scaling_factor;                 // unscale
+
+    out_data[idx] = value;
+}
+
+torch::Tensor fused_operations_cuda(torch::Tensor x, torch::Tensor bias, float scaling_factor) {
+    auto channels = bias.size(0);
+    auto height = x.size(2);
+    auto width = x.size(3);
+    auto batch_size = x.size(0);
+    auto size = x.numel();
+
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    // Launch the kernel
+    fused_operations_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scaling_factor,
+        out.data_ptr<float>(),
+        size,
+        channels,
+        height,
+        width
+    );
+
+    return out;
+}
+
+Wait, but in the kernel, when calculating the indices, perhaps the order is different. Let me check the calculation again. Let's say the input is NCHW. The index for a given element (n, c, h, w) would be n * C*H*W + c*H*W + h*W + w. So to compute the indices from the flattened index:
+
+n = idx / (C*H*W)
+remainder = idx % (C*H*W)
+c = remainder / (H*W)
+remainder2 = remainder % (H*W)
+h = remainder2 / W
+w = remainder2 % W
+
+Yes, that's correct. So the code in the kernel for calculating the indices is as written.
+
+Wait, in the code above, the way to calculate c is (idx / (width * height)) % channels ?
+
+Wait:
+
+(idx / (width * height)) gives (n * C + c) * H*W + ...? Hmm, perhaps the code is correct.
+
+Alternatively, perhaps the way I wrote in the kernel is:
+
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c = (idx / (width * height)) % channels;
+    int n = idx / (channels * width * height);
+
+Let me see for a small example. Suppose N=1, C=3, H=2, W=2. So size is 1*3*2*2=12.
+
+For idx=5:
+
+w = 5%2=1
+
+h = (5/2)=2, mod height (2) gives 0? Wait, no: 5//2=2 (integer division), but height is 2. So (5//2) mod 2: 2 mod 2=0. Hmm, that's not correct. Let's see:
+
+Wait, for H=2 and W=2:
+
+idx=0: (0,0,0,0)
+
+idx=1: (0,0,0,1)
+
+idx=2: (0,0,1,0)
+
+idx=3: (0,0,1,1)
+
+idx=4: (0,1,0,0)
+
+Wait, no. Wait when c is 1:
+
+idx=4 would be 1*2*2=4, so c is 1 (since (4/(2*2)) =1, mod 3 (channels=3) gives 1.
+
+Wait, for idx=4:
+
+w = 4%2=0
+
+h = (4/2)=2 mod 2 → 0?
+
+Wait, h is (4//2) mod height (2). 4//2 is 2 mod 2 is 0. So h=0. So the position would be (0,1,0,0). That's correct.
+
+Hmm, okay. So the way the indices are computed in the kernel seems correct.
+
+Now, in the Python code, the kernel is compiled via load_inline.
+
+Then, in the ModelNew class, we replace the forward pass:
+
+def forward(self, x):
+    x = self.conv_transpose(x)
+    x = self.fused_ops(x, self.bias, self.scaling_factor)
+    return x
+
+Wait, but the fused_ops is a function from the loaded CUDA extension. Wait, in the example, they have a class with a method that calls the CUDA function. Wait, let me think. The fused_operations_cuda function is a standalone function in the C++ extension. So in the Python code, after loading the CUDA code, we can call it as a function.
+
+Wait, in the example provided earlier, the elementwise_add was loaded into a module, and then called as elementwise_add.elementwise_add_cuda(a, b).
+
+So, in this case, the fused_operations_cuda function is part of the CUDA module. So the code would be:
+
+First, define the CUDA source code as a string:
+
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ... the kernel and function code as above ...
+"""
+
+Then, the header declaration:
+
+fused_ops_cpp_source = "torch::Tensor fused_operations_cuda(torch::Tensor x, torch::Tensor bias, float scaling_factor);"
+
+Then, load the inline CUDA code:
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_operations_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super().__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+        self.scaling_factor = scaling_factor
+        self.fused_ops = fused_ops  # the loaded module
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.fused_ops.fused_operations_cuda(x, self.bias, self.scaling_factor)
+        return x
+
+Wait, but the scaling_factor is a parameter here. Wait, in the original code, the scaling_factor is a parameter passed to __init__, so it's stored as an attribute. In the fused_operations_cuda function, it's a float parameter, so when calling the CUDA function, we have to pass it as a float. But in the original code, scaling_factor is stored as a float, so in the ModelNew, it's an attribute, so self.scaling_factor is a float, so that's okay.
+
+Wait, but in the original Model class, the scaling_factor is a float parameter. So in the __init__ of ModelNew, we need to pass all the parameters, including scaling_factor. 
+
+Also, in get_init_inputs, the original function returns the parameters needed to initialize the model. The original get_init_inputs includes scaling_factor as the last parameter. So the __init__ of ModelNew must take all those parameters. 
+
+Putting all together, the code should be structured as follows:
+
+First, define the CUDA kernel code as a string.
+
+Then, compile it inline with load_inline, creating the fused_ops module.
+
+Then, in the ModelNew class, the __init__ takes all the parameters, initializes the conv_transpose layer, the bias parameter, and the scaling_factor as an attribute, and also includes the fused_ops module.
+
+The forward function applies the conv_transpose first, then the fused kernel.
+
+Now, check if all the parameters are passed correctly. For instance, bias_shape is (out_channels, 1, 1). The bias is a parameter initialized with that shape.
+
+Now, the get_init_inputs function must return the same list of parameters as the original. The original's get_init_inputs returns [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor].
+
+Thus, the ModelNew must have an __init__ that takes all those parameters, so the code should work.
+
+Now, possible issues:
+
+1. The CUDA kernel must have the correct parameters. The fused_operations_cuda function in the C++ code takes x (tensor), bias (tensor), and scaling_factor (float). The kernel's parameters are correctly passed.
+
+2. The indices calculation in the kernel must be correct. We tested with a small example and it seems okay.
+
+3. The output tensor is allocated with torch.zeros_like(x), which is correct.
+
+4. The block and grid sizes: using 256 threads per block, and grid size as (size + block-1)//block. That should be okay.
+
+Now, possible optimizations:
+
+- Maybe the kernel can be made faster by using shared memory or better thread arrangement, but given the problem statement, it's sufficient to just fuse all the steps into one kernel.
+
+- Also, the CUDA kernel could be written to avoid branching (if statements) but the clamping is straightforward with fmaxf and fminf, which are intrinsics and efficient.
+
+Another possible optimization: the scaling factor is a float, so the division and multiplication can be fused with the clamping steps. The code already does that.
+
+So the final code should look like the above steps.
+
+Another thing: in the CUDA kernel, the bias is a tensor of shape (C,1,1). When we access bias_data[c], it's correct because the data is stored in a contiguous array, so the first C elements are the C channels. Since the bias is (C,1,1), the stride for the first dimension is 1 (since the next dimensions have 1 and 1 elements). Therefore, the bias_data pointer correctly points to the array where each element is the bias for channel c.
+
+Testing for correct output:
+
+Suppose the input x after conv_transpose is a tensor with some values. Adding bias per channel, then applying the sequence of clamps and scaling should give the same result as the original code. 
+
+Yes, because the kernel exactly replicates the steps:
+
+original steps:
+
+x = x + self.bias --> in kernel: x_val + bias[c]
+
+then clamp to 0-1 --> first clamp
+
+then multiply by scaling --> scaling
+
+then clamp again --> second clamp
+
+then divide by scaling --> scaling^-1.
+
+Thus, the kernel's computation matches the original code.
+
+Therefore, the fused kernel should produce the correct output.
+
+Now, putting all this into code blocks.
+
+The final code would have the CUDA kernel code as a string, then the wrapper function, then the load_inline, then the ModelNew class.
+
+So the full code would be something like this:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused operations
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_operations_kernel(
+    const float* x_data,
+    const float* bias_data,
+    float scaling_factor,
+    float* out_data,
+    int size,
+    int channels,
+    int height,
+    int width) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    // Calculate indices
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c = (idx / (width * height)) % channels;
+    int n = idx / (channels * width * height);
+
+    // Compute the value step by step
+    float value = x_data[idx] + bias_data[c]; // Add bias per channel
+    value = fmaxf(0.0f, fminf(value, 1.0f)); // First clamp [0,1]
+    value *= scaling_factor;                 // Scale
+    value = fmaxf(0.0f, fminf(value, 1.0f)); // Second clamp [0,1]
+    value /= scaling_factor;                 // Unscale
+
+    out_data[idx] = value;
+}
+
+torch::Tensor fused_operations_cuda(torch::Tensor x, torch::Tensor bias, float scaling_factor) {
+    auto channels = bias.size(0);
+    auto height = x.size(2);
+    auto width = x.size(3);
+    auto size = x.numel();
+
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    // Launch the kernel
+    fused_operations_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scaling_factor,
+        out.data_ptr<float>(),
+        size,
+        channels,
+        height,
+        width
+    );
+
+    return out;
+}
+"""
+
+fused_ops_cpp_source = (
+    "torch::Tensor fused_operations_cuda(torch::Tensor x, torch::Tensor bias, float scaling_factor);"
+)
+
+# Compile the fused operations CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_operations_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, stride=stride,
+            padding=padding, output_padding=output_padding
+        )
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scaling_factor = scaling_factor
+        self.fused_ops = fused_ops  # The CUDA module
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.fused_ops.fused_operations_cuda(x, self.bias, self.scaling_factor)
+        return x
+
+# The get_init_inputs and get_inputs functions remain the same as original
+batch_size = 128
+in_channels  = 64  
+out_channels = 64  
+height = width = 128 
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+bias_shape = (out_channels, 1, 1)
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor]
+```
+
+Wait, but in the get_inputs function, the original code had get_inputs return tensors on CPU, but in the example provided earlier, they were moved to CUDA. The original code's get_inputs had:
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+But in the example, they used .cuda(). So perhaps the user expects the inputs to be on GPU. The original problem says that in the example, the inputs are on CUDA. So I'll adjust the get_inputs to return CUDA tensors.
+
+So in the code above, get_inputs() returns [torch.rand(...).cuda()].
+
+Also, in the ModelNew's forward function, the input x is expected to be on the same device as the parameters. Since the bias is a parameter, which is on CUDA by default (assuming the model is moved to CUDA, but in the get_init_inputs, the parameters are initialized with .rand, which is on CPU unless specified. Wait, the original code's Model has self.bias initialized with torch.randn(bias_shape), which is on CPU. So when using the ModelNew, the user would have to move the model to CUDA. Alternatively, the code should ensure that the bias is on the same device as the inputs.
+
+Wait, but in the original code, the get_init_inputs function would pass bias_shape as a tuple, and the __init__ creates the bias as a parameter, which is initialized on the default device (CPU). So when using the model, you need to call .cuda() on the model to move parameters and buffers to the GPU.
+
+Therefore, the code is correct as written, assuming that the user moves the model to CUDA when using it. The get_inputs in the problem's original code may generate CPU tensors, but the example shows moving to CUDA, so I followed that.
+
+Thus, the code should be correct.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused operations
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_operations_kernel(
+    const float* x_data,
+    const float* bias_data,
+    float scaling_factor,
+    float* out_data,
+    int size,
+    int channels,
+    int height,
+    int width) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    // Calculate indices
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c = (idx / (width * height)) % channels;
+    int n = idx / (channels * width * height);
+
+    // Compute the value step by step
+    float value = x_data[idx] + bias_data[c]; // Add bias per channel
+    value = fmaxf(0.0f, fminf(value, 1.0f)); // First clamp [0,1]
+    value *= scaling_factor;                 // Scale
+    value = fmaxf(0.0f, fminf(value, 1.0f)); // Second clamp [0,1]
+    value /= scaling_factor;                 // Unscale
+
+    out_data[idx] = value;
+}
+
+torch::Tensor fused_operations_cuda(torch::Tensor x, torch::Tensor bias, float scaling_factor) {
+    auto channels = bias.size(0);
+    auto height = x.size(2);
+    auto width = x.size(3);
+    auto size = x.numel();
+
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int grid_size = (size + block_size - 1) / block_size;
+
+    // Launch the kernel
+    fused_operations_kernel<<<grid_size, block_size>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scaling_factor,
+        out.data_ptr<float>(),
+        size,
+        channels,
+        height,
+        width
+    );
+
+    return out;
+}
+"""
+
+fused_ops_cpp_source = (
+    "torch::Tensor fused_operations_cuda(torch::Tensor x, torch::Tensor bias, float scaling_factor);"
+)
+
+# Compile the fused operations CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_operations_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, stride=stride,
+            padding=padding, output_padding=output_padding
+        )
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scaling_factor = scaling_factor
+        self.fused_ops = fused_ops  # The CUDA module
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.fused_ops.fused_operations_cuda(x, self.bias, self.scaling_factor)
+        return x
+
+# The get_init_inputs and get_inputs functions remain the same as original
+batch_size = 128
+in_channels  = 64  
+out_channels = 64  
+height = width = 128 
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+bias_shape = (out_channels, 1, 1)
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor]
+```

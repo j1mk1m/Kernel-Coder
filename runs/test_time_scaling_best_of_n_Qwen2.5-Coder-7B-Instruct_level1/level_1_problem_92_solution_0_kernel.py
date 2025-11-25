@@ -1,0 +1,60 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+exclusive_cumsum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void exclusive_cumsum_kernel(float* input, float* output, int batch_size, int length) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+
+    for (int i = tid; i < length; i += stride) {
+        if (i > 0) {
+            output[i] = input[i] + output[i - 1];
+        } else {
+            output[i] = input[i];
+        }
+    }
+}
+
+torch::Tensor exclusive_cumsum_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto length = input.size(1);
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (length + block_size - 1) / block_size;
+
+    exclusive_cumsum_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, length);
+
+    return output;
+}
+"""
+
+exclusive_cumsum_cpp_source = (
+    "torch::Tensor exclusive_cumsum_cuda(torch::Tensor input);"
+)
+
+exclusive_cumsum = load_inline(
+    name="exclusive_cumsum",
+    cpp_sources=exclusive_cumsum_cpp_source,
+    cuda_sources=exclusive_cumsum_source,
+    functions=["exclusive_cumsum_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.exclusive_cumsum = exclusive_cumsum
+
+    def forward(self, x):
+        exclusive_cumsum_result = self.exclusive_cumsum.exclusive_cumsum_cuda(x)
+        return exclusive_cumsum_result

@@ -1,0 +1,164 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D transposed convolution
+transposed_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void transposed_conv_3d_kernel(const float* x, float* out, int batch_size, int in_channels, int out_channels, int D_in, int H_in, int W_in, int D_out, int H_out, int W_out, int kernel_size, int stride, int padding, bool bias) {
+    // Implement the transposed convolution kernel here
+}
+
+torch::Tensor transposed_conv_cuda(torch::Tensor x, int in_channels, int out_channels, int kernel_size, int stride, int padding, bool bias) {
+    auto batch_size = x.size(0);
+    auto D_in = x.size(2);
+    auto H_in = x.size(3);
+    auto W_in = x.size(4);
+    auto D_out = (D_in - 1) * stride + kernel_size - 2 * padding;
+    auto H_out = (H_in - 1) * stride + kernel_size - 2 * padding;
+    auto W_out = (W_in - 1) * stride + kernel_size - 2 * padding;
+    auto out = torch::zeros({batch_size, out_channels, D_out, H_out, W_out}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (out.numel() + block_size - 1) / block_size;
+
+    transposed_conv_3d_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), batch_size, in_channels, out_channels, D_in, H_in, W_in, D_out, H_out, W_out, kernel_size, stride, padding, bias);
+
+    return out;
+}
+"""
+
+# Define the custom CUDA kernel for Layer Normalization
+layer_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void layer_norm_kernel(const float* x, float* out, int batch_size, int out_channels, int D, int H, int W, float eps) {
+    // Implement the layer normalization kernel here
+}
+
+torch::Tensor layer_norm_cuda(torch::Tensor x, int out_channels, float eps) {
+    auto batch_size = x.size(0);
+    auto D = x.size(2);
+    auto H = x.size(3);
+    auto W = x.size(4);
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (out.numel() + block_size - 1) / block_size;
+
+    layer_norm_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), batch_size, out_channels, D, H, W, eps);
+
+    return out;
+}
+"""
+
+# Define the custom CUDA kernel for GELU activation
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_kernel(const float* x, float* out, int numel) {
+    // Implement the GELU kernel here
+}
+
+torch::Tensor gelu_cuda(torch::Tensor x) {
+    auto numel = x.numel();
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (out.numel() + block_size - 1) / block_size;
+
+    gelu_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), numel);
+
+    return out;
+}
+"""
+
+# Define the custom CUDA kernel for scaling
+scaling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void scaling_kernel(const float* x, float* out, int numel, float scaling_factor) {
+    // Implement the scaling kernel here
+}
+
+torch::Tensor scaling_cuda(torch::Tensor x, float scaling_factor) {
+    auto numel = x.numel();
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (out.numel() + block_size - 1) / block_size;
+
+    scaling_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), numel, scaling_factor);
+
+    return out;
+}
+"""
+
+# Compile the inline CUDA code for each operation
+transposed_conv = load_inline(
+    name="transposed_conv",
+    cpp_sources="torch::Tensor transposed_conv_cuda(torch::Tensor x, int in_channels, int out_channels, int kernel_size, int stride, int padding, bool bias);",
+    cuda_sources=transposed_conv_source,
+    functions=["transposed_conv_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+layer_norm = load_inline(
+    name="layer_norm",
+    cpp_sources="torch::Tensor layer_norm_cuda(torch::Tensor x, int out_channels, float eps);",
+    cuda_sources=layer_norm_source,
+    functions=["layer_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+gelu = load_inline(
+    name="gelu",
+    cpp_sources="torch::Tensor gelu_cuda(torch::Tensor x);",
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+scaling = load_inline(
+    name="scaling",
+    cpp_sources="torch::Tensor scaling_cuda(torch::Tensor x, float scaling_factor);",
+    cuda_sources=scaling_source,
+    functions=["scaling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True, eps=1e-5, scaling_factor=1.0):
+        super(ModelNew, self).__init__()
+        self.transposed_conv = transposed_conv
+        self.layer_norm = layer_norm
+        self.gelu = gelu
+        self.scaling = scaling
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.transposed_conv.transposed_conv_cuda(x, in_channels, out_channels, kernel_size, stride, padding, bias)
+        x = self.layer_norm.layer_norm_cuda(x, out_channels, eps)
+        x = self.gelu.gelu_cuda(x)
+        x = self.scaling.scaling_cuda(x, self.scaling_factor)
+        return x
+
+# Example usage
+model_new = ModelNew(in_channels, out_channels, kernel_size, stride, padding, bias, eps, scaling_factor)
+inputs = get_inputs()
+output = model_new(inputs[0])
+print(output.shape)

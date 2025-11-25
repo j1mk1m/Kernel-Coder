@@ -1,0 +1,1186 @@
+The given architecture is a model that performs Batch Normalization. The goal is to replace parts of the PyTorch implementation with custom CUDA kernels for speedups. The example provided uses a simple element-wise addition, so I need to analyze the BatchNorm operations and see which parts can be optimized.
+
+First, I need to understand how BatchNorm works. The batch normalization layer normalizes the input tensor over the batch and spatial dimensions, then scales and shifts it using learnable parameters. The formula is:
+
+y = γ * (x - μ) / σ + β
+
+where μ is the mean, σ the variance (or sqrt(var + eps)), and γ, β are learnable parameters.
+
+The standard PyTorch implementation (nn.BatchNorm2d) is already highly optimized, but perhaps there's a way to fuse some operations or optimize the computation for specific input shapes or parameters.
+
+Looking at the given architecture, the input is a 4D tensor with shape (batch_size, features, dim1, dim2). The batch size is 64, features=64, and dim1, dim2 are both 512. So the input is 64x64x512x512. 
+
+Possible steps for optimization:
+1. Compute the mean and variance more efficiently. The current implementation might compute these using PyTorch functions, which could be replaced with a custom CUDA kernel for better performance.
+2. Combine the normalization steps (subtract mean, divide by std, multiply by gamma, add beta) into a single kernel to reduce memory access and kernel launch overhead.
+3. Exploit tensor parallelism, especially for the channels dimension, but since it's 2D batch norm, maybe not applicable here.
+4. Use tensor core operations if possible (but that requires specific tensor shapes and data types, like mixed precision).
+
+First, let's think about the mean and variance computation. The mean is computed over the dimensions except the channel dimension. For a 4D tensor (N,C,H,W), the mean is computed over N, H, W for each channel. Similarly for variance. 
+
+The standard approach would be to sum over the first, third, and fourth dimensions and divide by the product of their sizes (H*W*N). The variance is the average of squared deviations from the mean.
+
+Implementing this in a custom CUDA kernel might allow for better memory access patterns or parallelization. However, given that PyTorch's implementation is already optimized, this might not yield a significant speedup. Alternatively, fusing the mean/var computation with the normalization step into a single kernel could save time by reducing the number of kernel launches.
+
+Alternatively, maybe the forward pass can be fused into a single kernel. Let's outline the steps:
+
+1. Compute mean over N, H, W for each channel.
+2. Compute variance over N, H, W for each channel.
+3. Normalize each element by (x - mean)/sqrt(var + eps)
+4. Scale and shift by gamma and beta.
+
+The key is to perform steps 1-4 in as few kernels as possible. Let's see if we can compute mean and variance in a single pass, then normalize and scale in another.
+
+Alternatively, maybe all steps can be in a single kernel.
+
+First, let's tackle the mean and variance computation.
+
+Let me think about the dimensions:
+
+Input is (N, C, H, W). For each channel c (0..C-1), the mean is:
+
+mean[c] = (sum_{n,h,w} x[n,c,h,w]) / (N*H*W)
+
+Similarly for variance:
+
+var[c] = (sum_{n,h,w} (x[n,c,h,w] - mean[c])^2 ) / (N*H*W)
+
+Then the normalization is done per element:
+
+y[n,c,h,w] = gamma[c] * (x[n,c,h,w] - mean[c]) / sqrt(var[c] + eps) + beta[c]
+
+The problem is that the mean and variance depend on the entire batch and spatial dimensions. So to compute them, each channel's mean and variance must be computed across all those dimensions.
+
+The first step is to compute mean and variance. To do this in a kernel, perhaps we can use a reduction over the batch and spatial dimensions for each channel. Since the channels are independent, each channel can be handled separately.
+
+However, in CUDA, handling each channel separately could lead to inefficient use of threads. Alternatively, the computation can be done in a way that all threads collaborate to compute the sums for each channel.
+
+An approach could be:
+
+1. For each thread, process a channel (since C is 64 here, which is manageable). But with 64 channels, using 64 threads might be possible but with limited parallelism. Alternatively, process multiple channels per thread.
+
+Alternatively, use a grid where each block is responsible for a channel. Each block has multiple threads processing elements of that channel.
+
+Wait, for each channel, we need to compute the sum over N*H*W elements. Let's say for each channel, we launch a block. Each thread in the block processes a subset of the elements in that channel.
+
+For example:
+
+For channel c in 0..C-1:
+
+- Each thread in block c processes a chunk of the N*H*W elements.
+
+But with C=64, and assuming 1024 threads per block, this might be feasible.
+
+Alternatively, use a single block and have each thread handle a channel? Probably not, since 64 threads would be needed, and more threads are available.
+
+Alternatively, use a grid of C blocks, each block for a channel, with threads per block handling the spatial and batch elements.
+
+Let me try to outline the code structure.
+
+First, the kernel for computing mean and variance.
+
+Compute mean and variance per channel:
+
+Each block corresponds to a channel. Each thread in the block processes a subset of the elements in that channel's "flattened" array (since the channel is N x H x W).
+
+The steps per block:
+
+1. Compute sum_x (sum over all elements in channel c)
+2. Compute sum_x2 (sum of squares)
+
+Then, the mean is sum_x / count, variance is (sum_x2 - mean^2 * count)/count.
+
+Wait, variance can be computed as (sum_x2 / count) - mean^2.
+
+So, for each channel c:
+
+sum_x = sum_{all elements in c} x
+
+sum_x2 = sum_{all elements in c} x^2
+
+mean = sum_x / count
+
+var = (sum_x2 / count) - mean^2
+
+Then, the variance is stored as var.
+
+This approach allows computing mean and variance in parallel for each channel, using a block per channel.
+
+The count is N * H * W, which for the given input is 64*512*512 = 16,384, which is manageable.
+
+So each block (per channel) will have to process 16,384 elements. With, say, 512 threads per block, each thread can process 32 elements (16384 / 512 = 32). 
+
+The kernel for mean/var computation would be something like this:
+
+```cuda
+template <typename scalar_t>
+__global__ void compute_mean_var(
+    const scalar_t* __restrict__ input,
+    scalar_t* mean,
+    scalar_t* var,
+    int batch_size,
+    int channels,
+    int spatial_dim) {
+
+    int c = blockIdx.x; // each channel is a block
+    if (c >= channels) return;
+
+    const int count = batch_size * spatial_dim;
+    const int input_offset = c * batch_size * spatial_dim;
+
+    __shared__ scalar_t s_sum[2]; // sum_x and sum_x2
+
+    s_sum[threadIdx.x] = 0;
+    __syncthreads();
+
+    // Each thread processes a chunk of elements
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        scalar_t val = input[input_offset + i];
+        s_sum[0] += val;
+        s_sum[1] += val * val;
+    }
+
+    __syncthreads();
+
+    // Reduce the partial sums
+    for (int s = blockDim.x/2; s > 0; s >>=1) {
+        if (threadIdx.x < s) {
+            s_sum[0] += s_sum[threadIdx.x + s];
+            s_sum[1] += s_sum[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        mean[c] = s_sum[0] / count;
+        scalar_t mean_sq = mean[c] * mean[c];
+        var[c] = (s_sum[1]/count) - mean_sq;
+    }
+}
+```
+
+Wait, but the spatial_dim here is H*W. Because the input is (N, C, H, W), so for a given channel c, the data is stored as N*H*W elements? Or maybe the layout is different. Need to make sure of the memory layout.
+
+Alternatively, the spatial dimensions are H and W, so for each channel, the elements are in the first dimension (batch) and then H and W. But in terms of memory, the data is contiguous in the last dimensions.
+
+Wait, the input tensor is (N, C, H, W). So for channel c, the data is stored as N*H*W elements. So the total elements per channel is indeed N * H * W.
+
+Thus, the above kernel should work, assuming that input is a flattened array for each channel? No, actually the input is a 4D tensor. The pointer to input is the base address, and input_offset = c * batch_size * H * W ?
+
+Wait, the total number of elements per channel is batch_size * H * W. So the stride between channels would be batch_size * H * W.
+
+Wait, in a 4D tensor of (N, C, H, W), the strides depend on the memory layout. In PyTorch, by default, tensors are stored in row-major order. So the element (n, c, h, w) is located at position:
+
+n * C*H*W + c * H*W + h * W + w.
+
+Hence, for a given channel c, the elements are scattered across the batch and spatial dimensions. Thus, to access all elements of channel c, you have to iterate over n, h, w.
+
+But the above kernel assumes that all elements of channel c are contiguous, which is not the case. Thus, the input_offset calculation is incorrect. So the code above is flawed.
+
+Hmm, this complicates things. To access all elements of a particular channel, we can't just stride through a contiguous block. Instead, the elements are interleaved with other channels.
+
+Therefore, the kernel needs to access elements in a way that for each c, it can traverse all n, h, w.
+
+Alternatively, the input can be transposed or permuted to have channels as the outer dimension, but that would require a copy, which might not be efficient.
+
+Alternatively, perhaps the kernel can compute for all channels in parallel, but that might complicate the per-channel reduction.
+
+Hmm, this is a problem. Let's think of another approach.
+
+Another approach is to have each thread process an element of the entire tensor, and accumulate the sums per channel.
+
+Suppose we have a grid of threads where each thread processes an element (n, c, h, w). For each element, the thread contributes to the sum for channel c.
+
+So the global index of the thread can be mapped to (n, c, h, w), and each thread will add its value to the partial sums for channel c.
+
+This way, we can have a kernel that:
+
+- For each element (n,c,h,w):
+
+   - val = input[n,c,h,w]
+
+   - atomicAdd(sum_x[c], val)
+
+   - atomicAdd(sum_x2[c], val * val)
+
+But using atomic operations could be slow, but since the channels are 64, and each element belongs to one channel, perhaps it's manageable.
+
+Alternatively, use a reduction approach with per-channel shared memory buffers.
+
+Let me try to outline this approach.
+
+The kernel would be:
+
+Each thread is responsible for a certain element in the input tensor. The input is a 4D tensor, so we can map the thread indices to the 4D coordinates.
+
+But the exact mapping needs to be considered. Let's say we have a 1D grid of blocks, with each block processing a chunk of elements.
+
+Alternatively, map the global thread ID to the elements in the tensor.
+
+Let me think of the input as a flattened array of size N*C*H*W. Each thread processes an element at position idx in this array.
+
+Then, for each element at idx:
+
+- c = (idx / (H*W)) % C
+
+- n = (idx / (C*H*W)) 
+
+Wait, maybe better to compute the coordinates:
+
+Let's suppose the input is stored in row-major order, so the index is:
+
+index = n * C*H*W + c * H*W + h * W + w.
+
+So for a given index, we can compute the coordinates as:
+
+n = index / (C*H*W)
+
+remainder = index % (C*H*W)
+
+c = remainder / (H*W)
+
+remainder2 = remainder % (H*W)
+
+h = remainder2 / W
+
+w = remainder2 % W
+
+But this is a bit involved, but manageable.
+
+Alternatively, just compute the channel c from the index:
+
+c = (index // (H*W)) % C
+
+But perhaps using a stride-based approach would be better.
+
+Anyway, each thread processes an element, computes its channel, and adds its value and square to the channel's partial sums.
+
+To do this efficiently, we can use shared memory to store per-channel partial sums, then accumulate into global memory.
+
+Here's a possible kernel outline:
+
+template <typename scalar_t>
+__global__ void compute_mean_var(
+    const scalar_t* input,
+    scalar_t* mean,
+    scalar_t* var,
+    int N, int C, int H, int W) {
+
+    __shared__ scalar_t s_sum[2][MAX_CHANNELS]; // Assuming MAX_CHANNELS is >= C
+
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+
+    // Initialize shared memory to zero
+    for (int c = tid; c < C; c += blockDim.x) {
+        s_sum[0][c] = 0.0f;
+        s_sum[1][c] = 0.0f;
+    }
+    __syncthreads();
+
+    // Each thread processes elements in a block of work
+    for (int idx = bid * blockDim.x + tid; idx < N*C*H*W; idx += gridDim.x * blockDim.x) {
+
+        // Compute coordinates
+        int c = (idx / (H * W)) % C;
+        int n = idx / (C * H * W);
+        int rem = idx % (C * H * W);
+        int h = (rem % (H * W)) / W;
+        int w = rem % W;
+
+        scalar_t val = input[idx];
+
+        atomicAdd(&s_sum[0][c], val);
+        atomicAdd(&s_sum[1][c], val * val);
+    }
+
+    __syncthreads();
+
+    // Accumulate into global memory
+    for (int c = tid; c < C; c += blockDim.x) {
+        atomicAdd(&mean[c], s_sum[0][c]);
+        atomicAdd(&var[c], s_sum[1][c]);
+    }
+}
+
+Wait, but this might have race conditions. Also, the shared memory approach with atomic adds might not be efficient. Alternatively, each thread can compute partial sums in shared memory without atomics, but requires a reduction step.
+
+This is getting complicated. Maybe it's better to proceed with the first approach where each channel is handled by a block.
+
+Let me think again of the first approach, but correcting the memory layout issue.
+
+Suppose we have a block per channel. For each block (channel c):
+
+- The block processes all elements in that channel. The elements are located at positions (n, c, h, w). So the total elements per channel are N*H*W.
+
+Thus, the block can process all these elements by iterating over n, h, w.
+
+To compute the sum_x and sum_x2 for channel c, each thread in the block can process a chunk of the N*H*W elements.
+
+So for example:
+
+Each thread in the block processes a range of elements. Let's say the total elements per channel is count = N * H * W. Each thread in the block (of say, 256 threads) processes count / 256 elements.
+
+The kernel would be structured as:
+
+template <typename scalar_t>
+__global__ void compute_mean_var(
+    const scalar_t* input,
+    scalar_t* mean,
+    scalar_t* var,
+    int N, int C, int H, int W) {
+
+    const int c = blockIdx.x; // each block is a channel
+    if (c >= C) return;
+
+    const int count = N * H * W;
+    const int tid = threadIdx.x;
+
+    __shared__ scalar_t s_sum[2][256]; // Maybe need to adjust size based on block size
+
+    s_sum[0][tid] = 0.0f;
+    s_sum[1][tid] = 0.0f;
+    __syncthreads();
+
+    // Each thread processes a portion of the elements in this channel
+    for (int i = tid; i < count; i += blockDim.x) {
+
+        // Compute the coordinates within the channel's elements:
+        // The i-th element in the channel corresponds to (n, h, w) indices.
+
+        // Let's compute n, h, w such that n is first, then h, then w.
+        // So the order is n increases fastest, then h, then w? Not sure, depends on memory layout.
+
+        // Alternatively, since the input is (N, C, H, W), the element index within the channel is:
+        // The offset for channel c is c * N * H * W. Then, the elements are ordered as n, h, w.
+
+        // Wait, the total size per channel is N*H*W. So for each element in the channel:
+
+        // The global index in the tensor is: offset = c * N * H * W + n * H * W + h * W + w
+
+        // But to get the value of the element at (n,h,w) in the channel, we can compute the index as:
+
+        int n = i / (H * W);
+        int rem = i % (H * W);
+        int h = rem / W;
+        int w = rem % W;
+
+        // Now, the actual input index is:
+        int idx = c * N * H * W + n * H * W + h * W + w;
+
+        scalar_t val = input[idx];
+
+        s_sum[0][tid] += val;
+        s_sum[1][tid] += val * val;
+    }
+
+    __syncthreads();
+
+    // Now, perform reduction in shared memory
+    for (int s = blockDim.x/2; s > 0; s >>=1) {
+        if (tid < s) {
+            s_sum[0][tid] += s_sum[0][tid + s];
+            s_sum[1][tid] += s_sum[1][tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        mean[c] = s_sum[0][0] / count;
+        scalar_t mean_sq = mean[c] * mean[c];
+        var[c] = (s_sum[1][0] / count) - mean_sq;
+    }
+}
+
+Wait, but in this setup, the input is stored as a contiguous array. The input tensor's data is stored in a way that the first dimension (N) is the slowest varying, then C, H, W. So the calculation of the index should be correct.
+
+However, this requires that the input is stored in a way that allows this addressing. Let me confirm:
+
+The strides for a 4D tensor (N, C, H, W):
+
+- The stride for the first dimension (N) is C*H*W.
+
+- The stride for the second dimension (C) is H*W.
+
+- The stride for the third (H) is W.
+
+- The fourth (W) is 1.
+
+Thus, the element (n, c, h, w) has an offset of:
+
+n * C*H*W + c * H*W + h * W + w.
+
+Which is exactly what the code computes. So the index calculation is correct.
+
+Therefore, this kernel should work.
+
+The next step is to compute the mean and variance for each channel using this kernel.
+
+Then, the normalization step can be another kernel that uses the mean and variance to compute the normalized values.
+
+The normalization kernel would be:
+
+template <typename scalar_t>
+__global__ void normalize(
+    const scalar_t* input,
+    scalar_t* output,
+    const scalar_t* mean,
+    const scalar_t* var,
+    scalar_t eps,
+    const scalar_t* gamma,
+    const scalar_t* beta,
+    int N, int C, int H, int W) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N*C*H*W) return;
+
+    // Compute coordinates
+    int c = (idx / (H * W)) % C;
+    int n = idx / (C * H * W);
+    int rem = idx % (C * H * W);
+    int h = (rem % (H * W)) / W;
+    int w = rem % W;
+
+    scalar_t x = input[idx];
+    scalar_t inv_std = 1.0f / sqrt(var[c] + eps);
+    scalar_t normalized = (x - mean[c]) * inv_std;
+    output[idx] = gamma[c] * normalized + beta[c];
+}
+
+This kernel computes the normalized value for each element using the precomputed mean and var for its channel.
+
+However, to further optimize, perhaps combine the mean/var computation with the normalization into a single kernel, but that might be complex. Alternatively, separate the kernels and see.
+
+Now, the steps in the forward pass would be:
+
+1. Compute mean and var for each channel using compute_mean_var kernel.
+
+2. Compute the normalized values using the normalize kernel.
+
+3. Multiply by gamma and add beta.
+
+But in the original PyTorch implementation, these steps are all handled in the BatchNorm layer. To replace this with custom kernels, we can write a custom CUDA function that performs these steps.
+
+Now, in Python, we need to define these kernels, compile them, and then use them in the ModelNew class.
+
+The key steps are:
+
+- In the forward pass, compute mean and var with compute_mean_var kernel.
+
+- Then perform normalization.
+
+- Also, the gamma and beta parameters are part of the model. The original BatchNorm2d layer has parameters: weight (gamma) and bias (beta), along with running mean and variance, but in training mode, it uses the batch statistics.
+
+Assuming the model is in training mode (the example doesn't specify, but the problem says to optimize the given architecture, which uses a BatchNorm2d which by default uses batch stats in training).
+
+Thus, in the custom implementation, we need to:
+
+- Compute mean and var for each channel.
+
+- Normalize using those stats, apply gamma and beta.
+
+Thus, the code for the custom forward pass would be:
+
+In Python:
+
+First, write the CUDA kernels as strings.
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.eps = 1e-5  # Assuming same as PyTorch's default
+
+        # Load the CUDA kernels
+        # Define the CUDA sources here
+
+    def forward(self, x):
+        # Compute mean and var
+        # Launch compute_mean_var kernel
+        # Then launch normalize kernel
+        # Return the result
+
+Now, the problem is to write the CUDA kernels as strings in the Python code, compile them, and use them.
+
+Putting this all together, here's the plan for the code:
+
+First, write the CUDA kernels as strings in Python.
+
+First, the compute_mean_var kernel:
+
+compute_mean_var_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void compute_mean_var(
+    const scalar_t* input,
+    scalar_t* mean,
+    scalar_t* var,
+    int N, int C, int H, int W) {
+
+    const int c = blockIdx.x;
+    if (c >= C) return;
+
+    const int count = N * H * W;
+    const int tid = threadIdx.x;
+
+    __shared__ scalar_t s_sum[2][256];
+    for (int i = 0; i < 2; ++i) {
+        s_sum[i][tid] = 0.0;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < count; i += blockDim.x) {
+        // Compute n, h, w for this element in channel c
+        int n = i / (H * W);
+        int rem = i % (H * W);
+        int h = rem / W;
+        int w = rem % W;
+
+        // Calculate the global index
+        int idx = c * N * H * W + n * H * W + h * W + w;
+        scalar_t val = input[idx];
+
+        s_sum[0][tid] += val;
+        s_sum[1][tid] += val * val;
+    }
+
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x/2; s > 0; s >>=1) {
+        if (tid < s) {
+            s_sum[0][tid] += s_sum[0][tid + s];
+            s_sum[1][tid] += s_sum[1][tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        mean[c] = s_sum[0][0] / count;
+        scalar_t mean_sq = mean[c] * mean[c];
+        var[c] = (s_sum[1][0] / count) - mean_sq;
+    }
+}
+
+// Host function to launch compute_mean_var
+std::tuple<torch::Tensor, torch::Tensor> compute_mean_var_cuda(
+    torch::Tensor input,
+    int N, int C, int H, int W) {
+
+    const int threads = 256;
+    const dim3 blocks(C); // One block per channel
+
+    torch::Tensor mean = torch::zeros({C}, torch::device("cuda").dtype(input.scalar_type()));
+    torch::Tensor var = torch::zeros({C}, torch::device("cuda").dtype(input.scalar_type()));
+
+    // Launch kernel
+    compute_mean_var<<<blocks, threads>>>(
+        input.data_ptr<scalar_t>(),
+        mean.data_ptr<scalar_t>(),
+        var.data_ptr<scalar_t>(),
+        N, C, H, W
+    );
+
+    cudaDeviceSynchronize();
+    return std::make_tuple(mean, var);
+}
+
+// Template instantiation
+#define CUDA_KERNEL_TYPE(T) \
+    template __global__ void compute_mean_var<T><<<>>>( \
+        const T*, T*, T*, int, int, int, int); \
+
+CUDA_KERNEL_TYPE(float)
+CUDA_KERNEL_TYPE(at::Half)
+"""
+
+Wait, but I need to handle different data types, but since the problem doesn't specify, maybe assume float32.
+
+Alternatively, use torch::Tensor's scalar_type to determine.
+
+But for simplicity, let's assume the inputs are float32.
+
+Similarly, the normalize kernel:
+
+normalize_source = """
+template <typename scalar_t>
+__global__ void normalize(
+    const scalar_t* input,
+    scalar_t* output,
+    const scalar_t* mean,
+    const scalar_t* var,
+    scalar_t eps,
+    const scalar_t* gamma,
+    const scalar_t* beta,
+    int N, int C, int H, int W) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N*C*H*W) return;
+
+    int c = (idx / (H * W)) % C;
+    int n = idx / (C * H * W);
+    int rem = idx % (C * H * W);
+    int h = (rem % (H * W)) / W;
+    int w = rem % W;
+
+    scalar_t x = input[idx];
+    scalar_t inv_std = 1.0f / sqrt(var[c] + eps);
+    scalar_t normalized = (x - mean[c]) * inv_std;
+    output[idx] = gamma[c] * normalized + beta[c];
+}
+
+std::tuple<torch::Tensor> normalize_cuda(
+    torch::Tensor input,
+    torch::Tensor mean,
+    torch::Tensor var,
+    float eps,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int N, int C, int H, int W) {
+
+    const int num_elements = N*C*H*W;
+    const int threads = 256;
+    const int blocks = (num_elements + threads -1) / threads;
+
+    torch::Tensor output = torch::empty_like(input);
+
+    normalize<<<blocks, threads>>>(
+        input.data_ptr<scalar_t>(),
+        output.data_ptr<scalar_t>(),
+        mean.data_ptr<scalar_t>(),
+        var.data_ptr<scalar_t>(),
+        eps,
+        gamma.data_ptr<scalar_t>(),
+        beta.data_ptr<scalar_t>(),
+        N, C, H, W
+    );
+
+    cudaDeviceSynchronize();
+    return std::make_tuple(output);
+}
+
+// Template instantiation
+template __global__ void normalize<float><<<>>>(...);
+// Need to instantiate for float
+#define CUDA_KERNEL_TYPE(T) \
+    template __global__ void normalize<T><<<>>>( \
+        const T*, T*, const T*, const T*, float, const T*, const T*, int, int, int, int); \
+
+CUDA_KERNEL_TYPE(float)
+"""
+
+Wait, but in the normalize function, the eps is a float, but the var is of type scalar_t (float). That should be okay.
+
+Putting this all together in Python:
+
+First, combine the two kernels into a single CUDA source.
+
+Wait, but in the Python code, each CUDA kernel needs to be compiled. Alternatively, combine both kernels into one CUDA source.
+
+Wait, the first kernel (compute_mean_var) and the second (normalize) can be in the same CUDA source file.
+
+Thus:
+
+The full CUDA code would be:
+
+compute_mean_var_and_normalize_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void compute_mean_var(
+    const scalar_t* input,
+    scalar_t* mean,
+    scalar_t* var,
+    int N, int C, int H, int W) {
+
+    // ... as before
+}
+
+template <typename scalar_t>
+__global__ void normalize(
+    const scalar_t* input,
+    scalar_t* output,
+    const scalar_t* mean,
+    scalar_t* var,
+    scalar_t eps,
+    const scalar_t* gamma,
+    const scalar_t* beta,
+    int N, int C, int H, int W) {
+
+    // ... as before
+}
+
+// Host functions
+std::tuple<torch::Tensor, torch::Tensor> compute_mean_var_cuda(
+    torch::Tensor input,
+    int N, int C, int H, int W) {
+
+    // ... as before
+}
+
+std::tuple<torch::Tensor> normalize_cuda(
+    torch::Tensor input,
+    torch::Tensor mean,
+    torch::Tensor var,
+    float eps,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int N, int C, int H, int W) {
+
+    // ... as before
+}
+
+// Template instantiations for float
+template __global__ void compute_mean_var<float><<<>>>(float*, float*, float*, int, int, int, int);
+template __global__ void normalize<float><<<>>>(float*, float*, float*, float*, float, float*, float*, int, int, int, int);
+"""
+
+Wait, but the compute_mean_var_cuda function uses scalar_t which must be float here.
+
+Now, in Python, we need to load these functions.
+
+Thus, in the Python code:
+
+from torch.utils.cpp_extension import load_inline
+
+compute_mean_var_and_normalize_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// ... (insert the full CUDA code above here)
+"""
+
+# Define the CUDA sources
+cpp_source = """
+#include <torch/extension.h>
+"""
+
+cuda_source = compute_mean_var_and_normalize_source
+
+# Load the CUDA code
+module = load_inline(
+    name="bn_custom",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["compute_mean_var_cuda", "normalize_cuda"],
+    verbose=True,
+)
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features).cuda())
+        self.beta = nn.Parameter(torch.zeros(num_features).cuda())
+        self.eps = 1e-5  # same as PyTorch default
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        # Compute mean and var
+        mean, var = module.compute_mean_var_cuda(x, N, C, H, W)
+        # Normalize
+        output = module.normalize_cuda(x, mean, var, self.eps, self.gamma, self.beta, N, C, H, W)[0]
+        return output
+
+Wait, but the parameters gamma and beta in the original BatchNorm are learnable parameters stored in the module. In the original code, the model has self.bn = nn.BatchNorm2d(...), which includes these parameters. So in ModelNew, we need to replicate that.
+
+Wait, the original Model class is:
+
+class Model(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(num_features=num_features)
+
+    def forward(self, x):
+        return self.bn(x)
+
+The BatchNorm2d layer has parameters: weight (gamma), bias (beta), running_mean, running_var, and momentum. But when in training mode, it uses the batch statistics (mean and var computed from the input) and updates the running stats.
+
+However, in our custom implementation, we are only implementing the forward pass using batch statistics, but not the backward pass (since we need to provide a complete forward pass for testing). But for the purpose of this problem, perhaps we just need to match the forward computation, and the parameters gamma and beta are needed.
+
+Thus, in ModelNew, we need to have gamma and beta as parameters. The original code's model has them in the BatchNorm2d instance. Hence, in ModelNew, we should initialize gamma and beta as parameters.
+
+Hence, in the __init__ of ModelNew:
+
+self.gamma = nn.Parameter(torch.ones(num_features).cuda())
+self.beta = nn.Parameter(torch.zeros(num_features).cuda())
+
+Alternatively, we can load the parameters from the original model, but since we are creating a new model, we need to set them.
+
+Wait, but the original model's parameters are inside the BatchNorm2d instance. So when converting to ModelNew, to have equivalent parameters, we need to initialize gamma and beta to match the original model's parameters.
+
+However, since the problem says "write the new architecture", we can just define them as part of ModelNew's parameters.
+
+Thus, the code should work.
+
+Now, putting it all together, the full Python code would be:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features).cuda())
+        self.beta = nn.Parameter(torch.zeros(num_features).cuda())
+        self.eps = 1e-5  # same as PyTorch's default epsilon
+
+        # Load the custom CUDA kernels
+        compute_mean_var_and_normalize_source = """
+        #include <torch/extension.h>
+        #include <cuda.h>
+        #include <cuda_runtime.h>
+
+        template <typename scalar_t>
+        __global__ void compute_mean_var(
+            const scalar_t* input,
+            scalar_t* mean,
+            scalar_t* var,
+            int N, int C, int H, int W) {
+            const int c = blockIdx.x;
+            if (c >= C) return;
+
+            const int count = N * H * W;
+            const int tid = threadIdx.x;
+
+            __shared__ scalar_t s_sum[2][256];
+            for (int i = 0; i < 2; ++i) {
+                s_sum[i][tid] = 0.0;
+            }
+            __syncthreads();
+
+            for (int i = tid; i < count; i += blockDim.x) {
+                int n = i / (H * W);
+                int rem = i % (H * W);
+                int h = rem / W;
+                int w = rem % W;
+                int idx = c * N * H * W + n * H * W + h * W + w;
+                scalar_t val = input[idx];
+                s_sum[0][tid] += val;
+                s_sum[1][tid] += val * val;
+            }
+
+            __syncthreads();
+
+            for (int s = blockDim.x/2; s > 0; s >>=1) {
+                if (tid < s) {
+                    s_sum[0][tid] += s_sum[0][tid + s];
+                    s_sum[1][tid] += s_sum[1][tid + s];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                mean[c] = s_sum[0][0] / count;
+                scalar_t mean_sq = mean[c] * mean[c];
+                var[c] = (s_sum[1][0] / count) - mean_sq;
+            }
+        }
+
+        template <typename scalar_t>
+        __global__ void normalize(
+            const scalar_t* input,
+            scalar_t* output,
+            const scalar_t* mean,
+            const scalar_t* var,
+            scalar_t eps,
+            const scalar_t* gamma,
+            const scalar_t* beta,
+            int N, int C, int H, int W) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= N*C*H*W) return;
+
+            int c = (idx / (H * W)) % C;
+            int n = idx / (C * H * W);
+            int rem = idx % (C * H * W);
+            int h = (rem % (H * W)) / W;
+            int w = rem % W;
+
+            scalar_t x = input[idx];
+            scalar_t inv_std = 1.0f / sqrt(var[c] + eps);
+            scalar_t normalized = (x - mean[c]) * inv_std;
+            output[idx] = gamma[c] * normalized + beta[c];
+        }
+
+        std::tuple<torch::Tensor, torch::Tensor> compute_mean_var_cuda(
+            torch::Tensor input,
+            int N, int C, int H, int W) {
+            const int threads = 256;
+            const dim3 blocks(C);
+
+            torch::Tensor mean = torch::zeros({C}, torch::device("cuda").dtype(input.scalar_type()));
+            torch::Tensor var = torch::zeros({C}, torch::device("cuda").dtype(input.scalar_type()));
+
+            compute_mean_var<<<blocks, threads>>>(
+                input.data_ptr<scalar_t>(),
+                mean.data_ptr<scalar_t>(),
+                var.data_ptr<scalar_t>(),
+                N, C, H, W
+            );
+
+            cudaDeviceSynchronize();
+            return std::make_tuple(mean, var);
+        }
+
+        std::tuple<torch::Tensor> normalize_cuda(
+            torch::Tensor input,
+            torch::Tensor mean,
+            torch::Tensor var,
+            float eps,
+            torch::Tensor gamma,
+            torch::Tensor beta,
+            int N, int C, int H, int W) {
+            const int num_elements = N*C*H*W;
+            const int threads = 256;
+            const int blocks = (num_elements + threads -1) / threads;
+
+            torch::Tensor output = torch::empty_like(input);
+
+            normalize<<<blocks, threads>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                mean.data_ptr<scalar_t>(),
+                var.data_ptr<scalar_t>(),
+                eps,
+                gamma.data_ptr<scalar_t>(),
+                beta.data_ptr<scalar_t>(),
+                N, C, H, W
+            );
+
+            cudaDeviceSynchronize();
+            return std::make_tuple(output);
+        }
+
+        // Template instantiations for float
+        template __global__ void compute_mean_var<float><<<>>>(float*, float*, float*, int, int, int, int);
+        template __global__ void normalize<float><<<>>>(float*, float*, float*, float*, float, float*, float*, int, int, int, int);
+        """
+
+        # Compile the CUDA code
+        self.module = load_inline(
+            name="bn_custom",
+            cpp_sources="",
+            cuda_sources=compute_mean_var_and_normalize_source,
+            functions=["compute_mean_var_cuda", "normalize_cuda"],
+            verbose=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        N, C, H, W = x.shape
+        # Compute mean and variance
+        mean, var = self.module.compute_mean_var_cuda(x, N, C, H, W)
+        # Normalize using the computed stats
+        output = self.module.normalize_cuda(
+            x,
+            mean,
+            var,
+            self.eps,
+            self.gamma,
+            self.beta,
+            N, C, H, W
+        )[0]
+        return output
+
+# The original get_inputs and get_init_inputs functions remain the same as in the problem statement
+```
+
+Wait, but in the CUDA kernel code, the functions compute_mean_var_cuda and normalize_cuda are declared with template parameters. Since we are using float, the template instantiations are needed. The code includes the necessary template instantiations for float.
+
+Also, in the Python code, the module is created with the functions "compute_mean_var_cuda" and "normalize_cuda".
+
+Testing this code would require ensuring that the CUDA kernels are correctly compiled and that the parameters are managed properly. Since the problem states not to include testing code, this should suffice.
+
+Potential issues:
+
+- The CUDA kernels might have off-by-one errors in the index calculations.
+
+- The shared memory size may be insufficient (e.g., s_sum is declared as s_sum[2][256], but if the block size is 256, then this is okay).
+
+- The block dimensions and thread dimensions may not be optimal. For example, compute_mean_var uses 256 threads per block, which is a standard choice.
+
+- The input tensor must be contiguous. If the input is not contiguous, the kernel might not work. So in the forward function, perhaps we should ensure that x is contiguous.
+
+- The original BatchNorm2d might have different epsilon or other parameters. Here, the default epsilon is 1e-5.
+
+- The parameters gamma and beta are initialized to 1 and 0, respectively, which matches the default initialization of BatchNorm2d.
+
+Another point: the original BatchNorm2d includes a running_mean and running_var, which are updated in training mode. However, since the problem specifies optimizing the given architecture, which includes the forward pass only, and the provided code's get_init_inputs returns [features], which is the number of features for initialization, but since the custom model does not need to track running stats, it's acceptable.
+
+Therefore, this should be a valid implementation.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features).cuda())
+        self.beta = nn.Parameter(torch.zeros(num_features).cuda())
+        self.eps = 1e-5  # same as PyTorch's default epsilon
+
+        compute_mean_var_and_normalize_source = """
+        #include <torch/extension.h>
+        #include <cuda.h>
+        #include <cuda_runtime.h>
+
+        template <typename scalar_t>
+        __global__ void compute_mean_var(
+            const scalar_t* input,
+            scalar_t* mean,
+            scalar_t* var,
+            int N, int C, int H, int W) {
+            const int c = blockIdx.x;
+            if (c >= C) return;
+
+            const int count = N * H * W;
+            const int tid = threadIdx.x;
+
+            __shared__ scalar_t s_sum[2][256];
+            for (int i = 0; i < 2; ++i) {
+                s_sum[i][tid] = 0.0;
+            }
+            __syncthreads();
+
+            for (int i = tid; i < count; i += blockDim.x) {
+                int n = i / (H * W);
+                int rem = i % (H * W);
+                int h = rem / W;
+                int w = rem % W;
+                int idx = c * N * H * W + n * H * W + h * W + w;
+                scalar_t val = input[idx];
+                s_sum[0][tid] += val;
+                s_sum[1][tid] += val * val;
+            }
+
+            __syncthreads();
+
+            for (int s = blockDim.x/2; s > 0; s >>=1) {
+                if (tid < s) {
+                    s_sum[0][tid] += s_sum[0][tid + s];
+                    s_sum[1][tid] += s_sum[1][tid + s];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                mean[c] = s_sum[0][0] / count;
+                scalar_t mean_sq = mean[c] * mean[c];
+                var[c] = (s_sum[1][0] / count) - mean_sq;
+            }
+        }
+
+        template <typename scalar_t>
+        __global__ void normalize(
+            const scalar_t* input,
+            scalar_t* output,
+            const scalar_t* mean,
+            const scalar_t* var,
+            scalar_t eps,
+            const scalar_t* gamma,
+            const scalar_t* beta,
+            int N, int C, int H, int W) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= N*C*H*W) return;
+
+            int c = (idx / (H * W)) % C;
+            int n = idx / (C * H * W);
+            int rem = idx % (C * H * W);
+            int h = (rem % (H * W)) / W;
+            int w = rem % W;
+
+            scalar_t x = input[idx];
+            scalar_t inv_std = 1.0f / sqrt(var[c] + eps);
+            scalar_t normalized = (x - mean[c]) * inv_std;
+            output[idx] = gamma[c] * normalized + beta[c];
+        }
+
+        std::tuple<torch::Tensor, torch::Tensor> compute_mean_var_cuda(
+            torch::Tensor input,
+            int N, int C, int H, int W) {
+            const int threads = 256;
+            const dim3 blocks(C);
+
+            torch::Tensor mean = torch::zeros({C}, torch::device("cuda").dtype(input.scalar_type()));
+            torch::Tensor var = torch::zeros({C}, torch::device("cuda").dtype(input.scalar_type()));
+
+            compute_mean_var<<<blocks, threads>>>(
+                input.data_ptr<scalar_t>(),
+                mean.data_ptr<scalar_t>(),
+                var.data_ptr<scalar_t>(),
+                N, C, H, W
+            );
+
+            cudaDeviceSynchronize();
+            return std::make_tuple(mean, var);
+        }
+
+        std::tuple<torch::Tensor> normalize_cuda(
+            torch::Tensor input,
+            torch::Tensor mean,
+            torch::Tensor var,
+            float eps,
+            torch::Tensor gamma,
+            torch::Tensor beta,
+            int N, int C, int H, int W) {
+            const int num_elements = N*C*H*W;
+            const int threads = 256;
+            const int blocks = (num_elements + threads -1) / threads;
+
+            torch::Tensor output = torch::empty_like(input);
+
+            normalize<<<blocks, threads>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                mean.data_ptr<scalar_t>(),
+                var.data_ptr<scalar_t>(),
+                eps,
+                gamma.data_ptr<scalar_t>(),
+                beta.data_ptr<scalar_t>(),
+                N, C, H, W
+            );
+
+            cudaDeviceSynchronize();
+            return std::make_tuple(output);
+        }
+
+        template __global__ void compute_mean_var<float><<<>>>(float*, float*, float*, int, int, int, int);
+        template __global__ void normalize<float><<<>>>(float*, float*, float*, float*, float, float*, float*, int, int, int, int);
+        """
+
+        self.module = load_inline(
+            name="bn_custom",
+            cpp_sources="",
+            cuda_sources=compute_mean_var_and_normalize_source,
+            functions=["compute_mean_var_cuda", "normalize_cuda"],
+            verbose=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        N, C, H, W = x.shape
+        mean, var = self.module.compute_mean_var_cuda(x, N, C, H, W)
+        output = self.module.normalize_cuda(
+            x,
+            mean,
+            var,
+            self.eps,
+            self.gamma,
+            self.beta,
+            N, C, H, W
+        )[0]
+        return output
+```

@@ -1,0 +1,57 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+conv_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Custom implementation of transposed convolution
+// This is just a placeholder; actual implementation details will vary
+__global__ void conv_transpose_kernel(...) {
+    // Kernel implementation goes here
+}
+
+torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, ...) {
+    // Function implementation goes here
+}
+"""
+
+conv_transpose_cpp_source = (
+    "torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, ...);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+conv_transpose = load_inline(
+    name="conv_transpose",
+    cpp_sources=conv_transpose_cpp_source,
+    cuda_sources=conv_transpose_source,
+    functions=["conv_transpose_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = conv_transpose
+        self.multiplier = multiplier
+
+    def forward(self, x):
+        x = self.conv_transpose.conv_transpose_cuda(x, self.weight, ...)  # Use the custom transposed convolution kernel
+        x = x * self.multiplier
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # First global average pooling
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # Second global average pooling
+        return x
+
+# Initialize inputs and model
+inputs = get_inputs()
+model_new = ModelNew(*get_init_inputs())
+
+# Forward pass through the model
+output = model_new(inputs[0])
+print(output.shape)

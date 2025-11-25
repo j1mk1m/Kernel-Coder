@@ -1,0 +1,14 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Your custom CUDA kernels here
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        # Use your custom CUDA kernels here
+        pass

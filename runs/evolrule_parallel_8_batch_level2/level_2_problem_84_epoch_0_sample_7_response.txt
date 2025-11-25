@@ -1,0 +1,791 @@
+The code should be compatible with PyTorch 2.3.0 and CUDA 12.2. 
+
+Make sure that the forward method of ModelNew has the same outputs as the original Model.
+
+The user will run the following tests to verify correctness:
+- The output of ModelNew must match the output of the original Model to at least 5 decimal places.
+- The backward pass of ModelNew must also match the original Model's backward pass outputs to at least 5 decimal places.
+- The speed of ModelNew must be measurably faster than the original Model.
+
+You may replace some or all of the operators in the forward pass of the Model with custom CUDA kernels. You may also combine operators into a single kernel for optimization. For example, fusing Gemm + BatchNorm + scaling into one kernel would be a good optimization. The Softmax can also be implemented with a custom kernel, especially if fused with the previous steps.
+
+The user has provided an example of fusing Gemm, BatchNorm, scaling, and Softmax into a single fused kernel. However, they are open to any approach that results in faster execution without sacrificing accuracy.
+
+The user wants the final code to be in Python with CUDA kernels. They also want you to ensure that all the necessary parameters (e.g., weights, biases, batch norm parameters) are properly handled in the new implementation.
+
+
+
+
+Okay, I need to optimize the given PyTorch model by replacing some operators with custom CUDA kernels. Let me look at the model structure again. The original model has a linear layer (Gemm), batch normalization, scaling by a parameter, and then softmax. The goal is to make this faster by fusing these operations into a single CUDA kernel if possible.
+
+First, I should analyze which parts can be fused. The linear layer (matmul + bias) is a big operation. Then batch norm involves normalizing the output, which requires mean and variance. Since batch norm is part of the forward pass here, I can include that in the kernel. The scaling by a scalar (scale * x) is straightforward, so that can be incorporated too. Finally, the softmax requires exponentiating and normalizing, which can also be part of the same kernel.
+
+Fusing all these steps into a single kernel would reduce memory transfers and kernel launch overhead. Let me think about the steps:
+
+1. The linear layer does x = Wx + b. Then batch norm applies (x - mean)/sqrt(var + eps), scaled by gamma and beta. Wait, the batch norm formula is: output = gamma * (x - mean) / sqrt(var + eps) + beta. But in the original code, after BN, there's a scaling by self.scale. So the sequence is linear -> BN -> scaling -> softmax.
+
+Wait, the original code's forward is: x = self.gemm(x) (which includes bias), then x = self.bn(x), then x = self.scale * x, then softmax. So the scaling here is element-wise multiplication by the scale parameter (which is a scalar, since scale_shape is (1,)).
+
+Hmm, so the steps are:
+
+- Linear: (Wx + b) where W is (out_features, in_features), x is (batch, in_features). The output is (batch, out_features).
+
+- BatchNorm1d: since it's 1D, the batch norm is over the batch and features. The mean and variance are computed over the batch dimension for each feature. Wait, BatchNorm1d typically computes the mean and variance over the batch and spatial dimensions (if any), but for 1D, it's across the batch. So for each feature (the second dimension), compute the mean and variance over the batch samples.
+
+Wait, but in the forward pass, during training, the mean and variance are computed over the batch. The batch norm layer has parameters gamma (scale) and beta (bias). Then the scaling by the self.scale is an additional element-wise multiplication. 
+
+So the fused kernel needs to handle:
+
+1. Compute the linear layer (matrix multiply plus bias).
+
+2. Compute batch normalization (mean, variance, normalize, apply gamma and beta).
+
+3. Multiply by the scale parameter (element-wise).
+
+4. Apply softmax.
+
+Wait, but the batch norm's gamma and beta are part of the batch norm layer's parameters. However, in the original code, the batch norm is applied, then we do x = self.scale * x. So the self.scale is an additional scalar multiplier. So the order is important.
+
+Wait, the batch norm's computation is:
+
+y = (x - mean) / sqrt(var + eps) --> then multiplied by gamma, then add beta. Then multiplied by the self.scale, then softmax.
+
+Alternatively, perhaps the self.scale is applied before or after the batch norm? The code says after, so after the batch norm's output.
+
+So the fused kernel steps would be:
+
+For each element in the batch and feature:
+
+- Compute the linear layer's output: Wx + b (where W is the gemm's weight, b is bias).
+
+Then, for batch norm:
+
+Compute mean and variance over the batch (for each feature). Let me denote the intermediate output after linear as x_linear.
+
+Then, for each feature d (0 to out_features-1):
+
+mean_d = mean of x_linear[:, d]
+
+var_d = variance of x_linear[:, d]
+
+Then the normalized x is:
+
+x_normalized[:, d] = (x_linear[:, d] - mean_d) / sqrt(var_d + eps)
+
+Then apply gamma and beta (parameters of the batch norm):
+
+x_bn = gamma * x_normalized + beta
+
+Then scale by self.scale: x_scaled = x_bn * scale
+
+Then apply softmax.
+
+Wait, but the batch norm parameters gamma and beta are part of the batch norm layer's parameters, so they have to be included in the computation. The scale is another parameter (self.scale).
+
+So in the kernel, I need to read all these parameters: the linear's weight and bias, the batch norm's gamma, beta, running_mean, running_var (but during training, we use the batch statistics, not the running ones?), and the scale parameter.
+
+Wait, in the original code, during forward pass, the batch norm is applied in training mode (assuming the model is in training mode). The batch norm's forward during training computes the mean and variance of the current batch, and uses those for normalization, and also updates the running mean and variance. However, when we are writing a fused kernel, we need to replicate the same behavior.
+
+But when using a custom kernel, how do we handle the batch norm's running mean and variance? Since the original model's batch norm layer would track the running mean and variance, but in our fused kernel, we need to make sure that the batch norm parameters (gamma, beta) are used, and the batch statistics (mean, var) are computed on the fly.
+
+Therefore, in the custom kernel, for each mini-batch:
+
+Compute x_linear = Wx + b
+
+Compute for each feature dimension d:
+
+mean_d = mean over batch of x_linear[:,d]
+
+var_d = var over batch of x_linear[:,d]
+
+Then compute the normalized x:
+
+x_normalized = (x_linear - mean_d) / sqrt(var_d + eps)
+
+Apply gamma and beta: x_bn = gamma * x_normalized + beta
+
+Multiply by the scale: x_scaled = x_scaled * scale
+
+Apply softmax.
+
+Wait, but the scale here is a parameter (self.scale) which is a tensor of shape (1,), so it's a scalar multiplier for each element. So the scale is applied element-wise, same for all elements.
+
+Then the softmax is applied over the features (dim=1). The softmax function is exp(x_scaled) / sum(exp(x_scaled), dim=1, keepdim=True).
+
+But to compute this efficiently in a kernel, perhaps we can do all these steps in one go.
+
+Now, the challenge is to implement all these steps in a single CUDA kernel, handling all the computations. Let me outline the steps:
+
+First, the matrix multiply part: the linear layer's weight is of shape (out_features, in_features), input x is (batch_size, in_features). The output x_linear is (batch_size, out_features). The bias is (out_features,).
+
+To compute this in CUDA, for each output element (i,j) where i is batch index and j is output feature, the value is sum_{k=0}^{in_features-1} W[j][k] * x[i][k] + b[j].
+
+Then compute the mean and variance for each feature j over all batch elements i. For feature j, mean_j is (1/B) * sum_{i} x_linear[i][j], where B is batch size.
+
+The variance_j is (1/B) * sum_{i} (x_linear[i][j] - mean_j)^2.
+
+Then compute the normalized values (x_linear[i][j] - mean_j) / sqrt(var_j + eps).
+
+Multiply by gamma[j], add beta[j], multiply by scale (a scalar), then compute the exponentials for softmax.
+
+Wait, but the softmax requires computing the exponential of each element, then the sum over the features for each sample, then divide each element by the sum.
+
+Wait, actually, the softmax is over the features (dim=1), so for each sample (each row in the batch), we compute the exponentials of all features, sum them, then divide each by the sum.
+
+So putting all together, in the kernel:
+
+1. Compute the linear part: for each element in x_linear, which is (batch_size, out_features).
+
+2. Compute batch mean and variance for each feature j.
+
+3. Normalize each element using the mean and variance.
+
+4. Apply gamma and beta, then scale by the scalar.
+
+5. Compute the exponentials of all elements.
+
+6. Compute the sum over features for each sample to get the denominator for softmax.
+
+7. Divide each exponential by the sum to get the softmax result.
+
+However, steps 2 and 3 require knowing the mean and variance for each feature. Since these are computed over the entire batch, this introduces a dependency: the means and variances can't be computed per-thread, so we need to have a step where we first compute the means and variances, then proceed.
+
+Therefore, the kernel will have to:
+
+- First, in a first pass, compute the sum of each feature across the batch to get the mean.
+
+- Then compute the sum of squares for the variance.
+
+- Then compute the means and variances.
+
+- Then compute the normalized values, apply gamma and beta, scale, then compute exp, etc.
+
+This can be done in a multi-step approach within the kernel.
+
+Alternatively, maybe we can structure it so that we first compute all the necessary statistics (mean, variance) for each feature in a separate step.
+
+So here's a possible plan for the CUDA kernel:
+
+1. The kernel is launched with a grid and block configuration that can handle all elements.
+
+2. For the matrix multiplication part, each thread can compute one element of the output.
+
+Wait, but matrix multiplication is a bit more involved. The standard approach for matrix multiplication is to use tiled approaches for better memory access, but for simplicity, perhaps we can use a straightforward implementation here.
+
+Wait, but given that in_features and out_features are 8192, the matrix multiplication is 1024x8192 * 8192x8192 (for weights). Wait, no, the input is (batch_size, in_features), so the weight matrix is (out_features, in_features). So the multiplication is (batch_size, in_features) * (in_features, out_features) → resulting in (batch_size, out_features). So each element of the output is the dot product between the input row and the corresponding weight column.
+
+Therefore, for each output element (i,j), the value is sum_{k} x[i][k] * weight[j][k] + bias[j].
+
+This is a standard GEMM operation. Implementing this in CUDA efficiently requires a good approach. Since in_features is large (8192), we need to handle this efficiently. However, given that this is a custom kernel, perhaps we can proceed with a straightforward approach for simplicity, even if it's not the most optimized, as the main goal is to fuse steps rather than optimize GEMM itself. Alternatively, maybe we can find a way to compute this efficiently.
+
+Alternatively, perhaps we can use shared memory for caching weights or inputs. But that might complicate things.
+
+Alternatively, since the batch is 1024, and out_features is 8192, each output element is per (batch, out) pair.
+
+Hmm. Let's think about how to structure the kernel.
+
+Perhaps first, compute the linear layer's output. Let's see:
+
+The input x is of size (1024, 8192).
+
+The weight matrix W is (8192, 8192).
+
+So for each batch element (i) and output feature (j), the dot product is sum_{k} x[i][k] * W[j][k], plus bias[j].
+
+This is a bit challenging because each output element (i,j) requires accessing all 8192 elements of x's row and W's column. So for each thread handling an output element, it would need to loop over 8192 elements, which is a lot. That might be slow.
+
+Wait, but the batch size is 1024. So the total number of elements in the output is 1024 * 8192 ≈ 8 million elements. Each of these requires 8192 multiplications and additions. That's 65 billion operations just for the matrix multiplication, which is a lot. So maybe this approach isn't feasible unless we can parallelize this efficiently.
+
+Alternatively, perhaps the matrix multiplication is best left to cuBLAS, and we can only fuse the subsequent operations (batch norm, scaling, softmax) into a kernel, while keeping the matrix multiplication as is. But that might not give enough speedup. Alternatively, if the fused kernel can handle the matrix multiply and the following steps in a way that is more efficient than separate kernels, then that's better.
+
+Hmm. Let me think again. Maybe the key is to find a way to compute the linear layer's output, batch norm, scaling, and softmax in a single kernel without too much memory overhead. But the problem is that the matrix multiplication is a massive computation.
+
+Alternatively, perhaps the fused kernel can compute the linear layer, batch norm, scaling, and softmax in a way that leverages shared memory or other optimizations. Alternatively, maybe we can use a tiled approach for the matrix multiplication and then proceed with the other steps.
+
+Alternatively, perhaps the user's example fuses all steps into one kernel. Let me see the user's example:
+
+The user's example shows fusing Gemm + BatchNorm + scaling + Softmax into a single kernel. So I'll proceed with that approach.
+
+Let me outline the steps:
+
+The kernel will process each output element (i,j) where i is batch index, j is output feature.
+
+First, compute the linear part:
+
+x_linear[i][j] = sum_{k=0}^{in_features-1} (W[j][k] * x[i][k]) + bias[j]
+
+Then, compute the mean and variance for each j. To compute mean_j and var_j:
+
+mean_j = (1/B) * sum_{i} x_linear[i][j]
+
+var_j = (1/B) * sum_{i} (x_linear[i][j] - mean_j)^2
+
+These are across the batch dimension for each j.
+
+Once we have mean and variance for each j, we can compute the normalized value:
+
+x_normalized[i][j] = (x_linear[i][j] - mean_j) / sqrt(var_j + eps)
+
+Then apply batch norm parameters:
+
+x_bn[i][j] = gamma[j] * x_normalized[i][j] + beta[j]
+
+Multiply by the scale (scalar):
+
+x_scaled[i][j] = x_bn[i][j] * scale
+
+Then compute the exponentials:
+
+exp_val = exp(x_scaled[i][j])
+
+Compute the sum over features for each i:
+
+sum_exp[i] = sum_{j} exp_val[i][j]
+
+Then compute softmax[i][j] = exp_val[i][j] / sum_exp[i]
+
+But how to compute the means and variances efficiently?
+
+The problem is that mean_j and var_j depend on all i for each j. So this requires a reduction over the batch dimension for each feature j.
+
+To compute these in the kernel, perhaps we can have two steps:
+
+1. First, compute the linear layer's output and accumulate the sums needed for the means and variances.
+
+2. Compute the means and variances using these accumulated sums.
+
+3. Then proceed with the rest.
+
+Alternatively, use atomic operations, but that might be inefficient. Another approach is to use a separate kernel to compute the means and variances, but that would add overhead. Since we want to fuse everything into a single kernel, perhaps we can use shared memory for the reductions.
+
+So here's a possible plan:
+
+The kernel will be organized as follows:
+
+- Each thread block is responsible for processing a set of output features. For example, with 8192 features, maybe split them into blocks. Or perhaps each thread block handles a batch element.
+
+Alternatively, let's think in terms of threads.
+
+Suppose we have each thread compute the linear term for a specific (i,j) pair. Then, we need to collect the sums for each j.
+
+Wait, let's think of the problem in terms of the computation steps:
+
+Step 1: Compute linear layer (Wx + b) for all (i,j).
+
+But this requires for each (i,j) the sum over k of W[j][k] * x[i][k].
+
+This is a GEMM operation, which is O(N^3) in the worst case, but with the given sizes (batch 1024, in 8192, out 8192), it's 1024*8192*8192 operations. That's way too big for a naive approach.
+
+Hmm, this might be a problem. Maybe this fused kernel isn't feasible unless we can find a way to optimize the matrix multiplication.
+
+Alternatively, perhaps the user's example is using a more efficient approach. Let me think again.
+
+Wait, in the example provided by the user, they fused a simple addition. The original problem here has a more complex computation, including a large matrix multiplication. Maybe the matrix multiplication is better left to cuBLAS, and we can fuse the rest (batch norm, scaling, softmax) into a kernel.
+
+Alternatively, perhaps the matrix multiplication can be done in a way that's part of the kernel, but with optimized memory access.
+
+Alternatively, perhaps the user's fused kernel approach is the way to go, but I need to structure it properly.
+
+Alternatively, perhaps the linear layer's computation can be done with a tiled approach. For example, using shared memory to cache parts of the weight matrix and input.
+
+Alternatively, perhaps using the input's row and weight's columns in a way that threads can compute their partial sums.
+
+Alternatively, for the matrix multiply part, maybe each thread is responsible for a single output element (i,j). Each thread would loop over the in_features elements to compute the sum.
+
+But with in_features being 8192, each thread would have to do 8192 operations, which is a lot. That would be slow. So this approach might not be feasible.
+
+Hmm, this is a problem. Maybe I need to find a way to structure the kernel so that the matrix multiplication can be done efficiently.
+
+Wait, maybe the batch size is 1024. Let's see: the output is 1024 x 8192. So each row has 8192 elements, each computed via a dot product with an 8192-element input vector and an 8192-element weight column.
+
+Wait, perhaps the input x can be stored in row-major order, and the weights are stored in column-major? Or perhaps using a tiled approach.
+
+Alternatively, maybe using a block of threads to handle a block of output elements. For example, a block can handle a tile of MxN output elements, and each thread computes a part of the computation.
+
+This is getting complicated. Maybe it's better to separate the GEMM into a separate kernel, but then fuse the rest. Let me think.
+
+Alternatively, perhaps the problem is that the linear layer is too big to handle in a fused kernel. So maybe we can split the computation into two parts: the GEMM is handled by PyTorch's optimized cuBLAS, then the rest (BN, scaling, softmax) are fused into a single kernel. That might be more feasible.
+
+Let me consider this approach.
+
+First, the original code uses self.gemm(x), which is a Linear layer, which uses cuBLAS under the hood, so that's already optimized. Then, the batch norm, scaling, and softmax can be fused into a single kernel.
+
+This might be a better approach. Let's try that.
+
+So the plan is:
+
+- Keep the linear layer as is (since it's already optimized).
+
+- Replace the batch norm, scaling, and softmax with a custom CUDA kernel.
+
+This way, we can focus on fusing those three steps into one kernel.
+
+So the forward becomes:
+
+x = self.gemm(x)  # this uses cuBLAS, remains unchanged
+
+x = fused_kernel(x)  # this kernel handles BN, scaling, softmax.
+
+Thus, the fused kernel will need to take the output of the linear layer (x) and process it with BN, scaling, and softmax.
+
+Now, the steps within the kernel would be:
+
+For each feature j:
+
+Compute the batch mean and variance over the current batch (over all samples i).
+
+Then normalize, apply gamma and beta, multiply by scale, compute exponentials, sum, and divide.
+
+This approach avoids the GEMM computation in the kernel, so that part is handled by PyTorch's optimized code.
+
+This seems more manageable.
+
+So the fused kernel will need to handle the following steps:
+
+1. Compute the batch mean and variance for each feature j.
+
+2. Normalize the input using the batch mean and variance.
+
+3. Apply batch norm's gamma and beta.
+
+4. Multiply by the scale parameter (a scalar).
+
+5. Compute the exponentials for each element.
+
+6. Compute the sum of exponentials for each sample.
+
+7. Divide each exponential by the sum to get the softmax.
+
+Now, the challenge is implementing this efficiently in CUDA.
+
+First, the mean and variance:
+
+To compute the mean for feature j, it's (sum over i of x[i][j]) / B, where B is batch size (1024).
+
+Similarly for variance, it's (sum over i of (x[i][j] - mean)^2)/B.
+
+So, for each feature j, we need to compute these across all batch elements.
+
+The kernel will need to process all features and batch elements.
+
+To do this efficiently, we can structure the kernel as follows:
+
+Each thread block is assigned to handle a set of features (since there are 8192 features). For example, if we have 1024 threads per block, then each block can handle 1024 features. But 8192 is 8x1024, so maybe 8 blocks can cover all features.
+
+Wait, but the number of blocks is up to the user, but the thread hierarchy needs to be designed such that all features can be processed.
+
+Alternatively, each thread can handle a single feature.
+
+Wait, here's an approach:
+
+1. First, compute the batch mean and variance for each feature j:
+
+   a. For each j, compute the sum over all i of x[i][j].
+
+   b. Compute mean_j = sum / B.
+
+   c. Compute the sum of squared deviations (sum over i (x[i][j] - mean_j)^2).
+
+   d. variance_j = sum_squared / B.
+
+2. Once we have the means and variances, normalize each element x[i][j] as (x[i][j] - mean_j)/sqrt(var_j + eps).
+
+3. Apply gamma[j] * normalized + beta[j].
+
+4. Multiply by scale (scalar).
+
+5. Compute exp of each element.
+
+6. Compute the row-wise sum of the exponentials for each sample (each row).
+
+7. Divide each exponential by the row sum to get the softmax.
+
+But steps 1a and 1c require reduction over the batch dimension for each feature.
+
+This is a classic reduce operation. To compute the sum over batch for each feature, we can have each thread in a block process a batch element for a particular feature.
+
+Wait, perhaps the following approach:
+
+Let's have each thread block handle one feature. For example, blockId = j (feature index). Each block processes the j-th feature.
+
+Within each block:
+
+- Each thread in the block (say, with blockDim.x = 1024) processes one batch element i (since batch size is 1024). So each thread in the block can compute x[i][j], and accumulate the sum and sum_squared.
+
+Wait, the batch is 1024, so if we have 1024 threads in a block, each thread can handle one batch element.
+
+Thus, for each feature j:
+
+Block j (assuming there are 8192 blocks) will have threads 0 to 1023 each processing sample i=threadIdx.x.
+
+Then, within the block:
+
+- Compute sum_val = sum_{i} x[i][j]
+
+- Compute sum_squared = sum_{i} (x[i][j] - mean)^2, where mean = sum_val / B
+
+But the problem is that mean needs to be computed first before the squared terms can be summed.
+
+Therefore, in block j:
+
+Each thread i reads x[i][j], stores it in a shared memory array.
+
+Then, using parallel reduction, compute the sum_val.
+
+Then compute mean = sum_val / B.
+
+Then, each thread computes (x[i][j] - mean)^2 and accumulates into sum_squared using another reduction.
+
+This way, per feature j, we can compute the mean and variance.
+
+This approach requires that for each feature, the block computes the necessary sums. However, with 8192 features, that's a lot of blocks. The maximum number of blocks in a grid is limited (like 65535), so 8192 is okay.
+
+Then, after all blocks have computed the means and variances for their respective features, those values need to be stored in some global arrays (mean and var arrays) so that the next steps can access them.
+
+Once the means and variances are computed, the next step is to normalize each element.
+
+Then, apply gamma and beta.
+
+Then scale by the scalar.
+
+Then compute exponentials and row sums.
+
+This requires a few steps:
+
+1. Compute means and variances for all features (step 1).
+
+2. For all elements, compute normalized values using the means and variances.
+
+3. Apply gamma and beta, scale, exponentials.
+
+4. Compute row sums.
+
+5. Divide each exponential by the row sum.
+
+So the kernel will have to handle these steps in sequence, or perhaps in a multi-stage approach.
+
+Alternatively, perhaps all these steps can be done in a single kernel with multiple stages. But this might be complex.
+
+Alternatively, split into multiple kernels. But to keep it as a single fused kernel, it's better to handle everything in one kernel.
+
+Hmm. Alternatively, perhaps use multiple kernels:
+
+- First kernel to compute the means and variances.
+
+- Second kernel to compute the normalized values, apply gamma and beta, scale, exponentials.
+
+- Third kernel to compute row sums and divide.
+
+But the problem is that the intermediate data (means and variances) would have to be stored in global memory between kernels, which may not be too bad, but for optimization, a single kernel is better.
+
+Alternatively, here's a possible structure:
+
+The entire process is done in a single kernel with multiple phases:
+
+Phase 1: Compute the means and variances for each feature.
+
+Phase 2: Normalize and apply gamma/beta, scale, exponentials, and compute row sums.
+
+Phase 3: Divide by row sums to get the softmax.
+
+But how to structure this in CUDA.
+
+Alternatively, we can have each thread process one output element (i,j). But the computation of means and variances requires coordination across threads.
+
+Alternatively, using shared memory for intermediate sums.
+
+Let me outline the code structure.
+
+First, the kernel will need to:
+
+For each feature j:
+
+   Compute mean_j and var_j.
+
+Then, for each (i,j):
+
+   Compute normalized value = (x[i][j] - mean_j)/sqrt(var_j + eps)
+
+   x_bn = gamma[j] * normalized + beta[j]
+
+   x_scaled = x_bn * scale
+
+   exp_val = exp(x_scaled)
+
+Then compute row sums for each i:
+
+sum_exp[i] = sum over j of exp_val[i][j]
+
+Then compute softmax[i][j] = exp_val[i][j]/sum_exp[i]
+
+So the first step is to compute mean and var for each j.
+
+To compute these, we can have a first step where each thread block is responsible for a feature j, as before.
+
+Wait, but how to organize the kernel.
+
+Alternatively, let's think of it as follows:
+
+The first part (computing mean and var) must be done before proceeding to the normalization step.
+
+This suggests that the kernel can't proceed until all mean and var computations are done. So perhaps we need to handle this in a two-step approach.
+
+First, run a kernel to compute all the means and variances, storing them in arrays. Then run another kernel to do the normalization and the rest. However, this may require multiple CUDA kernels, but the user's example showed that it's possible to do all in one kernel.
+
+Alternatively, in the first step of the kernel, we can compute the means and variances for all features, then proceed to process each element.
+
+However, the problem is that the computation of means and variances requires a reduction over the batch for each feature. This can be done using a separate kernel or within the same kernel with proper synchronization.
+
+Let me try to structure the kernel as follows:
+
+1. The kernel is launched with a grid of blocks, each block is responsible for a feature j.
+
+   - Let's say there are as many blocks as features (8192).
+
+   - Each block has 1024 threads (since batch size is 1024).
+
+   - Each thread in block j handles one batch element i (thread index = i).
+
+2. In the first phase (computing mean and var):
+
+   - Each thread reads x[i][j].
+
+   - Compute the sum over all threads in the block (for feature j).
+
+   - Compute the mean_j.
+
+   - Then, compute the sum of squared deviations.
+
+   - Store mean_j and var_j in global arrays.
+
+3. Once all blocks have finished their computations (requires synchronization?), then proceed to the next steps.
+
+Wait, but in CUDA, different blocks can't synchronize. Therefore, this approach might not work unless we use a separate kernel.
+
+Thus, the first step must be a separate kernel to compute the means and variances.
+
+So, the plan is:
+
+First, in the model's forward, after the linear layer:
+
+x_linear = self.gemm(x)
+
+Then, compute the means and variances using a CUDA kernel.
+
+Then, apply the rest (normalization, gamma, beta, scaling, exp, softmax) in another kernel.
+
+This would require two separate kernels, but they are fused in terms of the operations, not in a single kernel.
+
+Alternatively, we can write this as a single kernel with multiple steps, but it requires handling the first step (computing means and variances) and then proceeding.
+
+But given the block synchronization issues, perhaps it's better to split into two kernels.
+
+Let's proceed with that approach.
+
+So the first kernel will compute the means and variances for each feature, and store them in arrays.
+
+The second kernel will take those arrays and proceed with the normalization, scaling, etc.
+
+Now, let's think about the first kernel:
+
+Kernel 1: Compute means and variances.
+
+Parameters:
+
+Input x_linear (batch_size, out_features).
+
+Output arrays mean (out_features), var (out_features).
+
+The kernel can be structured as follows:
+
+Each block handles a feature j (blockIdx.x = j).
+
+Each thread in the block handles a batch element i (threadIdx.x = i).
+
+The block first computes the sum of x_linear[i][j] across all threads.
+
+Then computes the mean.
+
+Then computes the sum of squares of (x_linear[i][j] - mean).
+
+Then stores the mean and variance in global arrays.
+
+This requires each block to perform a reduction.
+
+Here's the code outline for this kernel:
+
+__global__ void compute_mean_var(
+    const float* x,
+    float* means,
+    float* vars,
+    int batch_size,
+    int out_features,
+    float eps) {
+
+    int j = blockIdx.x; // feature index
+    if (j >= out_features) return;
+
+    int i = threadIdx.x; // batch index
+
+    float x_ij = x[i * out_features + j]; // assuming row-major storage
+
+    __shared__ float shared_sum[THREADS_PER_BLOCK]; // maybe not needed, can use parallel reduction
+
+    // Compute sum of x[i][j] over all i
+    // Use parallel reduction in the block
+
+    // First pass: compute partial sums in shared memory
+
+    // Or just use a simple reduction.
+
+    // Alternatively, using a parallel reduction approach.
+
+    // Let's use a parallel reduction.
+
+    // Each thread has its x_ij, and we want to sum all x_ij for this j.
+
+    // Initialize a shared array for partial sums.
+
+    extern __shared__ float sdata[];
+
+    sdata[threadIdx.x] = (i < batch_size) ? x_ij : 0.0f;
+
+    __syncthreads();
+
+    // Perform reduction in shared memory
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        means[j] = sdata[0] / batch_size;
+    }
+
+    __syncthreads();
+
+    // Now compute the sum of squared deviations.
+
+    float mean_j = means[j];
+
+    float delta = x_ij - mean_j;
+    float delta_sq = delta * delta;
+
+    sdata[threadIdx.x] = (i < batch_size) ? delta_sq : 0.0f;
+
+    __syncthreads();
+
+    // Reduction again
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        vars[j] = sdata[0] / batch_size;
+    }
+
+    __syncthreads();
+}
+
+Wait, but this requires that the block size is equal to the batch size (since each thread corresponds to a batch element). The batch size is 1024, so the block dimension must be 1024. The shared memory size required here is 1024 floats for each reduction step, which is manageable.
+
+So the kernel would be launched as:
+
+compute_mean_var<<<out_features, batch_size, sharedMemSize>>>(...);
+
+Where sharedMemSize is 1024 * sizeof(float) * 2 (since we do two reductions, but actually the shared memory can be reused between the two steps). Wait in the code above, the first reduction uses sdata, then after syncthreads, the second uses sdata again. So the shared memory size needed is 1024 * sizeof(float).
+
+Wait, the shared memory array sdata is of size blockDim.x (which is 1024). So each block requires 1024 * sizeof(float) of shared memory. The total required per block is 4KB, which is acceptable.
+
+So the shared memory size passed to the kernel is 1024 * sizeof(float).
+
+Now, the second kernel will process each element (i,j) to apply the batch norm, scaling, and softmax.
+
+The steps are:
+
+For each (i,j):
+
+   normalized = (x_linear[i][j] - mean[j]) / sqrt(var[j] + eps)
+
+   x_bn = gamma[j] * normalized + beta[j]
+
+   x_scaled = x_bn * scale
+
+   exp_val = exp(x_scaled)
+
+   store exp_val in an intermediate array.
+
+Then compute the row sums (sum over j of exp_val[i][j]).
+
+Finally, divide each exp_val by the row sum to get the softmax output.
+
+The row sums can be computed in a separate step or within the same kernel.
+
+This suggests another kernel:
+
+Kernel 2:
+
+Compute normalized, apply gamma/beta, scale, exp, store in exp_val.
+
+Then compute row sums.
+
+Finally, divide each exp_val by row sums.
+
+But this requires multiple steps.
+
+Alternatively, the kernel can:
+
+1. Compute the exp_val and accumulate the row sums in shared memory.
+
+Here's an approach:
+
+Each thread processes a (i,j) element.
+
+The kernel is launched with gridDim.x = batch_size * out_features, blockDim.x = ... but this might not be efficient.
+
+Alternatively, each block handles a batch row (i), and processes all features j.
+
+For example, a block for row i can have threads for each j.
+
+But with 8192 features, the block size would be 8192, which is too large (max is 1024).
+
+Alternatively, use a block per feature, but again, 8192 blocks.
+
+Alternatively, a block can handle a batch and a subset of features.
+
+This is getting complex. Let me think:
+
+The second kernel needs to:
+
+For each (i,j):
+
+   compute normalized value using mean[j] and var[j]
+
+   apply gamma[j], beta[j], scale.
+
+   compute exp.
+
+Then, for each row i, compute the sum of exp over j.
+
+Then divide each exp by the row sum.
+
+Perhaps the kernel can do this in two steps:
+
+First, compute the exp and accumulate the row sums.
+
+The row sum can be computed in a reduction per row.
+
+Here's a possible plan:
+
+Kernel 2a: Compute exp and row sums.
+
+Each block handles a row (i). The block has threads for each j.
+
+Wait, for row i, there are 8192 elements. To process this row, we can have a block with 1024 threads and process in multiple warps, but perhaps use a tiled approach.
+
+Alternatively

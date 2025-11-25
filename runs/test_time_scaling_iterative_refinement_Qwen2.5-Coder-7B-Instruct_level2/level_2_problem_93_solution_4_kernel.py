@@ -1,0 +1,107 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+transposed_convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void transposed_convolution_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int height_in, int width_in, int height_out, int width_out, int kernel_size) {
+    int n = blockIdx.x / (out_channels * height_out * width_out);
+    int c = (blockIdx.x % (out_channels * height_out * width_out)) / (height_out * width_out);
+    int h = ((blockIdx.x % (out_channels * height_out * width_out)) % (height_out * width_out)) / width_out;
+    int w = (blockIdx.x % (out_channels * height_out * width_out)) % width_out;
+
+    float sum = 0.0f;
+    for (int i = 0; i < kernel_size; ++i) {
+        for (int j = 0; j < kernel_size; ++j) {
+            int ih = h * kernel_size + i;
+            int iw = w * kernel_size + j;
+            if (ih >= 0 && ih < height_in && iw >= 0 && iw < width_in) {
+                int in_idx = n * in_channels * height_in * width_in + c * height_in * width_in + ih * width_in + iw;
+                int wt_idx = c * out_channels * kernel_size * kernel_size + (i * kernel_size + j) * out_channels + n;
+                sum += input[in_idx] * weight[wt_idx];
+            }
+        }
+    }
+
+    int out_idx = n * out_channels * height_out * width_out + c * height_out * width_out + h * width_out + w;
+    output[out_idx] = sum;
+}
+
+torch::Tensor transposed_convolution_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto height_in = input.size(2);
+    auto width_in = input.size(3);
+    auto height_out = (height_in - 1) * 2 + kernel_size;
+    auto width_out = (width_in - 1) * 2 + kernel_size;
+    auto kernel_size = weight.size(2);
+
+    auto output = torch::zeros({batch_size, out_channels, height_out, width_out}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * out_channels * height_out * width_out + block_size - 1) / block_size;
+
+    transposed_convolution_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, out_channels, height_in, width_in, height_out, width_out, kernel_size);
+
+    return output;
+}
+"""
+
+transposed_convolution_cpp_source = (
+    "torch::Tensor transposed_convolution_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+transposed_convolution = load_inline(
+    name="transposed_convolution",
+    cpp_sources=transposed_convolution_cpp_source,
+    cuda_sources=transposed_convolution_source,
+    functions=["transposed_convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, add_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.transposed_convolution = transposed_convolution
+        self.add_value = add_value
+        self.multiply_value = multiply_value
+
+    def forward(self, x):
+        x = self.transposed_convolution.transposed_convolution_cuda(x, self.weight)
+        x = x + self.add_value
+        x = torch.min(x, torch.tensor(0.0, device=x.device))
+        x = torch.nn.functional.gelu(x)
+        x = x * self.multiply_value
+        return x
+
+# Initialize weights for the transposed convolution layer
+def get_init_inputs():
+    in_channels, out_channels, kernel_size, stride, add_value, multiply_value = get_init_inputs()
+    weight = torch.randn(out_channels, in_channels, kernel_size, kernel_size).cuda()
+    return [weight]
+
+# Get initial inputs for the model
+init_inputs = get_init_inputs()
+
+# Create an instance of the new model
+model_new = ModelNew(*get_init_inputs())
+
+# Get inputs for the model
+inputs = get_inputs()
+
+# Forward pass through the new model
+output_new = model_new(inputs[0])
+
+# Compare the output of the new model with the output of the original model
+original_model = Model(*get_init_inputs())
+output_original = original_model(inputs[0])
+assert torch.allclose(output_new, output_original, rtol=1e-5, atol=1e-5), "The outputs do not match."

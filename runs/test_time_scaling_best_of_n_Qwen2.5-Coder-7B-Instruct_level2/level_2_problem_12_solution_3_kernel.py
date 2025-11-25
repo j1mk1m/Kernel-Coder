@@ -1,0 +1,85 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Gemm, multiplication, and LeakyReLU
+gemm_multiply_leakyrelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define CUDA_KERNEL_LOOP(i, n) \
+    for (; i < n; i += blockDim.x * gridDim.x)
+
+__global__ void gemm_multiply_leakyrelu_kernel(
+    const float* a, const float* b, float* c, const float* d, float* e, float* f,
+    int m, int n, int k, float alpha, float beta, float negative_slope) {
+
+    CUDA_KERNEL_LOOP(index, m * n) {
+        int row = index / n;
+        int col = index % n;
+        float sum = 0.0f;
+
+        // Perform Gemm operation
+        for (int j = 0; j < k; ++j) {
+            sum += a[row * k + j] * b[j * n + col];
+        }
+
+        // Multiply the result by the multiplier
+        sum *= alpha;
+
+        // Apply LeakyReLU activation
+        e[index] = sum > 0 ? sum : negative_slope * sum;
+
+        // Store the final result
+        f[index] = e[index];
+    }
+}
+
+torch::Tensor gemm_multiply_leakyrelu_cuda(
+    torch::Tensor a, torch::Tensor b, float multiplier, float negative_slope) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto out = torch::zeros({m, n}, a.options());
+
+    const int block_size = 256;
+    const int num_blocks = (m * n + block_size - 1) / block_size;
+
+    gemm_multiply_leakyrelu_kernel<<<num_blocks, block_size>>>(
+        a.data_ptr<float>(), b.data_ptr<float>(), nullptr, nullptr, out.data_ptr<float>(), nullptr,
+        m, n, k, 1.0f, multiplier, negative_slope);
+
+    return out;
+}
+"""
+
+gemm_multiply_leakyrelu_cpp_source = (
+    "torch::Tensor gemm_multiply_leakyrelu_cuda(torch::Tensor a, torch::Tensor b, float multiplier, float negative_slope);"
+)
+
+# Compile the inline CUDA code for Gemm, multiplication, and LeakyReLU
+gemm_multiply_leakyrelu = load_inline(
+    name="gemm_multiply_leakyrelu",
+    cpp_sources=gemm_multiply_leakyrelu_cpp_source,
+    cuda_sources=gemm_multiply_leakyrelu_source,
+    functions=["gemm_multiply_leakyrelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        self.gemm_multiply_leakyrelu = gemm_multiply_leakyrelu
+
+    def forward(self, x):
+        return self.gemm_multiply_leakyrelu.gemm_multiply_leakyrelu_cuda(x, x, self.multiplier, self.negative_slope)
+
+# Example usage
+model_new = ModelNew(in_features, out_features, multiplier, negative_slope)
+inputs = get_inputs()[0].cuda()
+output = model_new(inputs)
+print(output.shape)

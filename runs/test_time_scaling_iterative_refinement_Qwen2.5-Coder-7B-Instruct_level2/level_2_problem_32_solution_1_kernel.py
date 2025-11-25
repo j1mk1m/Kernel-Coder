@@ -1,0 +1,1 @@
+RuntimeError: CUDA error: invalid argument. CUBLAS_STATUS_INVALID_VALUE (-4)

@@ -1,0 +1,67 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for batch matrix multiplication
+bmm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bmm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor bmm_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 32;
+    const int grid_x = (n + block_size - 1) / block_size;
+    const int grid_y = (m + block_size - 1) / block_size;
+
+    bmm_kernel<<<grid_x, grid_size, 0, at::cuda::getCurrentCUDAStream()>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+bmm_cpp_source = (
+    "torch::Tensor bmm_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for batch matrix multiplication
+bmm = load_inline(
+    name="bmm",
+    cpp_sources=bmm_cpp_source,
+    cuda_sources=bmm_source,
+    functions=["bmm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = bmm
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x, y):
+        x = self.bmm.bmm_cuda(x, y)
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        x = x + y
+        x = x * y
+        return x

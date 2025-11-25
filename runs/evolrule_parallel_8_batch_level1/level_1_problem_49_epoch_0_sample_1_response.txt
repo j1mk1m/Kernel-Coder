@@ -1,0 +1,1905 @@
+The new code must use the same get_inputs and get_init_inputs functions. 
+
+Make sure that the code you write is compatible with the given get_inputs and get_init_inputs functions. 
+
+The output code should be as efficient as possible. The goal is to maximize speed while maintaining correctness. 
+
+Ensure that the custom CUDA kernel is correct and efficient. Use shared memory and proper grid/block dimensions to maximize performance. 
+
+Consider the input tensor dimensions in get_inputs: the input is of shape (128,4096,4095). The model applies torch.max over a specific dimension (passed during initialization). The output is of shape (128,4095) if dim=1, or (128,4096) if dim=2, etc.
+
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.max_kernel = load_inline(
+            name='max_reduction_cuda',
+            cpp_sources=f"""
+                torch::Tensor max_reduction_cuda(torch::Tensor x, int64_t dim);
+            """,
+            cuda_sources=f"""
+                #include <torch/extension.h>
+                #include <cuda_runtime.h>
+                #include <limits>
+
+                template <typename scalar_t>
+                __device__ void warp_max(scalar_t& val, int lane_id) {{
+                    for (int offset = 1; offset < 32; offset *= 2) {{
+                        scalar_t other_val = __shfl_xor_sync(0xffffffff, val, offset, 32);
+                        if (val < other_val) {{
+                            val = other_val;
+                        }}
+                    }}
+                }}
+
+                template <typename scalar_t>
+                __global__ void max_kernel(const scalar_t* __restrict__ x,
+                                           scalar_t* __restrict__ out,
+                                           const int64_t dim_size,
+                                           const int64_t outer_dim,
+                                           const int64_t inner_dim,
+                                           const int64_t total_elements,
+                                           const int64_t reduction_dim) {{
+                    int block_idx = blockIdx.x;
+                    int thread_idx = threadIdx.x;
+                    int tid = block_idx * blockDim.x + thread_idx;
+
+                    __shared__ scalar_t shared_mem[1024]; // Shared memory buffer
+
+                    scalar_t local_max = -std::numeric_limits<scalar_t>::infinity();
+
+                    // Compute the starting and ending indices for the thread's segment
+                    int start = block_idx * blockDim.x * 2; // 2x warps per block
+                    int end = min(start + blockDim.x * 2, dim_size);
+
+                    for (int i = start + thread_idx; i < end; i += blockDim.x) {{
+                        int index = i * outer_dim * inner_dim;
+                        scalar_t val = x[index + tid % (outer_dim * inner_dim)];
+                        if (val > local_max) {{
+                            local_max = val;
+                        }}
+                    }}
+
+                    // Warp-level reduction
+                    warp_max(local_max, thread_idx % 32);
+
+                    // Shared memory reduction
+                    __syncthreads();
+                    int smem_offset = thread_idx;
+                    shared_mem[smem_offset] = local_max;
+                    __syncthreads();
+
+                    if (thread_idx < 32) {{
+                        for (int s = blockDim.x / 2; s > 0; s >>= 1) {{
+                            if (smem_offset < s) {{
+                                shared_mem[smem_offset] = max(shared_mem[smem_offset], shared_mem[smem_offset + s]);
+                            }}
+                            __syncthreads();
+                        }}
+                    }}
+
+                    if (thread_idx == 0) {{
+                        out[block_idx] = shared_mem[0];
+                    }}
+                }}
+
+                torch::Tensor max_reduction_cuda(torch::Tensor x, int64_t dim) {{
+                    auto x_size = x.sizes().vec();
+                    auto output_size = x.sizes().vec();
+                    output_size[dim] = 1;
+                    auto out = torch::empty(output_size, x.options());
+
+                    int64_t total_elements = x.numel();
+                    int64_t reduction_dim_size = x.size(dim);
+                    int64_t outer_dim = 1;
+                    for (int i = 0; i < dim; ++i) {{
+                        outer_dim *= x.size(i);
+                    }}
+                    int64_t inner_dim = 1;
+                    for (int i = dim + 1; i < x.dim(); ++i) {{
+                        inner_dim *= x.size(i);
+                    }}
+
+                    int block_size = 256;
+                    int grid_size = (reduction_dim_size + block_size * 2 - 1) / (block_size * 2);
+
+                    auto stream = at::cuda::getCurrentCUDAStream();
+                    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "max_reduction_cuda", ([&] {{
+                        max_kernel<scalar_t><<<grid_size, block_size, 0, stream>>>(
+                            x.data_ptr<scalar_t>(),
+                            out.data_ptr<scalar_t>(),
+                            reduction_dim_size,
+                            outer_dim,
+                            inner_dim,
+                            total_elements,
+                            dim);
+                    }}));
+
+                    return out.view(output_size);
+                }}
+            """,
+            functions=['max_reduction_cuda'],
+            verbose=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # The kernel returns a tensor with the reduced dimension as size 1, so we squeeze it
+        return self.max_kernel.max_reduction_cuda(x, self.dim).squeeze(self.dim)
+
+```
+</think>
+</think>
+
+Okay, I need to optimize the given PyTorch model that performs a max reduction over a specific dimension using a custom CUDA kernel. Let me start by understanding the problem. The original model uses `torch.max`, which is a standard PyTorch operator. To get a speedup, I'll replace this with a custom CUDA kernel.
+
+First, I should analyze the input dimensions. The input tensor is of shape (128, 4096, 4095), and the model reduces over a specified dimension, say dim=1 or 2. The output shape depends on which dimension is chosen. For example, reducing over dim=1 would give (128, 4095), and dim=2 would result in (128, 4096).
+
+The goal is to make the kernel as efficient as possible. CUDA kernels benefit from optimizing memory access patterns and utilizing shared memory for reductions. Since the max reduction is a parallelizable operation, I can distribute the computation across threads and blocks efficiently.
+
+Let me think about the kernel structure. Each thread can process a segment of the reduction dimension. To handle large dimensions (like 4096 or 4095), I need to divide the work appropriately. Using shared memory for intermediate results can reduce global memory accesses, which is a common optimization technique.
+
+I'll structure the kernel as follows: Each block handles a portion of the reduction dimension. Threads within a block will process elements and perform a partial max reduction. Then, they'll use shared memory to combine their results, followed by a final reduction within the block.
+
+Wait, but how exactly do I map the input tensor into the kernel? Let me break down the input:
+
+Suppose the reduction dimension is dim. The tensor has dimensions [B, D1, D2]. If dim=1, the reduction is over D1 elements for each B and D2. So for each position in B and D2, we need to compute the max over D1 elements.
+
+The kernel needs to process each "slice" along the reduction dimension. For example, if dim=1, each slice is of size D1 (4096). The total elements per slice are B*D2, so for each slice element (B and D2), we compute max over D1 elements.
+
+Hmm, perhaps it's better to structure the kernel such that each thread block handles a single slice (i.e., a single element in the non-reduction dimensions). Then, each thread in the block processes a chunk of the reduction dimension.
+
+Alternatively, threads can process multiple elements. Let me think in terms of grid and block dimensions.
+
+The grid size should be the number of elements along the non-reduction dimensions. For example, if reducing over dim=1 (size 4096), the number of elements to process is batch_size * dim2 = 128 * 4095. Each block could handle one such element. But 128*4095 is around 524,160, which is a lot. Maybe using a block size of 256 and grid size of (ceil(total_elements / 256)) might be feasible, but I need to structure it properly.
+
+Alternatively, perhaps it's better to have each block process a chunk of the reduction dimension for a particular output element.
+
+Wait, perhaps a better approach is to have each thread process a single element in the reduction dimension for a given output element. Let me think step by step.
+
+Suppose the reduction dimension is dim, and the output is of shape [B, D2] (if dim was 1). For each output element (b, d2), we need the max of x[b][0..D1-1][d2].
+
+So each output element is the max over D1 elements. Therefore, for each output element, we can have a block of threads, each handling a portion of the D1 elements.
+
+The kernel can be structured as follows:
+
+- Each block corresponds to an output element (b, d2).
+- The block has multiple threads, each processing a chunk of the D1 elements.
+- Each thread computes the max of its chunk and writes to shared memory.
+- Then, the block performs a reduction in shared memory to find the final max.
+
+This way, the number of blocks is equal to the number of output elements (B * D2 if dim=1).
+
+The block size should be chosen so that threads can cover all D1 elements. For example, if D1 is 4096, a block size of 256 would allow each thread to process 16 elements (4096 / 256 ≈ 16). But maybe using a larger block size like 512 or 1024 could be better, but needs to stay within the maximum thread limit per block (1024).
+
+Alternatively, maybe use a tiling approach where each block handles a range of output elements, but this might complicate things.
+
+Wait, let me think again. Let me consider the reduction over dim=1 (D1=4096). The output tensor has size (128, 4095). Each output element (b, d2) is the max over the 4096 elements in x[b][d1][d2].
+
+So for each of the 128 * 4095 output elements, we need to compute the max over 4096 elements. That's a lot of work. So the kernel needs to be efficient here.
+
+A possible approach is to use a block per output element. Each block has a number of threads (e.g., 256) which each process a chunk of the D1 elements. The threads can load their chunks into shared memory, then perform a reduction.
+
+Wait, but with D1=4096, each thread in a block (size 256) would need to process 16 elements (since 4096 / 256 = 16). Each thread can compute the max of its 16 elements, store it in shared memory, then perform a reduction across the block's shared memory to get the final max.
+
+This seems feasible.
+
+Let me outline the steps for the kernel:
+
+1. Each block is responsible for an output element (indexed by blockIdx.x). The total number of blocks is output_size.
+
+2. Each block has threads (e.g., 256 threads).
+
+3. Each thread in the block processes a portion of the D1 elements. For example, if D1 is 4096, each thread can process 16 elements (since 256 threads * 16 elements per thread = 4096).
+
+4. Each thread reads its portion of D1 elements (for the current output element) and computes the local max for its chunk.
+
+5. The local max is stored in shared memory.
+
+6. The block then performs a reduction on the shared memory to find the overall max. This can be done using a parallel reduction pattern (e.g., using log2(thread_count) steps).
+
+7. The final max is written to the output tensor.
+
+However, this approach may have high memory requirements since each block needs to process the entire D1 elements for its output element. Wait, no: each thread is handling a portion of the D1 elements for the current output element. The data for the D1 elements for a given output element is contiguous in memory if the tensor is stored in row-major order. So, the elements for the current output element are x[b][d1][d2], which for fixed b and d2, the d1 index varies. Since the tensor is (B, D1, D2), the stride for D1 is 1 element? Wait, the memory layout depends on how PyTorch stores tensors. Let me think:
+
+Assuming the tensor is stored in row-major (C order), the strides would be:
+
+For a tensor of shape (B, D1, D2):
+
+- The stride for B is D1*D2 elements.
+
+- The stride for D1 is D2 elements.
+
+- The stride for D2 is 1 element.
+
+So, for a given output element (b, d2), the elements to reduce over are at positions:
+
+x[b][0][d2], x[b][1][d2], ..., x[b][D1-1][d2]
+
+These are spaced by D2 elements apart. So the starting index for the first element is (b * D1 * D2) + (0 * D2) + d2. The next element is (b * D1 * D2) + (1 * D2) + d2, and so on.
+
+Therefore, the elements for a given output element are spaced by D2 elements. This could be a problem for coalesced memory access. Because each thread in the block (processing different D1 indices) will access elements that are D2 apart, which could lead to uncoalesced accesses if D2 is large (like 4095).
+
+Hmm, this might be an issue. Uncoalesced memory accesses can significantly slow down the kernel. To mitigate this, perhaps a different approach is better.
+
+Alternative idea: process multiple output elements in a single block. But that might complicate the kernel.
+
+Alternatively, transpose the tensor to make the reduction dimension contiguous? But that would require extra memory and might not be feasible.
+
+Hmm, perhaps I should reorganize the kernel to process in a way that accesses contiguous memory.
+
+Alternatively, let me think of the problem in terms of dimensions. Suppose the reduction is over dim=1 (D1=4096). The input tensor has dimensions (B, D1, D2). For each element in the output (B, D2), we need the max over D1 elements. 
+
+If we can reorganize the input so that for each D2, the elements to reduce are contiguous, but that might not be possible.
+
+Alternatively, the kernel can process blocks where each block handles a chunk of the D1 dimension across all output elements. Maybe this is getting too complicated.
+
+Perhaps the initial approach is the way to go, but with some optimizations.
+
+Let me proceed with the initial plan and see where adjustments can be made.
+
+First, the kernel function:
+
+Each block processes one output element. The number of blocks is the total number of output elements (B * D2).
+
+The block size can be 256. Each thread in the block processes a chunk of the D1 elements.
+
+The starting index for the current output element's data:
+
+base_index = b * D1 * D2 + d2
+
+Wait, how do I get b and d2 from the block index?
+
+The block index is blockIdx.x. Since the output is B * D2 elements, blockIdx.x can be mapped to b and d2 as:
+
+b = blockIdx.x / D2
+
+d2 = blockIdx.x % D2
+
+Once we have b and d2, the base index is:
+
+base = b * D1 * D2 + d2
+
+Then, for each thread in the block, the thread index is threadIdx.x.
+
+Each thread processes a number of elements along the D1 dimension. The total number of elements per thread is (D1 / block_size). Since D1 is 4096 and block size 256, that's 16 elements per thread.
+
+So each thread's offset in D1 is threadIdx.x * 16 (or similar). Wait, maybe better to calculate the number of elements per thread as (D1 + block_size - 1)/block_size, but for even division.
+
+Wait, let's compute for D1=4096 and block_size=256: 4096 /256 = 16. So each thread handles exactly 16 elements.
+
+Each thread's starting D1 index is threadIdx.x * 16.
+
+Wait, but D1 is the dimension being reduced. So for each thread, they will process 16 elements in the D1 direction. The actual indices in the tensor are:
+
+for i in 0..15:
+
+d1 = threadIdx.x * 16 + i
+
+element index = base + d1 * D2
+
+Wait, because each D1 step increases the index by D2 (since the stride for D1 is D2 elements). So the element at d1 is at position base + d1 * D2.
+
+Thus, the thread's elements are at indices:
+
+base + (thread's d1 offset) * D2.
+
+So the thread can loop over their 16 elements and compute the max.
+
+The thread can load the values from global memory into registers, compute the max, then store into shared memory.
+
+Once all threads have their local max, the block can perform a reduction in shared memory.
+
+Wait, but if each thread has 16 elements, their local max is the maximum of those 16 elements.
+
+Storing each thread's local max into shared memory, then performing a block reduction.
+
+The reduction can be done using shared memory. The steps would be:
+
+1. Each thread computes its local max over the 16 elements assigned to it.
+
+2. Write the local max to shared memory.
+
+3. Synchronize threads.
+
+4. Perform a parallel reduction in shared memory. For example, first, each thread (if in the first half) adds the second half's value. Repeat halving until one value remains.
+
+Wait, but max, so instead of adding, we take the maximum.
+
+Alternatively, use a binary reduction approach.
+
+Alternatively, since the block size is 256, the reduction can be done in log2(256)=8 steps. But with shared memory, perhaps using a warp-based approach.
+
+Alternatively, for 256 threads, we can have each thread store its value in shared memory, then each thread in the first 128 threads can take the max of two values, then first 64, etc., until the first thread has the result.
+
+Alternatively, using warp-level reductions first. Since 256 threads is 8 warps (each warp 32 threads), perhaps do a warp-level max first, then shared memory for the block.
+
+Hmm, let's think of code steps.
+
+In the kernel:
+
+__global__ void max_kernel(...){
+
+    int block_idx = blockIdx.x; // corresponds to output element (b, d2)
+
+    int b = block_idx / D2;
+
+    int d2 = block_idx % D2;
+
+    int base = b * D1 * D2 + d2;
+
+    __shared__ float shared_max[256]; // assuming block size 256
+
+    float local_max = -INFINITY;
+
+    for (int i = 0; i < 16; i++) { // each thread handles 16 elements
+
+        int d1 = threadIdx.x * 16 + i;
+
+        if (d1 < D1) { // in case D1 is not multiple of 16*block_size? Wait D1=4096, so 256*16=4096 exactly.
+
+            float val = x[base + d1 * D2]; // since stride of D1 is D2
+
+            if (val > local_max) local_max = val;
+
+        }
+
+    }
+
+    shared_max[threadIdx.x] = local_max;
+
+    __syncthreads();
+
+    // now reduce in shared memory
+
+    // implement a block reduction
+
+    for (int s=128; s>0; s/=2) {
+
+        if (threadIdx.x < s) {
+
+            shared_max[threadIdx.x] = max( shared_max[threadIdx.x], shared_max[threadIdx.x + s] );
+
+        }
+
+        __syncthreads();
+
+    }
+
+    if (threadIdx.x ==0 ) {
+
+        out[block_idx] = shared_max[0];
+
+    }
+
+}
+
+Wait, but this requires that the block size divides D1. Since D1=4096 and block size 256, 4096/(256*16) is exact. But if D1 wasn't a multiple of 16*block_size, we need to handle that. However, in the given problem, the input dimensions are fixed, so maybe it's okay.
+
+Wait, D1 is 4096. Each thread handles 16 elements. 256 threads *16=4096, so exactly covers.
+
+So the code above would work for this specific case. But need to make it general for any dim, but in the problem, the user will pass the dim during initialization.
+
+Wait, but in the kernel, the D1, D2, etc., are not known at compile time. So the kernel must accept parameters for the reduction dimension and the sizes.
+
+Hmm, this complicates things. The kernel needs to be generic in terms of the reduction dimension.
+
+Alternatively, the kernel must take the tensor's shape and the dimension as parameters.
+
+Wait, perhaps the kernel should be templated for the data type, but in CUDA, we can use templates with AT_DISPATCH_FLOATING_TYPES.
+
+Now, the kernel code needs to handle the general case where the reduction dimension can be any of the dimensions (0, 1, or 2 in this case).
+
+Hmm, this complicates the indexing. Let me think of the general case.
+
+Suppose the input tensor has dimensions (B, D1, D2). The reduction dimension is 'dim'. Let's say the output is (B, D2) if dim=1, etc.
+
+The key is to compute for each output element the max over the specified dimension.
+
+To handle any dimension, the code must compute the correct indices.
+
+Let me structure it as follows:
+
+Parameters passed to the kernel:
+
+- dim: the reduction dimension (0, 1, or 2)
+
+- outer_dim: the product of dimensions before 'dim'
+
+- inner_dim: the product of dimensions after 'dim'
+
+- total_elements: x.numel()
+
+The size of the reduction dimension is dim_size = x.size(dim).
+
+The output tensor has size (outer_dim, inner_dim).
+
+Each output element is determined by indices in the outer and inner dimensions.
+
+So for a given output index 'idx':
+
+outer = idx / inner_dim
+
+inner = idx % inner_dim
+
+The corresponding element in the original tensor is:
+
+offset = outer * (dim_size * inner_dim) + inner;
+
+Then, for each position along the dim_size (the reduction dimension), the element is offset + position * inner_dim.
+
+Wait, maybe I should think of the tensor as a flattened array, and compute the strides.
+
+Alternatively, using the formula:
+
+The index in the original tensor can be computed as:
+
+original_index = outer * (dim_size * inner_dim) + (position * inner_dim) + inner
+
+for position in 0..dim_size-1.
+
+Thus, for each output element (outer, inner), the loop over the dim_size elements would be:
+
+for (int pos = 0; pos < dim_size; pos++) {
+
+    float val = x[original_index + pos * inner_dim];
+
+    ... compute max ...
+
+}
+
+This way, the kernel can handle any dimension by computing the strides accordingly.
+
+This requires passing parameters to the kernel: dim_size, outer_dim, inner_dim, total_elements, and the reduction dimension.
+
+So, the kernel function will need to take these parameters as arguments.
+
+Now, the kernel structure would be:
+
+The grid size is the number of output elements, which is outer_dim * inner_dim.
+
+Each block corresponds to one output element.
+
+The block size is chosen (e.g., 256 threads).
+
+Within the block:
+
+Each thread processes a chunk of the dim_size elements. The chunk size is dim_size / block_size.
+
+Each thread calculates its chunk and computes the local max.
+
+The local max is stored in shared memory.
+
+Then, a block-wide reduction is performed to get the final max.
+
+This approach should be general for any dimension.
+
+Now, implementing this in code.
+
+First, in Python, the custom CUDA kernel is defined using load_inline.
+
+The kernel source code must be written with these parameters.
+
+Let me draft the CUDA code.
+
+First, the kernel function:
+
+template <typename scalar_t>
+__global__ void max_kernel(const scalar_t* __restrict__ x,
+                           scalar_t* __restrict__ out,
+                           const int64_t dim_size,
+                           const int64_t outer_dim,
+                           const int64_t inner_dim,
+                           const int64_t total_elements,
+                           const int64_t reduction_dim) {
+
+    int block_idx = blockIdx.x;
+    int thread_idx = threadIdx.x;
+
+    __shared__ scalar_t shared_mem[256]; // assuming block size 256
+
+    scalar_t local_max = -std::numeric_limits<scalar_t>::infinity();
+
+    // Compute the original indices
+    int outer = block_idx / inner_dim;
+    int inner = block_idx % inner_dim;
+
+    // Starting offset for the block's element
+    int base = outer * (dim_size * inner_dim) + inner;
+
+    // Each thread processes a chunk of the dim_size elements
+    int elements_per_thread = (dim_size + blockDim.x - 1) / blockDim.x;
+    int start = thread_idx * elements_per_thread;
+    int end = min(start + elements_per_thread, dim_size);
+
+    for (int pos = start; pos < end; ++pos) {
+        int idx = base + pos * inner_dim;
+        scalar_t val = x[idx];
+        if (val > local_max) {
+            local_max = val;
+        }
+    }
+
+    // Write to shared memory
+    shared_mem[thread_idx] = local_max;
+    __syncthreads();
+
+    // Block reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (thread_idx < s) {
+            shared_mem[thread_idx] = max(shared_mem[thread_idx], shared_mem[thread_idx + s]);
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        out[block_idx] = shared_mem[0];
+    }
+}
+
+Then, the wrapper function in Python:
+
+torch::Tensor max_reduction_cuda(torch::Tensor x, int64_t dim) {
+    auto x_size = x.sizes().vec();
+    auto output_size = x.sizes().vec();
+    output_size[dim] = 1;
+
+    auto outer_dim = 1;
+    for (int i = 0; i < dim; ++i) {
+        outer_dim *= x.size(i);
+    }
+    auto inner_dim = 1;
+    for (int i = dim + 1; i < x.dim(); ++i) {
+        inner_dim *= x.size(i);
+    }
+
+    int64_t dim_size = x.size(dim);
+    int block_size = 256;
+    int grid_size = outer_dim * inner_dim;
+
+    auto out = torch::empty(output_size, x.options());
+
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "max_reduction_cuda", ([&] {
+        max_kernel<scalar_t><<<grid_size, block_size>>>(
+            x.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            dim_size,
+            outer_dim,
+            inner_dim,
+            x.numel(),
+            dim);
+    }));
+
+    return out.view(output_size);
+}
+
+Wait, but in the kernel, the 'reduction_dim' is passed as a parameter. The code above should work for any dimension.
+
+Wait, but in the kernel, the way the 'base' is calculated may not be correct for all dimensions. Let's check:
+
+Suppose the reduction dimension is 0 (B=128, D1=4096, D2=4095). Then outer_dim = 1 (since before dim 0 there's nothing), inner_dim = 4096 *4095. Wait, no.
+
+Wait, for dim=0:
+
+outer_dim = 1 (since there are no dimensions before dim 0).
+
+inner_dim = product of dimensions after dim 0: D1*D2 = 4096 *4095.
+
+Thus, the base calculation would be:
+
+base = outer * (dim_size * inner_dim) + inner;
+
+But when dim is 0, dim_size is B=128, so:
+
+dim_size * inner_dim = 128 * (4096*4095). Hmm, but that might not be correct.
+
+Wait, maybe my approach to computing 'base' is wrong.
+
+Wait, perhaps the formula for the base is incorrect when the reduction dimension is not the middle dimension.
+
+Wait, let's think of the indices again. The outer and inner are indices in the non-reduction dimensions.
+
+Suppose the reduction is along dim=0 (B=128). The output shape would be (D1, D2). So for each output element (d1, d2), the base index in the original tensor is the starting index for that element across all B dimensions.
+
+The original tensor has shape (B, D1, D2). To get the max over B, for each (d1, d2), the elements are at positions:
+
+0 * D1*D2 + d1 * D2 + d2,
+
+1 * D1*D2 + d1 * D2 + d2,
+
+..., (B-1)* D1*D2 + d1 * D2 + d2.
+
+Thus, the base for the output element (d1, d2) would be d1*D2 + d2. Then each step is D1*D2? Wait no, the step between elements would be D1*D2 (the size of the first dimension).
+
+Wait, the element at position (b, d1, d2) is at offset b*(D1*D2) + d1*D2 + d2.
+
+Thus, for the output element (d1, d2), the base would be d1*D2 + d2.
+
+Then, the step for each B element is D1*D2.
+
+So the original index for the Bth element would be base + b * D1*D2.
+
+Hmm, so in general, the base is the offset excluding the reduction dimension, and then each step is the stride of the reduction dimension.
+
+The way I computed 'base' earlier may not be correct. Let me re-express the indices properly.
+
+Let me think of the tensor as a multidimensional array with strides. The strides are the number of elements to step in each dimension.
+
+For a tensor with dimensions [d0, d1, d2], the strides are:
+
+stride0 = d1*d2,
+
+stride1 = d2,
+
+stride2 = 1.
+
+The total size is d0*d1*d2.
+
+An element at position (i0, i1, i2) has index:
+
+index = i0*stride0 + i1*stride1 + i2*stride2.
+
+When reducing along dimension dim, the output has dimensions with the dim removed.
+
+For a given output index (o0, o1, ...), which corresponds to indices in the non-reduction dimensions.
+
+Suppose the reduction dimension is dim. The indices before dim are o0, o1, ..., and after are odim+1, etc.
+
+Thus, to compute the base offset for the output element's first element in the reduction dimension:
+
+The base is the offset without the reduction dimension. Then, each step along the reduction dimension is the stride of that dimension.
+
+The formula for the base can be computed as follows:
+
+Compute the indices in the non-reduction dimensions. The base offset is the sum over the indices multiplied by their strides, excluding the reduction dimension.
+
+Alternatively, perhaps it's better to compute the base offset as:
+
+base = outer * (stride_before_reduction) + inner;
+
+Where 'outer' is the index in the dimensions before the reduction dimension, and 'inner' is the index in the dimensions after.
+
+The stride_before_reduction is the product of the dimensions after the reduction dimension (since the reduction dimension's stride is multiplied by its size when moving to the next outer element).
+
+Hmm, this is getting complicated. Maybe a better approach is to compute the base as:
+
+The output index corresponds to a certain position in the non-reduction dimensions. The base offset is the index in the original tensor for the first element along the reduction dimension.
+
+Let me think of the example where reduction is along dim=1 (D1):
+
+Original shape (B, D1, D2). Output shape (B, D2).
+
+For an output element (b, d2), the base offset is:
+
+b * (D1 * D2) + d2. Because the D1 dimension is the one being reduced. So the starting position for this element is at b's start (b*D1*D2), then the D2 index is d2, but the D1 dimension is being reduced, so the starting position is the first element of D1 (d1=0) for that b and d2.
+
+Wait, no. The D1 index is being reduced. For each element in the output (b, d2), the elements to reduce are the D1 elements (d1 from 0 to D1-1) at position (b, d1, d2).
+
+The offset for (b,0,d2) is b*(D1*D2) + 0*D2 + d2 = b*D1*D2 + d2.
+
+The next element (d1=1) is at offset b*D1*D2 + 1*D2 + d2 = b*D1*D2 + d2 + D2.
+
+So the step between elements along D1 is D2.
+
+Thus, the base is b*D1*D2 + d2, and each step is D2.
+
+Thus, for the reduction along dim=1, the base is:
+
+base = b * (D1 * D2) + d2,
+
+step = D2,
+
+number of steps = D1.
+
+So the kernel can handle this with:
+
+for (int pos =0; pos < dim_size; pos++)
+
+   idx = base + pos * step,
+
+where step is the stride of the reduction dimension.
+
+Thus, the stride can be calculated as the stride of the reduction dimension. To compute the stride of the reduction dimension, it's the product of dimensions after the reduction dimension.
+
+Wait, the stride for the reduction dimension is the product of the sizes of the dimensions after it.
+
+Thus, in code, the stride can be computed as inner_dim.
+
+Wait, in the earlier code, I had:
+
+inner_dim = product of dimensions after the reduction dimension.
+
+Yes. So the step between elements along the reduction dimension is inner_dim.
+
+Thus, the base for the output element is:
+
+base = outer * (dim_size * inner_dim) + inner.
+
+Wait, no. Wait, outer is the index in the dimensions before the reduction dimension.
+
+Suppose the reduction is along dim. The outer index is the product of the first 'dim' dimensions. So for example, if dim is 1 (the second dimension), then outer is the index in the first dimension (B). The inner is the index in the last dimension (D2).
+
+Thus, the base is:
+
+base = outer * (stride_before_reduction) + inner.
+
+Wait, maybe the base should be:
+
+base = outer * (dim_size * inner_dim) + inner.
+
+Wait, the stride_before_reduction would be the product of the dimensions after the reduction dimension multiplied by the reduction dimension's size?
+
+Not sure. Let me re-calculate for the example.
+
+Example with dim=1 (reduction over D1):
+
+outer is the index in the first dimension (B). Since the first dimension has size B=128, outer ranges from 0 to 127.
+
+inner is the index in the last dimension (D2=4095), ranging from 0 to 4094.
+
+Then, the base should be:
+
+outer * (D1 * D2) (the stride of the first dimension) + inner.
+
+Wait, no, because the D1 dimension is between the first and last dimensions. The first dimension's stride is D1 * D2.
+
+Wait, the first dimension (dim=0) has stride D1 * D2.
+
+Thus, the base for the first dimension's index 'outer' is outer * stride0 = outer * D1*D2.
+
+Then, the inner is the index in the last dimension (dim=2), which has stride 1, but the position in the D2 dimension is given by 'inner'.
+
+But the D1 dimension is being reduced, so the elements to consider are those varying along D1 for fixed outer and inner.
+
+Wait, perhaps the correct formula is:
+
+base = outer * (stride_before) + inner,
+
+where stride_before is the product of the dimensions after the reduction dimension.
+
+Wait, I'm getting confused. Let me think of another way.
+
+Suppose the reduction is along dim:
+
+The indices before the reduction dimension are grouped into 'outer', which has size outer_dim = product of dimensions before dim.
+
+The indices after the reduction dimension are grouped into 'inner', which has size inner_dim = product of dimensions after dim.
+
+Thus, for an output element (outer, inner), the elements to consider are:
+
+for each position in 0..dim_size-1:
+
+the original index is:
+
+index = (outer * dim_size + position) * inner_dim + inner ?
+
+No, that's not right.
+
+Alternatively, the original indices can be thought of as:
+
+original_index = outer * (dim_size * inner_dim) + position * inner_dim + inner.
+
+Wait, perhaps this is the correct way. Let me verify with the example:
+
+Example: reduction along dim=1 (D1).
+
+outer is the index in the first dimension (B), so outer ranges 0..127.
+
+inner is the index in the last dimension (D2), 0..4094.
+
+dim_size is D1=4096.
+
+inner_dim is product of dimensions after dim=1, which is D2=4095.
+
+Thus:
+
+original_index = outer * (4096 * 4095) + pos * 4095 + inner.
+
+Wait, but for pos=0:
+
+outer=0, pos=0, inner=0:
+
+original_index = 0 + 0 + 0 = 0 → correct (element (0,0,0)).
+
+For pos=1, inner=0:
+
+0 * 4096*4095 + 1 *4095 +0 = 4095 → which is the element (0,1,0) → correct, since D2 stride is 1, so (0,1,0) is at offset 0*D1*D2 +1 * D2 +0 = 0 +4095*1 +0 =4095? Wait D2 is 4095, so D2 elements per D1 step. Hmm, this might not align.
+
+Wait, the original element (0,1,0) is in the first dimension (0), second dimension (1), last dimension (0). The offset would be:
+
+0 * (D1*D2) (stride for first dimension) → 0,
+
+plus 1 * D2 (stride for second dimension) → 1*4095,
+
+plus 0 (third dimension's index).
+
+Thus total offset is 4095, which matches the formula.
+
+Yes, so the formula works.
+
+Similarly for the third dimension: if reduction is over dim=2 (D2=4095), then inner_dim is 1 (since there are no dimensions after), and the formula would be:
+
+original_index = outer * (dim_size * inner_dim) + pos * inner_dim + inner → but inner is the index in the dimensions after dim=2, which is nothing, so inner is 0. So this would work.
+
+Therefore, the formula is correct.
+
+Thus, in the kernel, the base is:
+
+base = outer * (dim_size * inner_dim) + inner;
+
+Then, each position in 0..dim_size-1:
+
+idx = base + pos * inner_dim;
+
+Thus, the kernel's loop for each thread's chunk can be written as:
+
+int start = thread_idx * elements_per_thread;
+
+int end = min(start + elements_per_thread, dim_size);
+
+for (int pos = start; pos < end; pos++) {
+
+   int idx = base + pos * inner_dim;
+
+   val = x[idx];
+
+   ... compute max ...
+
+}
+
+This should handle any reduction dimension.
+
+Now, the kernel's code can be written with this logic.
+
+Now, considering the block size and shared memory.
+
+The block size is chosen as 256 threads. The shared memory array size should match the block size (256 elements).
+
+The kernel's block size can be fixed at 256, and the grid size is the number of output elements (outer_dim * inner_dim).
+
+Now, the reduction within the block:
+
+Each thread computes their local maximum over their assigned chunk of 'dim_size' elements.
+
+Then, they write their local_max to shared memory.
+
+Then, perform a block reduction by halving the size each iteration.
+
+The reduction loop:
+
+for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+
+   if (threadIdx.x < s) {
+
+       shared_mem[threadIdx.x] = max( shared_mem[threadIdx.x], shared_mem[threadIdx.x + s] );
+
+   }
+
+   __syncthreads();
+
+}
+
+This requires synchronization after each step.
+
+Once done, the thread 0 writes the result.
+
+Now, in the Python code, we need to compile this kernel.
+
+The code in Python would involve:
+
+- Defining the CUDA source as a string.
+
+- Using torch.utils.cpp_extension.load_inline to compile it.
+
+The function 'max_reduction_cuda' will take the input tensor and the dimension, compute the necessary parameters, and launch the kernel.
+
+Now, let's consider the initial code example provided by the user for the element-wise addition. The structure is similar: defining the CUDA source code as a string, then using load_inline with the functions.
+
+In the new code for the max reduction:
+
+The ModelNew class will replace the torch.max call with a call to the custom kernel.
+
+Wait, in the original Model class, the forward method is simply returning torch.max(x, dim=self.dim)[0].
+
+The new ModelNew class will call the custom kernel function.
+
+Thus, the forward method would be:
+
+def forward(self, x):
+    return self.max_kernel.max_reduction_cuda(x, self.dim).squeeze(self.dim)
+
+Wait, because the kernel returns a tensor with the reduction dimension set to size 1. So squeezing removes that singleton dimension.
+
+Now, putting it all together.
+
+Potential issues:
+
+1. The kernel must handle all data types (float, double, etc.), which is handled by AT_DISPATCH_FLOATING_TYPES.
+
+2. The block and grid dimensions must be chosen correctly. The grid size is the number of output elements. For large outputs (like 128 * 4095 = 524, 160), this is manageable since the maximum grid size in CUDA is large (like 2^31).
+
+3. The shared memory size must be sufficient. For block_size 256, the shared array of 256 elements is acceptable.
+
+4. Memory coalescing: when accessing x[idx], since idx is base + pos * inner_dim, the accesses may be scattered if inner_dim is large (like 4095). This can lead to uncoalesced memory accesses, which could slow down the kernel.
+
+Hmm, this is a concern. For example, when the reduction is over dim=1 (D1=4096), the inner_dim is D2=4095. The stride between elements is inner_dim=4095. Since each thread is accessing elements with steps of 4095, this could lead to uncoalesced accesses because threads in a warp are accessing different parts of memory.
+
+To mitigate this, perhaps we can transpose the tensor or reorganize the memory access pattern, but that might require changing the data layout, which isn't feasible here.
+
+Alternatively, maybe the coalescing is still okay because the threads are accessing contiguous chunks within their assigned positions.
+
+Wait, each thread's loop over their 'pos' (the reduction dimension) will access elements spaced by inner_dim (e.g., 4095). For 4096 elements, each thread processes a chunk of 16 elements (since elements_per_thread = 4096/256=16).
+
+The first thread would access positions 0 to 15, each spaced by 4095.
+
+The offsets would be base + 0 *4095, base +1 *4095, ..., base +15*4095.
+
+These are 16 elements spaced by 4095 bytes (if float, 4 bytes each, so 4095 * 4 = 16380 bytes apart).
+
+This is a large stride, leading to uncoalesced access. Each thread's memory accesses are not contiguous, so this could be a bottleneck.
+
+Hmm, this is a problem. Need to think of a better way.
+
+Alternative Idea: Process the reduction in a way that the accesses are contiguous.
+
+Suppose the reduction is over dim=1 (D1=4096), the input is (B, D1, D2).
+
+The output is (B, D2). For each output element (b, d2), we need the max over the D1 elements along the second dimension.
+
+The elements for (b, d2) are located at positions in the original tensor:
+
+b * D1*D2 + d2,
+
+b * D1*D2 + D2 + d2,
+
+...,
+
+b * D1*D2 + (D1-1)*D2 + d2.
+
+The step between these elements is D2.
+
+Thus, the elements are spaced by D2 elements. If D2 is 4095, then each step is 4095 elements (each element is 4 bytes for float), so the total stride between elements is 4095 * 4 = 16380 bytes.
+
+This is a big stride, which is not coalesced. Since threads in a warp are accessing elements that are far apart, this could lead to poor memory throughput.
+
+Hmm, this is a significant issue. Perhaps the initial approach is not optimal and we need a different strategy.
+
+Alternative Approach: Process the reduction in a way that threads access contiguous memory.
+
+Suppose instead of each block handling an output element, we process the reduction dimension in chunks.
+
+For example, each thread block processes a chunk of the reduction dimension (dim), and cooperates across the outer and inner dimensions.
+
+Alternatively, use a tiled approach where the reduction is done in chunks.
+
+Alternatively, consider that for reduction over dim=1 (D1=4096), the tensor is stored as (B, D1, D2). The reduction dimension is the middle one, so for each B and D2, the elements are spaced by D2.
+
+But maybe we can process the D1 dimension in chunks.
+
+Suppose the block is arranged to process a block of D1 elements across all B and D2.
+
+But this would require the output to be computed for all B and D2 simultaneously.
+
+Alternatively, use a kernel that processes the entire tensor in a way that each thread block handles a tile of the reduction dimension and computes the max for all other dimensions.
+
+This is getting complicated, but perhaps it's necessary for better memory coalescing.
+
+Let me think of the following approach:
+
+- The reduction is over dim=1 (D1). The kernel can be structured to process D1 elements in parallel.
+
+- The grid is divided into blocks along the outer and inner dimensions (B and D2).
+
+- Each block processes a block of D1 elements, and compute the maximum over their assigned range.
+
+Wait, maybe using a 2D grid where each block handles a chunk of the D1 dimension and a chunk of the output elements.
+
+Alternatively, here's another idea inspired by the CUDA reduction example:
+
+The kernel can first load all the elements of the reduction dimension into shared memory for a block of the outer and inner dimensions, then perform the reduction there.
+
+For example, if the block size is 256 threads, and the reduction dimension is 4096, we can have each block handle a 16x16 block of outer and inner, and each thread load 16 elements from the reduction dimension.
+
+But this requires the outer and inner dimensions to be large enough to make this feasible.
+
+Alternatively, for the given problem dimensions (B=128, D1=4096, D2=4095), perhaps the initial approach is the only way and we have to accept the uncoalesced accesses.
+
+Alternatively, transpose the tensor to make the reduction dimension contiguous.
+
+Wait, the problem requires the code to be compatible with the given get_inputs function, which generates the input tensors as they are. We cannot modify the input tensors' layout.
+
+Hmm, so perhaps the uncoalesced accesses are unavoidable, but maybe the computation is still faster than PyTorch's implementation.
+
+Alternatively, the initial approach might still be the best possible.
+
+Another optimization: Use warp-level reductions and shared memory to minimize global memory access.
+
+In the current approach, each thread reads a chunk of the reduction dimension. The elements are spaced by inner_dim (4095), so each thread's reads are to non-contiguous addresses.
+
+However, using warp-level reductions and shared memory can reduce the number of global reads. For example, each warp can read a contiguous chunk of the reduction dimension and then perform the reduction within the warp.
+
+Wait, perhaps if we process the reduction dimension in chunks that fit in shared memory.
+
+Suppose the reduction dimension is 4096. A block of 256 threads can store 4096 elements in shared memory (4096 floats = ~16KB, which is within the shared memory limit).
+
+Then, the kernel can read the entire reduction dimension for a particular output element into shared memory, then compute the max.
+
+This approach would have each block process an output element, and the entire reduction dimension is read into shared memory.
+
+The steps would be:
+
+- Each block corresponds to an output element (outer, inner).
+
+- The block reads the entire reduction dimension (4096 elements) into shared memory.
+
+- Then, perform a block reduction on the shared memory.
+
+This way, the memory accesses are sequential for each thread's read into shared memory.
+
+Let's see:
+
+Each block needs to read 4096 elements for the output element's reduction dimension.
+
+Each thread in the block can read a portion of these elements.
+
+The block size is 256 threads. So each thread reads 16 elements (4096/256=16).
+
+The threads can read their 16 elements sequentially from global memory, which would be coalesced.
+
+Then, write them into shared memory.
+
+After that, perform a reduction on the shared memory array.
+
+This would be more efficient in terms of memory access patterns.
+
+Yes, this is a better approach!
+
+Let me restructure the kernel accordingly.
+
+New plan:
+
+For each block (output element):
+
+- The block has 256 threads.
+
+- The reduction dimension has dim_size elements (e.g., 4096).
+
+- The block reads all dim_size elements into shared memory.
+
+- Each thread reads dim_size / block_size elements.
+
+- The threads write their chunks to shared memory.
+
+- Synchronize.
+
+- Then, perform a reduction on the shared memory array.
+
+This way, the global memory reads are coalesced because the threads are accessing contiguous elements along the reduction dimension.
+
+Wait, let's see:
+
+For an output element (outer, inner), the elements to read are:
+
+for pos in 0..dim_size-1:
+
+   idx = base + pos * inner_dim.
+
+These indices are spaced by inner_dim. If inner_dim is large (like 4095), then the elements are not contiguous in memory.
+
+Ah, so this approach won't help with contiguous accesses.
+
+Hmm, perhaps the only way to have contiguous accesses is if the reduction dimension is stored contiguously.
+
+In the current tensor layout, the reduction dimension may not be contiguous unless it's the last dimension.
+
+Wait, if the reduction is over the last dimension (dim=2), then the elements are contiguous. For example, for dim=2 (D2=4095), the reduction over the last dimension:
+
+For an output element (b, d1), the elements are at positions:
+
+b * D1*D2 + d1 * D2 + 0,
+
+b * D1*D2 + d1 * D2 + 1,
+
+..., up to +4094.
+
+These are contiguous in memory, so reading them sequentially would be coalesced.
+
+Thus, for reductions over the last dimension, the initial approach would have good memory access, but for other dimensions, it may not.
+
+So, the problem is that for reductions over non-last dimensions, the accesses are non-contiguous.
+
+Given that the problem allows any dimension to be reduced (as per the Model's __init__ taking a dim parameter), we need a solution that works for any dimension.
+
+Perhaps the best approach is to transpose the tensor to make the reduction dimension the last one, compute the max, then transpose back. But this would require extra memory and time for transposition.
+
+Alternatively, the kernel can be written to handle both cases, but that may complicate things.
+
+Given time constraints, perhaps proceed with the initial approach but optimize for the most common case (e.g., if the reduction is over the last dimension).
+
+Alternatively, the code can be written with the shared memory approach for all cases, even if it has non-coalesced reads, but the reduction in shared memory can help.
+
+Wait, in the shared memory approach, even if the global reads are uncoalesced, the number of reads can be reduced by having threads read their chunks into shared memory once, then perform computations on shared memory, which is faster.
+
+Thus, the revised kernel plan:
+
+Each block corresponds to an output element (outer, inner).
+
+The block size is 256.
+
+Each thread reads a portion of the dim_size elements (e.g., 16 for dim_size=4096).
+
+The threads write their chunks to shared memory.
+
+Then perform a reduction on the shared memory.
+
+This way, each thread only reads from global memory once, and subsequent reductions are in shared memory.
+
+The memory bandwidth is still an issue, but it's better than reading sequentially for each element.
+
+Let's write this kernel:
+
+Shared memory size must be at least dim_size.
+
+But for dim_size=4096 and float (4 bytes), that's 16KB, which is acceptable.
+
+The kernel code:
+
+template <typename scalar_t>
+__global__ void max_kernel(const scalar_t* __restrict__ x,
+                           scalar_t* __restrict__ out,
+                           const int64_t dim_size,
+                           const int64_t outer_dim,
+                           const int64_t inner_dim,
+                           const int64_t total_elements,
+                           const int64_t reduction_dim) {
+
+    int block_idx = blockIdx.x;
+    int thread_idx = threadIdx.x;
+
+    // Shared memory to hold all elements of the reduction dimension for this output element
+    extern __shared__ scalar_t shared_data[];
+
+    scalar_t local_max = -std::numeric_limits<scalar_t>::infinity();
+
+    // Compute the indices
+    int outer = block_idx / inner_dim;
+    int inner = block_idx % inner_dim;
+
+    int base = outer * (dim_size * inner_dim) + inner;
+
+    // Load data into shared memory
+    int elements_per_thread = (dim_size + blockDim.x - 1) / blockDim.x;
+    int start = thread_idx * elements_per_thread;
+    int end = min(start + elements_per_thread, dim_size);
+
+    // Load into shared memory
+    for (int pos = start; pos < end; pos++) {
+        int idx = base + pos * inner_dim;
+        shared_data[pos] = x[idx];
+    }
+
+    __syncthreads();
+
+    // Now perform reduction on shared_data
+    int tid = threadIdx.x;
+    int offset = blockDim.x >> 1;
+
+    for (int i = 0; i < dim_size; i += blockDim.x) {
+        int index = i + tid;
+        if (index < dim_size) {
+            local_max = max(local_max, shared_data[index]);
+        }
+    }
+
+    // Block reduction using shared memory
+    // Alternative: use a parallel reduction approach
+    for (offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) {
+            shared_data[threadIdx.x] = max(shared_data[threadIdx.x], shared_data[threadIdx.x + offset]);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        out[block_idx] = shared_data[0];
+    }
+}
+
+Wait, this approach first loads the entire dim_size elements into shared memory.
+
+The first loop for each thread loads their portion into shared_data[pos].
+
+Then, after syncthreads, each thread can process a portion of the shared memory.
+
+But perhaps a better reduction method is to use a parallel reduction on the shared_data array.
+
+Alternatively, each thread can process a portion of the array and then perform the block reduction.
+
+Wait, the code above has a loop over i which may not be needed.
+
+Alternatively, after loading all data into shared memory:
+
+Each thread processes a portion of the array, computes their local max, then do a block reduction.
+
+Like this:
+
+After loading:
+
+    __syncthreads();
+
+    // Each thread computes partial max over their section of shared_data
+    int elements_per_thread = (dim_size + blockDim.x - 1) / blockDim.x;
+    int start = thread_idx * elements_per_thread;
+    int end = min(start + elements_per_thread, dim_size);
+
+    local_max = -std::numeric_limits<scalar_t>::infinity();
+    for (int pos = start; pos < end; pos++) {
+        scalar_t val = shared_data[pos];
+        if (val > local_max) local_max = val;
+    }
+
+    __syncthreads();
+
+    // Now perform block reduction to find the max
+
+    shared_data[threadIdx.x] = local_max;
+
+    __syncthreads();
+
+    // Then perform the same reduction as before
+
+    for (int s = blockDim.x / 2; s > 0; s >>=1) {
+        if (threadIdx.x < s) {
+            shared_data[threadIdx.x] = max( shared_data[threadIdx.x], shared_data[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x ==0 ) {
+        out[block_idx] = shared_data[0];
+    }
+
+This way, after loading into shared memory, each thread computes their partial max over a portion of the array, then reduce in shared memory.
+
+This approach reduces the number of accesses to global memory (only once) and performs computations in shared memory.
+
+The initial loading into shared memory may still have uncoalesced accesses, but it's done once per block.
+
+This is better than the previous approach.
+
+Thus, this kernel would be more efficient.
+
+Now, the shared memory size must be exactly dim_size elements.
+
+Thus, the kernel must be launched with shared memory size of dim_size * sizeof(float).
+
+In the kernel launch:
+
+max_kernel<<<grid_size, block_size, shared_mem_size>>>(...);
+
+In the Python code, when dispatching the kernel:
+
+int shared_mem_size = dim_size * sizeof(scalar_t);
+
+The code would need to compute this dynamically.
+
+But in CUDA, the kernel launch syntax requires the shared memory size to be a constant or computed at kernel launch time.
+
+Thus, in the Python wrapper:
+
+auto stream = at::cuda::getCurrentCUDAStream();
+
+// Compute shared memory size
+int64_t shared_mem_bytes = dim_size * sizeof(scalar_t);
+
+AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "max_reduction_cuda", ([&] {
+    max_kernel<scalar_t><<<grid_size, block_size, shared_mem_bytes, stream>>>(
+        x.data_ptr<scalar_t>(),
+        out.data_ptr<scalar_t>(),
+        dim_size,
+        outer_dim,
+        inner_dim,
+        x.numel(),
+        dim);
+}));
+
+This requires that dim_size is known and passed correctly.
+
+Now, this approach should be better, especially for large dim_size.
+
+Now, the kernel code would be more efficient, with all data loaded into shared memory first, then processed.
+
+Potential issues:
+
+- For large dim_size, the shared memory usage could be high. For example, 4096 floats is ~16KB, which is within the limit (max shared memory per block is 49KB for many GPUs).
+
+- The loading phase may have uncoalesced accesses if the global memory addresses are non-contiguous. But since it's done once per block, it's better than multiple accesses.
+
+This seems like a better approach.
+
+Thus, I'll proceed to write the kernel code accordingly.
+
+Now, putting this all together into the Python code using load_inline.
+
+The CUDA source code would include this kernel and the wrapper.
+
+Also, the kernel uses warp-level reductions for the shared memory reduction.
+
+Wait, in the kernel code above, after loading into shared memory, the reduction is done with a block-wide reduction using shared memory.
+
+The code:
+
+After loading:
+
+Each thread computes their local_max over their chunk of the shared array.
+
+Then, store to shared memory, then reduce.
+
+Wait, the code I had earlier would need to be adjusted.
+
+Alternatively, here's the full kernel code:
+
+template <typename scalar_t>
+__global__ void max_kernel(const scalar_t* __restrict__ x,
+                           scalar_t* __restrict__ out,
+                           const int64_t dim_size,
+                           const int64_t outer_dim,
+                           const int64_t inner_dim,
+                           const int64_t reduction_dim) {
+
+    int block_idx = blockIdx.x;
+    int tid = threadIdx.x;
+
+    // Shared memory to hold all elements of the reduction dimension for this output element
+    extern __shared__ scalar_t shared_data[];
+
+    // Compute the indices for this block's output element
+    int outer = block_idx / inner_dim;
+    int inner = block_idx % inner_dim;
+
+    int base = outer * (dim_size * inner_dim) + inner;
+
+    // Load the data into shared memory
+    int elements_per_thread = (dim_size + blockDim.x - 1) / blockDim.x;
+    int start = tid * elements_per_thread;
+    int end = min(start + elements_per_thread, dim_size);
+
+    for (int pos = start; pos < end; pos++) {
+        int global_idx = base + pos * inner_dim;
+        shared_data[pos] = x[global_idx];
+    }
+
+    __syncthreads();
+
+    // Compute the max of the loaded data
+    scalar_t local_max = -std::numeric_limits<scalar_t>::infinity();
+    for (int pos = 0; pos < dim_size; pos += blockDim.x) {
+        int idx = pos + tid;
+        if (idx < dim_size) {
+            local_max = max(local_max, shared_data[idx]);
+        }
+    }
+
+    // Reduction in shared memory
+    __shared__ scalar_t sdata[blockDim.x];
+    sdata[tid] = local_max;
+    __syncthreads();
+
+    // Block reduction using parallel reduction
+    for (int s = blockDim.x / 2; s > 0; s >>=1) {
+        if (tid < s) {
+            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[block_idx] = sdata[0];
+    }
+}
+
+Wait, here's the breakdown:
+
+- The kernel uses shared memory to store all the elements of the reduction dimension for the current block's output element.
+
+- Each thread loads a portion of the global memory into shared_data.
+
+- After syncthreads, each thread computes a local_max over their portion of the shared array.
+
+- The local_max is stored in another shared array 'sdata' (size of block).
+
+- Then, a block reduction is performed on 'sdata' to find the maximum.
+
+This should work.
+
+The shared memory size must be the size needed for 'shared_data' and 'sdata'.
+
+Wait, 'shared_data' requires dim_size elements.
+
+'sdata' requires blockDim.x elements (256).
+
+Thus, the total shared memory required is dim_size * sizeof(scalar_t) + 256 * sizeof(scalar_t).
+
+But in the kernel launch, we only specify the first part, since the second is part of the kernel's declared shared arrays.
+
+Wait, no. The kernel declares 'extern __shared__ scalar_t shared_data[];', which is dynamically allocated. The 'sdata' is a static array declared within the kernel.
+
+Thus, the 'sdata' is part of the __shared__ memory allocated per block.
+
+The total shared memory needed is the size of shared_data (dim_size elements) plus the size of sdata (256 elements).
+
+Therefore, the shared memory size to allocate is:
+
+shared_mem_size = dim_size * sizeof(scalar_t) + 256 * sizeof(scalar_t);
+
+But in the kernel code, the 'sdata' is declared inside the kernel, so the total shared memory must be at least that.
+
+Thus, when launching the kernel:
+
+int shared_mem_size = (dim_size + blockDim.x) * sizeof(scalar_t);
+
+Wait, no:
+
+shared_data is allocated as extern __shared__, which is the first part. The sdata is a static array inside the kernel, which requires its own space.
+
+Alternatively, perhaps the 'sdata' should be part of the extern array.
+
+Alternatively, to simplify, the total shared memory should be:
+
+dim_size * sizeof(scalar_t) + blockDim.x * sizeof(scalar_t).
+
+Thus, in the kernel:
+
+extern __shared__ scalar_t shared_data[];
+
+// The sdata is a part of this array
+scalar_t* sdata = shared_data + dim_size;
+
+But this requires managing the shared memory allocation.
+
+Alternatively, to avoid confusion, it's better to have all shared memory variables declared as part of the extern array.
+
+Thus, modifying the kernel:
+
+extern __shared__ scalar_t smem[];
+
+// shared_data is the first part
+scalar_t* shared_data = smem;
+scalar_t* sdata = shared_data + dim_size;
+
+This way, the total shared memory required is dim_size + blockDim.x elements.
+
+Thus, when launching the kernel:
+
+shared_mem_size = (dim_size + blockDim.x) * sizeof(scalar_t);
+
+Thus, in the Python wrapper:
+
+int shared_mem_size = (dim_size + blockDim.x) * sizeof(scalar_t);
+
+But blockDim.x is fixed as 256.
+
+Thus, the code can be written with this in mind.
+
+But in the Python code, the block size is fixed to 256.
+
+Thus, the shared memory size is (dim_size + 256) * sizeof(float).
+
+This must be passed in the kernel launch.
+
+Therefore, the kernel code would need to be adjusted to use the smem array.
+
+Let me revise the kernel code accordingly:
+
+template <typename scalar_t>
+__global__ void max_kernel(const scalar_t* __restrict__ x,
+                           scalar_t* __restrict__ out,
+                           const int64_t dim_size,
+                           const int64_t outer_dim,
+                           const int64_t inner_dim) {
+
+    int block_idx = blockIdx.x;
+    int tid = threadIdx.x;
+
+    extern __shared__ scalar_t smem[];
+
+    scalar_t* shared_data = smem;
+    scalar_t* sdata = shared_data + dim_size;
+
+    // Compute the indices for this block's output element
+    int outer = block_idx / inner_dim;
+    int inner = block_idx % inner_dim;
+
+    int base = outer * (dim_size * inner_dim) + inner;
+
+    // Load the data into shared memory
+    int elements_per_thread = (dim_size + blockDim.x - 1) / blockDim.x;
+    int start = tid * elements_per_thread;
+    int end = min(start + elements_per_thread, dim_size);
+
+    for (int pos = start; pos < end; pos++) {
+        int global_idx = base + pos * inner_dim;
+        shared_data[pos] = x[global_idx];
+    }
+
+    __syncthreads();
+
+    // Compute the max of the loaded data
+    scalar_t local_max = -std::numeric_limits<scalar_t>::infinity();
+    for (int pos = 0; pos < dim_size; pos += blockDim.x) {
+        int idx = pos + tid;
+        if (idx < dim_size) {
+            local_max = max(local_max, shared_data[idx]);
+        }
+    }
+
+    // Store local_max to sdata
+    sdata[tid] = local_max;
+    __syncthreads();
+
+    // Reduction using sdata
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[block_idx] = sdata[0];
+    }
+}
+
+In this code:
+
+- The shared memory is allocated as a single array 'smem', with the first 'dim_size' elements for shared_data and the next 'blockDim.x' elements for sdata.
+
+- The shared memory size required is dim_size + blockDim.x.
+
+Thus, when launching the kernel:
+
+shared_mem_size = (dim_size + 256) * sizeof(scalar_t);
+
+This must be passed dynamically based on dim_size.
+
+Now, the Python code must calculate this and pass it when launching the kernel.
+
+Thus, the wrapper function:
+
+torch::Tensor max_reduction_cuda(torch::Tensor x, int64_t dim) {
+    auto x_size = x.sizes().vec();
+    auto output_size = x.sizes().vec();
+    output_size[dim] = 1;
+
+    // Compute outer and inner dimensions
+    int64_t outer_dim = 1;
+    for (int i = 0; i < dim; ++i) {
+        outer_dim *= x.size(i);
+    }
+    int64_t inner_dim = 1;
+    for (int i = dim + 1; i < x.dim(); ++i) {
+        inner_dim *= x.size(i);
+    }
+
+    int64_t dim_size = x.size(dim);
+    int block_size = 256;
+    int grid_size = outer_dim * inner_dim;
+
+    auto out = torch::empty(output_size, x.options());
+
+    // Compute shared memory size
+    int64_t shared_mem_size = (dim_size + block_size) * sizeof(float); // Assuming float, but need to be generic
+
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "max_reduction_cuda", ([&] {
+        int sm_size = (dim_size + block_size) * sizeof(scalar_t);
+        auto stream = at::cuda::getCurrentCUDAStream();
+        max_kernel<scalar_t><<<grid_size, block_size, sm_size, stream>>>(
+            x.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            dim_size,
+            outer_dim,
+            inner_dim
+        );
+    }));
+
+    return out.view(output_size);
+}
+
+Wait, but the kernel's parameters should include 'reduction_dim'? No, in this version, the kernel doesn't need it because the 'outer_dim' and 'inner_dim' are computed in the wrapper.
+
+Wait, the kernel now takes parameters:
+
+max_kernel<<<...>>>(x, out, dim_size, outer_dim, inner_dim)
+
+The kernel no longer needs the 'reduction_dim' because the outer and inner are computed from the wrapper.
+
+Thus, this should work.
+
+Now, testing this approach.
+
+Potential issues:
+
+- If dim_size is very large, the shared memory might exceed the maximum allowed. For example, if dim_size is 4096, shared memory needed is 4096+256 =4352 floats (17KB), which is acceptable.
+
+- The block size is fixed to 256. This may not be optimal for all cases, but it's a reasonable choice.
+
+Now, putting all this into the final code.
+
+The Python code for the ModelNew class would involve:
+
+- Loading the kernel with the source code.
+
+The CUDA source code includes the kernel and the wrapper function.
+
+The kernel code as written above.
+
+The wrapper function in C++ uses AT_DISPATCH to handle all floating point types.
+
+Now, the final code would be:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.max_kernel = load_inline(
+            name='max_reduction_cuda',
+            cpp_sources=f"""
+                torch::Tensor max_reduction_cuda(torch::Tensor x, int64_t dim);
+            """,
+            cuda_sources=f"""
+                #include <torch/extension.h>
+                #include <cuda_runtime.h>
+                #include <limits>
+
+                template <typename scalar_t>
+                __global__ void max_kernel(const scalar_t* __restrict__ x,
+                                           scalar_t* __restrict__ out,
+                                           const int64_t dim_size,
+                                           const int64_t outer_dim,
+                                           const int64_t inner_dim) {{
+                    int block_idx = blockIdx.x;
+                    int tid = threadIdx.x;
+
+                    extern __shared__ scalar_t smem[];
+                    scalar_t* shared_data = smem;
+                    scalar_t* sdata = shared_data + dim_size;
+
+                    // Compute outer and inner indices
+                    int outer = block_idx / inner_dim;
+                    int inner = block_idx % inner_dim;
+
+                    int base = outer * (dim_size * inner_dim) + inner;
+
+                    // Load data into shared memory
+                    int elements_per_thread = (dim_size + blockDim.x - 1) / blockDim.x;
+                    int start = tid * elements_per_thread;
+                    int end = min(start + elements_per_thread, dim_size);
+
+                    for (int pos = start; pos < end; ++pos) {{
+                        int global_idx = base + pos * inner_dim;
+                        shared_data[pos] = x[global_idx];
+                    }}
+
+                    __syncthreads();
+
+                    // Compute local max
+                    scalar_t local_max = -std::numeric_limits<scalar_t>::infinity();
+                    for (int pos = 0; pos < dim_size; pos += blockDim.x) {{
+                        int idx = pos + tid;
+                        if (idx < dim_size) {{
+                            local_max = max(local_max, shared_data[idx]);
+                        }}
+                    }}
+
+                    // Store to sdata
+                    sdata[tid] = local_max;
+                    __syncthreads();
+
+                    // Block reduction
+                    for (int s = blockDim.x / 2; s > 0; s >>= 1) {{
+                        if (tid < s) {{
+                            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+                        }}
+                        __syncthreads();
+                    }}
+
+                    if (tid == 0) {{
+                        out[block_idx] = sdata[0];
+                    }}
+                }}
+
+                torch::Tensor max_reduction_cuda(torch::Tensor x, int64_t dim) {{
+                    auto x_size = x.sizes().vec();
+                    auto output_size = x.sizes().vec();
+                    output_size[dim] = 1;
+
+                    int64_t outer_dim = 1;
+                    for (int i = 0; i < dim; ++i) {{
+                        outer_dim *= x.size(i);
+                    }}
+                    int64_t inner_dim = 1;
+                    for (int i = dim + 1; i < x.dim(); ++i) {{
+                        inner_dim *= x.size(i);
+                    }}
+
+                    int64_t dim_size = x.size(dim);
+                    int block_size = 256;
+                    int grid_size = outer_dim * inner_dim;
+
+                    auto out = torch::empty(output_size, x.options());
+
+                    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "max_reduction_cuda", ([&] {{
+                        int sm_size = (dim_size + block_size) * sizeof(scalar_t);
+                        auto stream = at::cuda::getCurrentCUDAStream();
+                        max_kernel<scalar_t><<<grid_size, block_size, sm_size, stream>>>(
+                            x.data_ptr<scalar_t>(),
+                            out.data_ptr<scalar_t>(),
+                            dim_size,
+                            outer_dim,
+                            inner_dim
+                        );
+                    }}));
+
+                    return out.view(output_size);
+                }}
+            """,
+            functions=['max_reduction_cuda'],
+            verbose=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.max_kernel.max_reduction_cuda(x, self.dim).squeeze(self.dim)
+
+```
+
+Wait, but in the kernel launch parameters, the 'reduction_dim' is not passed. The kernel now takes 'dim_size', 'outer_dim', and 'inner_dim' as parameters.
+
+This should work.
+
+Now, testing edge cases:
+
+- If dim is the last dimension, the kernel should handle it efficiently.
+
+- For small dim_size, the shared memory allocation would still work.
+
+Potential issues with the code:
+
+- The 'inner_dim' calculation for the kernel's 'inner_dim' parameter must be correct.
+
+- The 'base' calculation must be correct for all dimensions.
+
+- The shared memory allocation must account for the required size.
+
+This code should be correct and efficient given the problem constraints.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.max_kernel = load_inline(
+            name='max_reduction_cuda',
+            cpp_sources=f"""
+                torch::Tensor max_reduction_cuda(torch::Tensor x, int64_t dim);
+            """,
+            cuda_sources=f"""
+                #include <torch/extension.h>
+                #include <cuda_runtime.h>
+                #include <limits>
+
+                template <typename scalar_t>
+                __global__ void max_kernel(const scalar_t* __restrict__ x,
+                                           scalar_t* __restrict__ out,
+                                           const int64_t dim_size,
+                                           const int64_t outer_dim,
+                                           const int64_t inner_dim) {{
+                    int block_idx = blockIdx.x;
+                    int tid = threadIdx.x;
+
+                    extern __shared__ scalar_t smem[];
+                    scalar_t* shared_data = smem;
+                    scalar_t* sdata = shared_data + dim_size;
+
+                    // Compute outer and inner indices
+                    int outer = block_idx / inner_dim;
+                    int inner = block_idx % inner_dim;
+
+                    int base = outer * (dim_size * inner_dim) + inner;
+
+                    // Load data into shared memory
+                    int elements_per_thread = (dim_size + blockDim.x - 1) / blockDim.x;
+                    int start = tid * elements_per_thread;
+                    int end = min(start + elements_per_thread, dim_size);
+
+                    for (int pos = start; pos < end; ++pos) {{
+                        int global_idx = base + pos * inner_dim;
+                        shared_data[pos] = x[global_idx];
+                    }}
+
+                    __syncthreads();
+
+                    // Compute local max
+                    scalar_t local_max = -std::numeric_limits<scalar_t>::infinity();
+                    for (int pos = 0; pos < dim_size; pos += blockDim.x) {{
+                        int idx = pos + tid;
+                        if (idx < dim_size) {{
+                            local_max = max(local_max, shared_data[idx]);
+                        }}
+                    }}
+
+                    // Store to sdata
+                    sdata[tid] = local_max;
+                    __syncthreads();
+
+                    // Block reduction
+                    for (int s = blockDim.x / 2; s > 0; s >>= 1) {{
+                        if (tid < s) {{
+                            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+                        }}
+                        __syncthreads();
+                    }}
+
+                    if (tid == 0) {{
+                        out[block_idx] = sdata[0];
+                    }}
+                }}
+
+                torch::Tensor max_reduction_cuda(torch::Tensor x, int64_t dim) {{
+                    auto x_size = x.sizes().vec();
+                    auto output_size = x.sizes().vec();
+                    output_size[dim] = 1;
+
+                    int64_t outer_dim = 1;
+                    for (int i = 0; i < dim; ++i) {{
+                        outer_dim *= x.size(i);
+                    }}
+                    int64_t inner_dim = 1;
+                    for (int i = dim + 1; i < x.dim(); ++i) {{
+                        inner_dim *= x.size(i);
+                    }}
+
+                    int64_t dim_size = x.size(dim);
+                    int block_size = 256;
+                    int grid_size = outer_dim * inner_dim;
+
+                    auto out = torch::empty(output_size, x.options());
+
+                    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "max_reduction_cuda", ([&] {{
+                        int sm_size = (dim_size + block_size) * sizeof(scalar_t);
+                        auto stream = at::cuda::getCurrentCUDAStream();
+                        max_kernel<scalar_t><<<grid_size, block_size, sm_size, stream>>>(
+                            x.data_ptr<scalar_t>(),
+                            out.data_ptr<scalar_t>(),
+                            dim_size,
+                            outer_dim,
+                            inner_dim
+                        );
+                    }}));
+
+                    return out.view(output_size);
+                }}
+            """,
+            functions=['max_reduction_cuda'],
+            verbose=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.max_kernel.max_reduction_cuda(x, self.dim).squeeze(self.dim)
+
+```

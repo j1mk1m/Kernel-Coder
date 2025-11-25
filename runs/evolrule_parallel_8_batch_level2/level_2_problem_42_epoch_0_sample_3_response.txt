@@ -1,0 +1,892 @@
+Note: when you choose operators to optimize, make sure you can implement them. For example, implementing a custom conv2d may be too complicated, but fusion of simple operations like addition and multiplication is reasonable. Let me think step by step.
+
+Okay, I need to optimize the given Model's forward pass using custom CUDA kernels. Let me look at the architecture again.
+
+The model has several operations in sequence:
+
+1. ConvTranspose2d (transposed convolution)
+2. Global average pooling (mean over spatial dimensions)
+3. Add a bias term
+4. Apply log-sum-exp over channels
+5. Sum over the remaining spatial dimensions
+6. Multiply by 10.0
+
+The user's example replaced a simple addition with a CUDA kernel. Since writing a custom ConvTranspose2d might be too complex, I should focus on the other operations which are simpler.
+
+Looking at the steps after the convolution:
+
+- The global average pooling (mean over 2 and 3 dimensions)
+- Adding the bias
+- Log-sum-exp over dim 1
+- Sum over dims 2 and 3
+- Multiply by scalar.
+
+Perhaps I can fuse some of these operations into a single kernel to reduce memory traffic and launch overhead. Let me see.
+
+First, the convolution is a big operation. Since replacing that might be too involved, maybe leave it as is. The rest can be fused.
+
+Starting from the output of the convolution, which is a tensor of shape (batch, out_channels, H', W'). Then:
+
+- Global average pooling reduces H' and W' to 1, so after that the tensor is (batch, out_channels, 1, 1).
+
+- Adding the bias (shape (out_channels, 1, 1)) would just be element-wise addition over the channels.
+
+- Then log-sum-exp over dim 1 (the channel dimension) would produce a (batch, 1, 1, 1) tensor.
+
+- Summing over the last two dimensions (which are 1x1) would collapse them, so the tensor becomes (batch, 1).
+
+- Multiply by 10.0.
+
+These steps after the convolution can be combined into a single kernel.
+
+So, the plan is to write a CUDA kernel that takes the output of the transposed convolution (which is a tensor of shape (batch, out_channels, H', W')), then does the following in a single step:
+
+1. Compute the mean over spatial dimensions (H', W') for each channel and batch. This gives (batch, out_channels, 1, 1).
+
+2. Add the bias (which is already per channel).
+
+3. Compute log-sum-exp over the channels (dim=1). The log-sum-exp is log( sum(exp(x)) ), so for each batch, over the channels, compute the sum of exponentials, then log.
+
+Wait, but log-sum-exp is applied over dim=1 (channels). Let me check the original code:
+
+Original steps:
+
+x = torch.mean(x, dim=(2,3), keepdim=True) → (batch, out_channels, 1, 1)
+
+x = x + self.bias → (same shape, since bias is (out_channels,1,1))
+
+Then x = torch.logsumexp(x, dim=1, keepdim=True) → (batch,1,1,1)
+
+Then sum over (2,3) → which are 1, so it becomes (batch,1). Then multiply by 10.
+
+Hmm, perhaps the logsumexp is over the channel dimension, then the remaining dimensions are summed. But maybe we can combine those steps.
+
+Alternatively, let's see:
+
+After adding the bias, each element in the (batch, out_channels, 1, 1) tensor is a scalar per channel. The logsumexp over dim=1 will compute log( sum(exp(x[:,c,:,:])) over c ).
+
+So for each batch, we compute log( sum_{c} exp(x[c]) ), where x[c] is the value for channel c. Then, after that, the remaining dimensions are 1,1, so sum over them (which does nothing) and multiply by 10.
+
+Wait the sum over (2,3) after logsumexp would actually be redundant since those dimensions are already 1. So perhaps the sum is unnecessary here, but in the original code, maybe it's just to make sure the tensor is 2D? Let me check:
+
+The logsumexp result is (batch, 1, 1, 1). Summing over dim 2 and 3 (indices 2 and 3) would collapse those dimensions, resulting in (batch, 1). Then multiply by 10 gives a (batch, 1) tensor.
+
+So combining all those steps after the convolution into a single kernel would be beneficial. The idea is to take the output of the convolution, compute the mean over spatial dimensions, add bias, compute logsumexp over channels, sum over the remaining spatial (but they're 1), then multiply by 10.
+
+Wait, but the steps after the convolution can be done in a fused kernel. Let me outline the steps:
+
+Given the convolution output (B, C, H', W'):
+
+1. Compute mean over H' and W' → gives (B, C, 1, 1)
+
+2. Add bias (C,1,1) → (B,C,1,1)
+
+3. Compute logsumexp over C → (B,1,1,1)
+
+4. Sum over (H', W') (but they are 1, so just squeeze) → (B,1)
+
+5. Multiply by 10 → (B,1)
+
+So, the main operations to fuse are steps 1-5.
+
+But let's see if we can combine steps 1-3 in a single kernel, then steps 4 and 5 are trivial (sum over 1's and multiply). Alternatively, maybe even combine all steps into one.
+
+But perhaps the most computationally heavy steps here are the mean and logsumexp.
+
+Wait the mean is just averaging over spatial dimensions. For each channel in each batch, the mean is the average over H' * W' elements. That's O(H' W' C B) computation, but for H' and W' being 512 (if the transposed convolution's output is same as input? Wait, let me check the input dimensions.
+
+Wait the input to the model is given as:
+
+get_inputs returns [torch.rand(batch_size, in_channels, height, width)] where height and width are 512. The convolution is a transposed convolution with kernel_size 3. Let me think about the output size of the transposed convolution.
+
+The formula for output size in transposed convolutions can be a bit tricky, but for a kernel size of 3, stride 1 (assuming default stride?), padding 0, the output spatial dimensions would be:
+
+For a 2D transposed conv, the output H' is H_in * stride - 2*padding + kernel_size. But I might be misremembering. Since the user didn't specify stride or padding, it's possible that the default parameters (stride=1, padding=0) are used. So if the input is 512x512, then with kernel_size 3, the output would be (512 -1)*stride + kernel_size, but maybe I need not calculate that exactly. However, the exact dimensions might not matter for the kernel.
+
+The key is that the mean over H' and W' requires summing over H' * W' elements per channel per batch. So for each batch and channel, the mean is sum over all spatial elements divided by (H'*W').
+
+The logsumexp over channels requires, for each batch, computing log( sum_{c} exp( (mean_val_c + bias_c) ) )
+
+Wait, the logsumexp is applied over dim=1 (the channel dimension). So for each element in the batch, the logsumexp is over the channels. The result is a single value per batch.
+
+So, steps 1-3 can be combined into a single kernel:
+
+1. For each batch, for each channel, compute the mean over H' and W' (spatial dimensions). Let's call this value m_c for channel c.
+
+2. Add the bias (b_c) to each m_c, getting m_c + b_c.
+
+3. Compute log( sum_{c} exp(m_c + b_c) )
+
+So the output after step 3 is a scalar per batch (since we're summing over all channels). Wait, but the logsumexp over channels would produce a (batch, 1, 1, 1) tensor. The subsequent steps are sum over those 1's and multiply.
+
+Therefore, the entire process after convolution can be done in three steps:
+
+- Compute the spatial mean and add bias (this is per channel, so O(B*C*H'*W')) but maybe that's too much.
+
+Wait, but the spatial mean requires for each channel in each batch, summing over all spatial elements. That's H'*W' elements per channel per batch. For 512x512, that's 262,144 elements per channel. For 128 channels and 16 batches, that's 16*128*262144 = huge number. That might be computationally expensive. However, perhaps using a kernel that can compute this efficiently.
+
+Alternatively, perhaps it's better to first compute the spatial mean for each channel, then proceed.
+
+Alternatively, maybe the logsumexp can be fused with the spatial mean and bias addition.
+
+Hmm, maybe it's better to split the operations into two steps:
+
+First, compute the spatial mean over H' and W' for each channel and batch. That's step 1. Then, adding the bias is per channel, so that's easy. Then compute logsumexp over channels.
+
+So the main computations are:
+
+Compute the mean over H' and W' for each (batch, channel).
+
+Then compute logsumexp over channels for each batch.
+
+Then multiply by 10.
+
+The problem is that the first step (computing the mean over H' and W') is O(B*C*H'W'), which could be expensive. However, if H' and W' are large (like 512x512), then it's a lot of computation.
+
+Alternatively, perhaps the convolution output is stored in a contiguous array, and we can compute the mean efficiently.
+
+Alternatively, maybe the spatial mean can be computed as a reduction over the spatial dimensions. But that's still a lot of work.
+
+Alternatively, perhaps we can write a kernel that for each batch, and each channel, accumulates the sum over all spatial elements, then divides by (H'W').
+
+Wait, but that's exactly the mean. So, for each (batch, channel), we need the sum over (h, w) of x[b, c, h, w], then divide by H'W'.
+
+So the first step is to compute for each (b, c) the sum over the spatial dimensions. Then divide by (H'W'), add the bias, then compute logsumexp over c for each b.
+
+But how to compute the sum efficiently.
+
+This could be done with a CUDA kernel that for each spatial element, accumulates into the per-channel sum.
+
+Alternatively, since the transposed convolution's output is a tensor, perhaps using built-in reduction functions like .mean() is already optimized, but maybe combining steps can save time.
+
+Alternatively, perhaps the logsumexp can be computed as log( sum(exp(mean + bias)) ), so after getting the mean and adding bias, the logsumexp is a reduction over the channel dimension.
+
+Hmm. Maybe the key is to combine the spatial mean and the logsumexp steps into a single kernel to avoid intermediate memory copies.
+
+Let me think of the steps:
+
+The plan is to write a CUDA kernel that takes the convolution output tensor (B, C, H', W'), and returns the final result (B, 1).
+
+The steps inside the kernel would be:
+
+For each batch in B:
+
+   For each channel in C:
+
+      Compute the sum over all spatial elements (h,w) of x[b, c, h, w]
+
+      (Store this in a per-channel sum)
+
+   Compute the mean for each channel: sum / (H' * W')
+
+   Add the bias (which is a parameter, so stored as a tensor)
+
+   Then compute the exponentials of (mean + bias) for each channel.
+
+   Sum all these exponentials across channels.
+
+   Take the log of that sum → gives the logsumexp value for the batch.
+
+   Multiply by 10.0
+
+   Store the result in the output tensor for that batch.
+
+So, the main steps are:
+
+1. Compute per-channel spatial sums (sum over H' and W').
+
+2. Compute mean (sum / (H'W')), add bias.
+
+3. Compute exp(mean + bias) for each channel, then sum over all channels.
+
+4. log the sum and multiply by 10.
+
+This can be done in a single kernel, but the per-channel sum requires some synchronization or atomic operations.
+
+Alternatively, we can structure the kernel to compute the per-channel sums first, then proceed.
+
+Let me think in terms of kernel design.
+
+First, to compute the per-channel sums for all batches and channels:
+
+The input tensor is of shape (B, C, H', W'). Let's assume it's stored in a contiguous format.
+
+We can launch a kernel where each thread handles a spatial element (h, w), and for each batch and channel, accumulate into a per-channel sum.
+
+Alternatively, the per-channel sum can be computed as a reduction over the spatial dimensions.
+
+Perhaps the best way is to first compute the spatial sums for each (batch, channel) pair. For that, we can launch a kernel that:
+
+- For each element (b, c, h, w), add x[b,c,h,w] to the sum for (b,c).
+
+This can be done with a 4D grid, but that might be overkill. Alternatively, use a tiled approach.
+
+Alternatively, for each batch, loop over all channels and spatial elements.
+
+But maybe a better approach is to use a kernel that for each spatial position (h,w), and each batch, and each channel, adds to the per-channel sum.
+
+Wait, perhaps we can structure it as:
+
+The total number of batches is B.
+
+The number of channels is C.
+
+The spatial dimensions are H' and W'.
+
+We can have each thread block handle a single (batch, channel) pair, and each thread in the block handles a spatial element.
+
+Wait, but that might require too many blocks. Let me see.
+
+Suppose we have:
+
+Each block handles a single (batch, channel). The block has (H' * W') threads, but that might be too much. Alternatively, split into blocks per batch and per spatial element?
+
+Alternatively, perhaps use a grid where each block is responsible for a batch and a spatial position (h,w), and each thread in the block handles a channel.
+
+Wait, this is getting complicated. Maybe using a tiled approach.
+
+Alternatively, use a 2D grid where each block handles a batch and a channel, and then each thread in the block computes a portion of the spatial elements.
+
+Alternatively, perhaps using shared memory for the sums per block. Hmm, this is getting complex.
+
+Alternatively, use a kernel that for each (b, c), loops over all h and w and accumulates the sum.
+
+But with 16 batches and 128 channels, that's 16*128=2048 threads, each needing to loop over 512*512 elements. That would be 512*512=262,144 iterations per thread, which is way too much.
+
+That's not feasible.
+
+Hmm, so that approach is not going to work. Maybe a better way is needed.
+
+Alternative idea: The spatial dimensions can be processed in parallel. For each element (h,w), across all batches and channels, accumulate into their respective (b,c) sums.
+
+Each thread could handle a (h, w) position, and loop over batches and channels.
+
+But even so, for 512x512 spatial elements, that's 262,144 threads, which is too many (since maximum threads per block is 1024). So perhaps this isn't feasible either.
+
+Hmm, perhaps I need to use a reduction approach. For each (b,c), the sum over h,w is the sum of all elements in the 2D spatial array. So we can perform a reduction over h and w for each (b,c).
+
+To compute that efficiently, perhaps use a kernel that for each (b,c) pair, uses a tiled reduction over the spatial dimensions.
+
+Alternatively, use a grid where each block handles a (b,c) pair, and within the block, the spatial elements are divided among threads to compute the sum.
+
+Let me think of this structure:
+
+Each block corresponds to a (b, c) pair.
+
+Each block has a number of threads (say, 256).
+
+Each thread in the block processes a portion of the spatial elements (h,w).
+
+The block computes the sum of x[b,c,h,w] over all h and w.
+
+The block's threads can cooperate using shared memory to accumulate partial sums.
+
+Once each block has computed its (b,c) sum, then we can proceed.
+
+The problem is that for 16*128=2048 blocks, the grid size would be 2048, which may be manageable.
+
+The spatial dimensions H' and W' are 512 each. So for each block (handling one (b,c)), the total spatial elements are 512*512 = 262,144. To process this in a block of 256 threads, each thread would need to process 262144 / 256 = ~1024 elements. That's manageable.
+
+So here's the plan for the per-channel spatial sum kernel:
+
+Kernel 1: Compute spatial sums for each (b, c):
+
+- Each block is assigned to a (b, c) pair.
+
+- The block reads the slice of the input tensor for (b,c,:,:), which is a 512x512 matrix.
+
+- Each thread in the block processes a portion of this matrix to compute the sum.
+
+- The block uses shared memory to accumulate partial sums, then writes the total to an output array (sums[b,c]).
+
+Once we have the sums, then the next steps are:
+
+sums[b,c] / (H'*W') → mean.
+
+Then mean + bias[c,0,0] → since the bias is (out_channels,1,1), so for each c, the bias is a scalar.
+
+Then compute exp(mean + bias) for each (b,c).
+
+Then sum over c for each b → sum_c exp(mean + bias).
+
+Take log of that sum, multiply by 10 → result[b,0].
+
+These steps can be done in subsequent kernels or within the same kernel.
+
+Alternatively, after the first kernel, we can process the rest in a second kernel.
+
+But let's see.
+
+The first kernel computes the per (b,c) sums.
+
+Then, we can have a second kernel that takes these sums, and for each batch, compute:
+
+For each batch b:
+
+   temp = 0.0
+
+   for c in 0..C-1:
+
+       mean_bc = sums[b,c] / (H' * W')
+
+       temp += exp( mean_bc + bias[c] )
+
+   log_temp = log(temp)
+
+   result[b] = log_temp * 10.0
+
+But this second kernel would need to process each batch in parallel. Since there are only 16 batches, this is feasible.
+
+Alternatively, in a single kernel:
+
+Each block handles a batch.
+
+Each thread in the block handles a channel.
+
+Compute the mean, add bias, compute exponential, accumulate into a sum for the batch.
+
+Then compute the log and multiply.
+
+Wait, let's think of the second kernel:
+
+Input: the sums array (B, C), the bias (C), H, W.
+
+Output: a tensor of size B, 1 (after multiplying by 10).
+
+Each block can process a single batch.
+
+Within the block, each thread handles a channel.
+
+For each batch:
+
+   Initialize a partial sum (like in shared memory).
+
+   Each thread c in the block:
+
+      mean_bc = sums[b][c] / (H*W)
+
+      exp_val = exp( mean_bc + bias[c] )
+
+      atomicAdd to the partial sum (but need to use atomic operations or use a reduction).
+
+Alternatively, each block (per batch) processes all C channels, and uses a reduction within the block to compute the sum of exp terms.
+
+Let me outline the second kernel steps:
+
+Kernel 2 (per batch):
+
+- Each block is assigned to a batch.
+
+- The block has enough threads (e.g., 128 threads for 128 channels).
+
+- The block loads the sums for this batch (sums[b, :]).
+
+- Each thread handles a channel c (from 0 to C-1):
+
+   compute mean_bc = sums[b][c] / (H*W)
+
+   add bias[c]
+
+   compute exp_val = exp(mean_bc + bias[c])
+
+   accumulate into a shared memory array.
+
+- Then perform a reduction in shared memory to sum all exp_val's for the batch.
+
+- Compute log of the total sum.
+
+- Multiply by 10 and store in the output for this batch.
+
+This way, the kernel can efficiently compute the logsumexp and the final step.
+
+So the overall plan is:
+
+1. ConvTranspose2d (no change).
+
+2. Compute the spatial sums for each (b,c) using a custom kernel (Kernel 1).
+
+3. Compute the logsumexp and final steps using Kernel 2.
+
+This combines multiple steps into two custom kernels, avoiding the need to materialize intermediate tensors like the mean and adding bias, thus reducing memory usage and launch overhead.
+
+Now, I need to write these kernels.
+
+First, the first kernel: compute the spatial sums.
+
+The input tensor is (B, C, H, W).
+
+The output is a (B, C) tensor of sums.
+
+The kernel for this:
+
+Each block handles a (b, c). The block's index can be calculated as blockIdx.x * gridDim.y + blockIdx.y, but perhaps better to have gridDim.x = B and gridDim.y = C, so each block is (blockIdx.x, blockIdx.y) → (b,c).
+
+The block's threads process the spatial elements.
+
+Let me structure the kernel as follows:
+
+__global__ void spatial_sum_kernel(
+    const float* input,  // shape (B, C, H, W)
+    float* sums,         // shape (B, C)
+    int B, int C, int H, int W
+) {
+    // blockIdx.x = b, blockIdx.y = c
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+
+    // Each block processes one (b,c). Each thread in the block processes a portion of H*W.
+
+    int total_elements = H * W;
+    int tid = threadIdx.x;
+
+    float local_sum = 0.0f;
+
+    for (int i = tid; i < total_elements; i += blockDim.x) {
+        // compute h and w from i
+        int h = i / W;
+        int w = i % W;
+        // calculate the input index: input is stored in B,C,H,W order
+        int idx = ((b * C + c) * H + h) * W + w;
+        local_sum += input[idx];
+    }
+
+    // Use shared memory to reduce within the block
+    __shared__ float shared_sum[256];  // Assuming block size is 256 or less
+    shared_sum[threadIdx.x] = local_sum;
+
+    __syncthreads();
+
+    // Perform reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        sums[b * C + c] = shared_sum[0];
+    }
+}
+
+This kernel uses a 1D grid where each block is (b,c), but actually, the grid dimensions would need to be B*C. Wait, the blockIdx.x would be the block index, but we need to map blockIdx to (b,c). So perhaps better to have gridDim.x = B * C, and blockIdx.x is the linear index. Then:
+
+int bc = blockIdx.x;
+int b = bc / C;
+int c = bc % C;
+
+But that's okay.
+
+The block dimension (number of threads per block) can be chosen, say 256.
+
+The input tensor must be contiguous in memory. Assuming that the input tensor is contiguous (which it should be as a result of the convolution), the indexing is straightforward.
+
+The sums array is a 1D array of size B*C.
+
+Now the second kernel:
+
+Kernel 2: takes the sums array, the bias array (size C), and computes for each batch b the logsumexp over channels.
+
+The steps:
+
+For each batch b:
+
+   total = 0.0
+
+   for each c in 0..C-1:
+
+       mean = sums[b*C + c] / (H*W)
+
+       val = mean + bias[c]
+
+       exp_val = exp(val)
+
+       total += exp_val
+
+   log_total = log(total)
+
+   result[b] = log_total * 10.0
+
+The kernel can be structured as:
+
+__global__ void logsumexp_final_kernel(
+    const float* sums,
+    const float* bias,
+    float* output,
+    int B, int C, int H, int W
+) {
+    // blockIdx.x is the batch index
+    int b = blockIdx.x;
+
+    // Each block handles a batch. Each thread handles a channel.
+
+    __shared__ float shared_sum[128];  // assuming C <= 128, but can adjust.
+
+    float total = 0.0f;
+
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        int idx = b * C + c;
+        float mean = sums[idx] / (H * W);
+        float val = mean + bias[c];
+        float exp_val = expf(val);
+        atomicAdd(&total, exp_val);
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float log_total = logf(total);
+        output[b] = log_total * 10.0f;
+    }
+}
+
+Wait, but using atomicAdd here could be problematic if multiple threads are writing to 'total'. Alternatively, use a reduction within the block.
+
+Wait, in the current setup, each thread c in the block is processing a channel. The total needs to be summed across all channels for the batch. So perhaps better to use a reduction within the block.
+
+Let me restructure:
+
+Each block processes a batch. The block has enough threads to handle all channels (or use a larger block size and loop).
+
+Wait, let me think of the kernel as:
+
+Each block is a batch. The block has, say, 256 threads.
+
+Each thread handles a channel c, but only up to C.
+
+Compute for each c, exp(mean + bias[c]), store in shared memory.
+
+Then perform a reduction in shared memory to get the total.
+
+Then compute log and multiply.
+
+So:
+
+__global__ void logsumexp_final_kernel(
+    const float* sums,
+    const float* bias,
+    float* output,
+    int B, int C, int H, int W
+) {
+    int b = blockIdx.x;
+
+    __shared__ float shared_vals[256];  // Assuming C <= 256
+
+    float local_val = 0.0f;
+
+    // Each thread processes a channel
+    int c = threadIdx.x;
+    if (c < C) {
+        int idx = b * C + c;
+        float mean = sums[idx] / (H * W);
+        float val = mean + bias[c];
+        local_val = expf(val);
+    }
+
+    shared_vals[threadIdx.x] = (c < C) ? local_val : 0.0f;
+    __syncthreads();
+
+    // Now perform reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared_vals[threadIdx.x] += shared_vals[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float total = shared_vals[0];
+        float log_total = logf(total);
+        output[b] = log_total * 10.0f;
+    }
+}
+
+This assumes that the block size is at least the maximum of C and 256 (or adjust the shared array size). Let's say the block size is 256, and C is 128, then it works.
+
+Now, putting this all together into the ModelNew.
+
+The steps in the forward function would be:
+
+1. Run the convolution.
+
+2. Get the output tensor from the convolution (x).
+
+3. Compute the spatial sums using the first kernel.
+
+4. Compute the logsumexp and final steps using the second kernel.
+
+The ModelNew class will need to have these kernels compiled.
+
+Now, in the Python code:
+
+We need to define both kernels as inline CUDA code.
+
+First, the spatial_sum_kernel.
+
+The first kernel requires the input tensor (B,C,H,W), the output tensor (B,C), and parameters B, C, H, W.
+
+But in PyTorch, the input tensor shape can be obtained via x.shape.
+
+Wait, in the forward function, after the convolution, the output is x. The shape is (B, C, H', W'). So the H and W here are H' and W'.
+
+Wait, the kernel must know H and W (the spatial dimensions of the convolution output). These can be obtained at runtime from x.size(2) and x.size(3).
+
+But when defining the CUDA kernel in PyTorch, the kernel parameters must be passed as arguments. So in the kernel call, we can pass the H and W from the input tensor.
+
+So, the steps in the forward function would be:
+
+def forward(self, x):
+
+    x = self.conv_transpose(x)
+
+    # Compute spatial sums
+
+    B = x.size(0)
+
+    C = x.size(1)
+
+    H = x.size(2)
+
+    W = x.size(3)
+
+    # Create output tensors
+
+    # sums is shape (B, C)
+
+    sums = torch.zeros(B*C, dtype=x.dtype, device=x.device)
+
+    # Launch spatial_sum_kernel
+
+    block_size = 256  # threads per block
+
+    grid_size = B * C  # each block is for a (b,c) pair
+
+    spatial_sum_kernel <<< grid_size, block_size >>> (x.data_ptr(), sums.data_ptr(), B, C, H, W)
+
+    # Wait for kernel to finish?
+
+    # Then compute the logsumexp step
+
+    # Create output tensor for final result (B, 1)
+
+    output = torch.zeros(B, 1, dtype=x.dtype, device=x.device)
+
+    # Launch logsumexp_final_kernel
+
+    block_size2 = 256
+
+    grid_size2 = B
+
+    logsumexp_final_kernel <<< grid_size2, block_size2 >>> (sums.data_ptr(), self.bias.data_ptr(), output.data_ptr(), B, C, H, W)
+
+    return output
+
+Wait, but in PyTorch, we need to use the load_inline function to compile the CUDA kernels.
+
+Thus, in the Python code:
+
+We need to define both kernels as strings, then load them.
+
+So, the code structure would be:
+
+First, write the CUDA code for the two kernels.
+
+Then, define the ModelNew class, which has the conv_transpose and bias parameters, and the compiled kernels.
+
+Putting it all together:
+
+Here's the plan for the Python code:
+
+Import statements, then:
+
+Define the two CUDA kernels as strings.
+
+Then, compile them using load_inline.
+
+Then, in the ModelNew's forward function, call these kernels with appropriate parameters.
+
+Now, let's write the CUDA code for the two kernels.
+
+First, spatial_sum_kernel:
+
+The CUDA code for the first kernel:
+
+elementwise_add_source in the example was a string with the kernel code.
+
+So, here:
+
+First kernel's code:
+
+spatial_sum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void spatial_sum_kernel(
+    const float* input,  // shape (B, C, H, W)
+    float* sums,         // shape (B*C)
+    int B, int C, int H, int W
+) {
+    int bc = blockIdx.x;
+    int b = bc / C;
+    int c = bc % C;
+
+    int tid = threadIdx.x;
+
+    float local_sum = 0.0f;
+
+    int total_elements = H * W;
+
+    for (int i = tid; i < total_elements; i += blockDim.x) {
+        int h = i / W;
+        int w = i % W;
+        int idx = ((b * C + c) * H + h) * W + w;
+        local_sum += input[idx];
+    }
+
+    __shared__ float shared_sum[256];
+    shared_sum[threadIdx.x] = local_sum;
+
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        sums[bc] = shared_sum[0];
+    }
+}
+"""
+
+Wait, the block index is blockIdx.x, which is the linear index bc. So bc = blockIdx.x.
+
+But the grid size is B*C, so each block handles a (b,c).
+
+Then, the sums array is of size B*C, so sums[bc] = sums[b*C + c].
+
+Yes.
+
+Then the second kernel's code:
+
+logsumexp_final_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void logsumexp_final_kernel(
+    const float* sums,  // shape (B*C)
+    const float* bias,  // shape (C)
+    float* output,      // shape (B)
+    int B, int C, int H, int W
+) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float shared_vals[256];
+
+    float local_val = 0.0f;
+
+    int c = tid;
+    if (c < C) {
+        int idx = b * C + c;
+        float mean = sums[idx] / (H * W);
+        float val = mean + bias[c];
+        local_val = expf(val);
+    }
+
+    shared_vals[tid] = (c < C) ? local_val : 0.0f;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_vals[tid] += shared_vals[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total = shared_vals[0];
+        float log_total = logf(total);
+        output[b] = log_total * 10.0f;
+    }
+}
+"""
+
+Wait, but the output tensor is of shape (B, 1), so when storing, we have to set output[b] (assuming output is a 1D tensor) or if output is 2D, then output[b][0] = ... So in the code, perhaps the output is a 1D tensor of size B, and then reshape or view it as (B,1).
+
+Alternatively, in the Python code, the output can be initialized as a 1D tensor, then we can reshape it.
+
+Now, compiling these kernels with load_inline.
+
+But each kernel needs to be compiled as a separate function.
+
+Wait, the load_inline function can include multiple kernels, but the functions must be declared properly.
+
+Alternatively, perhaps define two separate inline CUDA extensions.
+
+Alternatively, combine both kernels into one compilation.
+
+Wait, in the example, they had a single kernel and a single function.
+
+In this case, we have two kernels, so need to have two functions.
+
+Alternatively, define both kernels in the same CUDA source, and then expose two functions.
+
+So the combined source code for both kernels:
+
+combined_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void spatial_sum_kernel(
+    const float* input,  // shape (B, C, H, W)
+    float* sums,         // shape (B*C)
+    int B, int C, int H, int W
+) {
+    int bc = blockIdx.x;
+    int b = bc / C;
+    int c = bc % C;
+
+    int tid = threadIdx.x;
+
+    float local_sum = 0.0f;
+
+    int total_elements = H * W;
+
+    for (int i = tid; i < total_elements; i += blockDim.x) {
+        int h = i / W;
+        int w = i % W;
+        int idx = ((b * C + c) * H + h) * W + w;
+        local_sum += input[idx];
+    }
+
+    __shared__ float shared_sum[256];
+    shared_sum[threadIdx.x] = local_sum;
+
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        sums[bc] = shared_sum[0];
+    }
+}
+
+__global__ void logsumexp_final_kernel(
+    const float* sums,  // shape (B*C)
+    const float* bias,  // shape (C)
+    float* output,      // shape (B)
+    int B, int C, int H, int W
+) {
+    int b = blockIdx.x;
+   

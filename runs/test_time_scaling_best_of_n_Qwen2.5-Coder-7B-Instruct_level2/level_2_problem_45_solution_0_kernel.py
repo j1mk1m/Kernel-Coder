@@ -1,0 +1,171 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Gemm
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 16;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    gemm_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for Gemm
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Sigmoid
+sigmoid_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void sigmoid_kernel(const float* x, float* y, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        y[idx] = 1.0f / (1.0f + exp(-x[idx]));
+    }
+}
+
+torch::Tensor sigmoid_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    sigmoid_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+
+    return y;
+}
+"""
+
+sigmoid_cpp_source = (
+    "torch::Tensor sigmoid_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for Sigmoid
+sigmoid = load_inline(
+    name="sigmoid",
+    cpp_sources=sigmoid_cpp_source,
+    cuda_sources=sigmoid_source,
+    functions=["sigmoid_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for LogSumExp
+logsumexp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void logsumexp_kernel(const float* x, float* y, int size) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    sdata[tid] = i < size ? x[i] : -FLT_MAX;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(y, sdata[0]);
+    }
+}
+
+torch::Tensor logsumexp_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto y = torch::zeros({1}, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    logsumexp_kernel<<<num_blocks, block_size, block_size * sizeof(float)>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+
+    return y;
+}
+"""
+
+logsumexp_cpp_source = (
+    "torch::Tensor logsumexp_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for LogSumExp
+logsumexp = load_inline(
+    name="logsumexp",
+    cpp_sources=logsum_cpp_source,
+    cuda_sources=logsumexp_source,
+    functions=["logsumexp_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(ModelNew, self).__init__()
+        self.linear1 = gemm
+        self.linear2 = gemm
+        self.sigmoid = sigmoid
+
+    def forward(self, x):
+        x = self.linear1.gemm_cuda(x, torch.randn(hidden_size, input_size).cuda())
+        x = self.sigmoid.sigmoid_cuda(x)
+        x = self.linear2.gemm_cuda(x, torch.randn(output_size, hidden_size).cuda())
+        x = logsumexp.logsumexp_cuda(x)
+        return x
+
+batch_size = 16384
+input_size = 2048
+hidden_size = 4096
+output_size = 1024
+
+model_new = ModelNew(input_size, hidden_size, output_size)
+inputs = get_inputs()
+outputs = model_new(inputs[0])
+print(outputs.shape)

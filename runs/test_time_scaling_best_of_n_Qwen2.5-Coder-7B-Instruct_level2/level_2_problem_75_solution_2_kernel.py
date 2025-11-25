@@ -1,0 +1,200 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for GEMM
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+void gemm_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor c) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, a.data_ptr<float>(), k, b.data_ptr<float>(), n, &beta, c.data_ptr<float>(), n);
+
+    cublasDestroy(handle);
+}
+"""
+
+gemm_cpp_source = (
+    "void gemm_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor c);"
+)
+
+# Compile the inline CUDA code for GEMM
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Group Normalization
+group_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void group_norm_kernel(const float* x, float* mean, float* var, float* y, int num_groups, int channels, int height, int width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < channels * height * width) {
+        int group = idx / (channels * height * width / num_groups);
+        int channel = (idx % (channels * height * width)) / (height * width);
+        int h = (idx % (channels * height * width)) % height;
+        int w = (idx % (channels * height * width)) / height;
+
+        float sum = 0.0f;
+        float sum_sqr = 0.0f;
+        for (int i = 0; i < height * width; ++i) {
+            int other_idx = group * (channels * height * width / num_groups) + channel * (height * width) + i;
+            sum += x[other_idx];
+            sum_sqr += x[other_idx] * x[other_idx];
+        }
+
+        mean[group * channels + channel] = sum / (height * width);
+        var[group * channels + channel] = sum_sqr / (height * width) - mean[group * channels + channel] * mean[group * channels + channel];
+
+        y[idx] = (x[idx] - mean[group * channels + channel]) / std::sqrt(var[group * channels + channel] + 1e-5f);
+    }
+}
+
+void group_norm_cuda(torch::Tensor x, torch::Tensor mean, torch::Tensor var, torch::Tensor y, int num_groups) {
+    int channels = x.size(1);
+    int height = x.size(2);
+    int width = x.size(3);
+
+    group_norm_kernel<<<(channels * height * width + 255) / 256, 256>>>(x.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), y.data_ptr<float>(), num_groups, channels, height, width);
+}
+"""
+
+group_norm_cpp_source = (
+    "void group_norm_cuda(torch::Tensor x, torch::Tensor mean, torch::Tensor var, torch::Tensor y, int num_groups);"
+)
+
+# Compile the inline CUDA code for Group Normalization
+group_norm = load_inline(
+    name="group_norm",
+    cpp_sources=group_norm_cpp_source,
+    cuda_sources=group_norm_source,
+    functions=["group_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Minimum Operation
+min_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void min_kernel(const float* x, float* y, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        y[idx] = x[idx];
+    }
+}
+
+void min_cuda(torch::Tensor x, torch::Tensor y) {
+    int size = x.numel();
+
+    min_kernel<<<(size + 255) / 256, 256>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+}
+"""
+
+min_cpp_source = (
+    "void min_cuda(torch::Tensor x, torch::Tensor y);"
+)
+
+# Compile the inline CUDA code for Minimum Operation
+min_op = load_inline(
+    name="min_op",
+    cpp_sources=min_cpp_source,
+    cuda_sources=min_source,
+    functions=["min_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Bias Addition
+bias_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bias_add_kernel(const float* x, const float* bias, float* y, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        y[idx] = x[idx] + bias[0];
+    }
+}
+
+void bias_add_cuda(torch::Tensor x, torch::Tensor bias, torch::Tensor y) {
+    int size = x.numel();
+
+    bias_add_kernel<<<(size + 255) / 256, 256>>>(x.data_ptr<float>(), bias.data_ptr<float>(), y.data_ptr<float>(), size);
+}
+"""
+
+bias_add_cpp_source = (
+    "void bias_add_cuda(torch::Tensor x, torch::Tensor bias, torch::Tensor y);"
+)
+
+# Compile the inline CUDA code for Bias Addition
+bias_add = load_inline(
+    name="bias_add",
+    cpp_sources=bias_add_cpp_source,
+    cuda_sources=bias_add_source,
+    functions=["bias_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(ModelNew, self).__init__()
+        self.gemm = gemm
+        self.group_norm = group_norm
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.gemm.gemm_cuda(x, self.weight, self.bias)
+        x = self.group_norm.group_norm_cuda(x, self.mean, self.var, self.output, num_groups)
+        x = min_op.min_cuda(x, self.min_output)
+        x = bias_add.bias_add_cuda(x, self.bias, self.output)
+        return x
+
+    def init_params(self, in_features, out_features, num_groups, bias_shape):
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.mean = nn.Parameter(torch.zeros(num_groups, out_features // num_groups))
+        self.var = nn.Parameter(torch.ones(num_groups, out_features // num_groups))
+        self.output = nn.Parameter(torch.zeros_like(x))
+        self.min_output = nn.Parameter(torch.zeros_like(x))

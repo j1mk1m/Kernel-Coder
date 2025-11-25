@@ -1,0 +1,6 @@
+## Explanation
+
+1. **Identify the Operation**: Recognize that the `softplus` operation is computationally intensive and can benefit from a custom CUDA implementation.
+2. **Implement the Custom CUDA Kernel**: Write a CUDA kernel that computes the `softplus` function efficiently.
+3. **Create a New Class**: Define a new class `ModelNew` that uses the custom CUDA kernel for the `forward` method.
+4. **Maintain Functionality**: Ensure that the new class produces the same results as the original `Model`.

@@ -1,0 +1,1 @@
+Similarly for the logsumexp kernel:

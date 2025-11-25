@@ -1,0 +1,396 @@
+The key here is to realize that diag(A) * B is actually element-wise multiplication of B with A's diagonal elements. Because diag(A) is a diagonal matrix with A's elements on the diagonal. So when you multiply diag(A) by B, the result is each row i of B is scaled by A[i]. So this can be optimized by replacing the diag(A) @ B with a custom kernel that does element-wise multiplication of B with A's elements.
+
+The original code creates a full diagonal matrix from A (which is NxN) and then does a matrix multiplication with B (NxM), resulting in O(N^2 + N*M) time. However, the optimized version can do this in O(N*M) time by just scaling each row of B by the corresponding A element. 
+
+Therefore, the main optimization is to avoid constructing the diagonal matrix and instead directly compute the scaled rows. So, the matmul operation can be replaced with an element-wise multiplication. 
+
+Therefore, the new kernel can be written as B * A.unsqueeze(1). But even better, to write a CUDA kernel that performs this scaling directly. 
+
+However, in PyTorch, element-wise multiplication requires broadcasting, so A has to be of shape (N, 1) to broadcast with B's (N, M). So the operation can be written as B * A.view(-1, 1). However, this is a one-liner. However, perhaps we can implement this as a custom CUDA kernel to see if there are any performance benefits, perhaps due to memory access patterns or avoiding intermediate tensors. 
+
+Alternatively, the custom kernel can directly compute the result without creating intermediate tensors. 
+
+The current problem requires replacing the existing torch.diag(A) @ B operation with a custom kernel. Let me think how to do that.
+
+First, the original code does diag(A) @ B. The diag(A) creates a NxN matrix, then multiplying with NxM gives NxM. But the actual computation is for each element in row i of B, multiply by A[i]. 
+
+So the kernel can be written as:
+
+for each element (i, j) in output:
+    output[i][j] = A[i] * B[i][j]
+
+So the CUDA kernel can be written to loop over all elements of B and multiply each element by the corresponding A[i].
+
+The steps would be:
+
+1. Create a CUDA kernel that takes A (1D) and B (2D), and produces C = A[i] * B[i][j]
+
+2. The kernel can be structured as a grid of threads, each handling one element. 
+
+The dimensions: the total number of elements is N*M. So we can have a 1D grid where each thread handles one element. The thread index can be computed as idx = blockIdx.x * blockDim.x + threadIdx.x. Then, i = idx // M, j = idx % M. Then, the element is A[i] * B[i][j]
+
+Alternatively, since B is stored in row-major order, accessing B[i][j] is contiguous for j. So perhaps using a 2D grid (block per row) might be better for coalesced memory access. 
+
+Alternatively, for the kernel, the code can be:
+
+__global__ void diag_mult_kernel(const float* A, const float* B, float* C, int N, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * M) {
+        int i = idx / M;
+        int j = idx % M;
+        C[idx] = A[i] * B[idx]; // since B is stored in row-major, B[i*M +j] is B[i][j]
+    }
+}
+
+Wait, but B is a tensor of shape (N, M). So B's elements are stored in row-major, so the linear index is i*M + j. So B[i][j] is indeed B[i*M + j].
+
+Thus, the kernel can be written as follows.
+
+The kernel function would take A (size N), B (size N*M), and output C (size N*M). The kernel loops over all elements, computes i and j, multiplies A[i] with B[i*M + j], and writes to C[i*M + j].
+
+The kernel can be launched with grid size (ceil(N*M / block_size)), block_size like 256 or 1024.
+
+Now, the problem is to code this in PyTorch using the load_inline function.
+
+First, in the new ModelNew class, replace the forward function with a call to this kernel.
+
+First, the kernel code:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void diag_mult_kernel(const float* A, const float* B, float* C, int N, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * M) {
+        int i = idx / M;
+        int j = idx % M;
+        C[idx] = A[i] * B[idx];
+    }
+}
+
+torch::Tensor diag_mult_cuda(torch::Tensor A, torch::Tensor B) {
+    int N = A.size(0);
+    int M = B.size(1);
+    auto C = torch::empty({N, M}, A.options());
+    const int threads_per_block = 256;
+    const int blocks_per_grid = (N * M + threads_per_block - 1) / threads_per_block;
+    diag_mult_kernel<<<blocks_per_grid, threads_per_block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), N, M);
+    return C;
+}
+
+Then, in the Python code, we can load this kernel via load_inline.
+
+But we have to make sure that the input tensors are on the GPU. The original get_inputs() returns tensors on CPU. Wait, in the original code, the get_inputs() does not have .cuda(), so the inputs are on CPU. However, in the problem statement, the user might have intended that the inputs are on GPU? Because in the first example, the inputs are on CUDA. 
+
+Looking back at the user's given architecture:
+
+In the original code given for the problem, the get_inputs() returns A and B on CPU. However, in the first example (the example provided by the user), their get_inputs() uses .cuda(). So perhaps in the problem, the user expects that the inputs are on CUDA. So we need to make sure the kernel is called on CUDA tensors. 
+
+Wait, in the problem's given architecture, the get_inputs() does not use .cuda(). So maybe the code is supposed to run on CPU? But that would not make sense for CUDA kernels. 
+
+Wait, perhaps I made a mistake here. Let me check the problem's given architecture again:
+
+The user provided this code for the problem's architecture:
+
+class Model(nn.Module):
+    ...
+    def forward(self, A, B):
+        return torch.diag(A) @ B
+
+def get_inputs():
+    A = torch.rand(N)
+    B = torch.rand(N, M)
+    return [A, B]
+
+def get_init_inputs():
+    return []
+
+So in the problem's architecture, the inputs are generated on CPU. But to use the CUDA kernel, the tensors need to be on the GPU. So perhaps the user expects that in the new ModelNew, the tensors are moved to the GPU. Or perhaps the user wants us to assume that the inputs are on the GPU? 
+
+Alternatively, perhaps the problem expects that the ModelNew is written such that the tensors are on GPU. Because otherwise, the CUDA kernel cannot be used. 
+
+Therefore, in the code, we have to make sure that the inputs are on the GPU. So in the get_inputs() function, we can modify it to have .cuda(). However, the user's instruction says that the user should not output testing code, so perhaps the get_inputs() is part of the model's code? 
+
+Wait, the user's instruction says to output the new architecture (ModelNew) and the get_inputs() and get_init_inputs() functions as in the original code. Wait, the original code includes get_inputs() and get_init_inputs() as part of the given architecture. So in the problem's given code, they are part of the code, so when replacing Model with ModelNew, we can keep the get_inputs() and get_init_inputs() as they are. 
+
+However, in order to use the CUDA kernel, the tensors must be on the GPU. Therefore, in the get_inputs() function, we must return tensors on the GPU. So we need to modify the get_inputs() function to put the tensors on the GPU. However, according to the user's instruction, we should not output testing code, so perhaps the get_inputs() is part of the model's code. Therefore, in the new code, the get_inputs() should be adjusted to use .cuda(). 
+
+Wait, the user's original problem says "Output the new code in codeblocks in markdown format (i.e. ```python or ```cpp). Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Do not output testing code."
+
+Therefore, the get_inputs() and get_init_inputs() are part of the code that needs to be outputted. So in order for the code to work, the get_inputs() must return tensors on the GPU. Therefore, in the new code, we need to modify get_inputs() to have .cuda().
+
+Therefore, in the new code:
+
+def get_inputs():
+    A = torch.rand(N).cuda()
+    B = torch.rand(N, M).cuda()
+    return [A, B]
+
+def get_init_inputs():
+    return []
+
+However, the problem's original code may not have that. Since the user says to replace the Model with ModelNew, but the rest of the code (like get_inputs()) is part of the architecture, perhaps they also need to be adjusted. 
+
+Alternatively, perhaps the user expects that the get_inputs() is left as is, and the code is written to handle tensors on CPU. But that would be impossible because the kernel is CUDA. 
+
+Therefore, the correct approach is to modify the get_inputs() to return CUDA tensors. 
+
+Thus, in the new code, the get_inputs() function must be adjusted to include .cuda(). 
+
+But in the original code given for the problem, the get_inputs() do not have .cuda(), so in order to make the code functional, we must change that. 
+
+Therefore, in the new code, the get_inputs() will be modified. 
+
+Now, putting it all together, here is the code:
+
+The ModelNew class will use the custom CUDA kernel. 
+
+So the Python code would be:
+
+First, the CUDA kernel code:
+
+elementwise_mult_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void diag_mult_kernel(const float* A, const float* B, float* C, int N, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * M) {
+        int i = idx / M;
+        int j = idx % M;
+        C[idx] = A[i] * B[idx];
+    }
+}
+
+torch::Tensor diag_mult_cuda(torch::Tensor A, torch::Tensor B) {
+    int N = A.size(0);
+    int M = B.size(1);
+    auto C = torch::empty({N, M}, A.options());
+    const int threads_per_block = 256;
+    const int blocks_per_grid = (N * M + threads_per_block - 1) / threads_per_block;
+    diag_mult_kernel<<<blocks_per_grid, threads_per_block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), N, M);
+    return C;
+}
+"""
+
+elementwise_mult_cpp_source = (
+    "torch::Tensor diag_mult_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+Then, we load the kernel:
+
+diag_mult = load_inline(
+    name="diag_mult",
+    cpp_sources=elementwise_mult_cpp_source,
+    cuda_sources=elementwise_mult_source,
+    functions=["diag_mult_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+Then, the ModelNew class will use this kernel:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.diag_mult = diag_mult  # Not sure if this is the right way to store it
+
+    def forward(self, A, B):
+        return self.diag_mult.diag_mult_cuda(A, B)
+
+Wait, but in the first example, the elementwise_add was stored as an attribute, and then called as self.elementwise_add.elementwise_add_cuda(a, b). So following that pattern, the diag_mult_cuda function is stored in self.diag_mult, and called as self.diag_mult.diag_mult_cuda(A, B). 
+
+Alternatively, perhaps the kernel is loaded as a function, not as an object. Let me think.
+
+In the first example's code:
+
+elementwise_add = load_inline(...)
+
+Then in forward:
+
+return self.elementwise_add.elementwise_add_cuda(a, b)
+
+Therefore, in this case, the kernel function is accessed via the loaded module's attribute. 
+
+So in the new code, the diag_mult_cuda function is in the diag_mult module. So in the forward function, the call would be:
+
+return diag_mult.diag_mult_cuda(A, B)
+
+But since the kernel is loaded into diag_mult, the function is diag_mult.diag_mult_cuda.
+
+However, in the first example's code, they stored the loaded module in self.elementwise_add, so that in the forward function, they can do self.elementwise_add.elementwise_add_cuda(...). 
+
+Therefore, in the new code, to follow the same pattern, we would do:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.diag_mult = diag_mult  # the loaded module
+
+    def forward(self, A, B):
+        return self.diag_mult.diag_mult_cuda(A, B)
+
+Thus, the code would be structured that way. 
+
+Now, considering that in the original code, the inputs are on CPU, but the kernel is on CUDA, we need to ensure that the inputs are on the GPU. 
+
+Therefore, modifying get_inputs() to return CUDA tensors. 
+
+Putting all together, the complete code would be:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for diag(A) @ B operation
+diag_mult_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void diag_mult_kernel(const float* A, const float* B, float* C, int N, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * M) {
+        int i = idx / M;
+        int j = idx % M;
+        C[idx] = A[i] * B[idx];
+    }
+}
+
+torch::Tensor diag_mult_cuda(torch::Tensor A, torch::Tensor B) {
+    int N = A.size(0);
+    int M = B.size(1);
+    auto C = torch::empty({N, M}, A.options());
+    const int threads_per_block = 256;
+    const int blocks_per_grid = (N * M + threads_per_block - 1) / threads_per_block;
+    diag_mult_kernel<<<blocks_per_grid, threads_per_block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), N, M);
+    return C;
+}
+"""
+
+diag_mult_cpp_source = "torch::Tensor diag_mult_cuda(torch::Tensor A, torch::Tensor B);"
+
+# Compile the inline CUDA code
+diag_mult = load_inline(
+    name="diag_mult",
+    cpp_sources=diag_mult_cpp_source,
+    cuda_sources=diag_mult_source,
+    functions=["diag_mult_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.diag_mult = diag_mult
+
+    def forward(self, A, B):
+        return self.diag_mult.diag_mult_cuda(A, B)
+
+M = 4096
+N = 4096
+
+def get_inputs():
+    A = torch.rand(N).cuda()
+    B = torch.rand(N, M).cuda()
+    return [A, B]
+
+def get_init_inputs():
+    return []
+```
+
+Wait, but in the code above, the kernel is designed to take tensors on the GPU, because it is a CUDA kernel. Therefore, the inputs A and B must be on the GPU. Hence, the get_inputs() function must put them on the GPU. 
+
+Therefore, the code as written above is correct. 
+
+However, in the original problem's code, the get_inputs() were on CPU. The user might have intended that the inputs are on the GPU. Since the first example used .cuda(), it's probably safe to assume that the user expects the inputs to be on the GPU. 
+
+Another thing to check is the data types. The original code uses torch.rand which is float32. The kernel is written for float, which matches. 
+
+Another thing is the kernel's memory allocation. The function diag_mult_cuda creates an empty tensor C with the same options as A. Since A is a CUDA tensor (because get_inputs returns CUDA tensors), then C will also be on CUDA. 
+
+Thus, the code should work. 
+
+Now, let me verify the forward function:
+
+The original code's forward was:
+
+def forward(self, A, B):
+    return torch.diag(A) @ B
+
+The new forward uses the kernel which computes A[i] * B[i][j]. Which is equivalent to diag(A) @ B. 
+
+Yes, because diag(A) is a diagonal matrix where each row i has A[i] on the diagonal, so multiplying by B (NxM) gives each element C[i,j] = A[i] * B[i,j]. 
+
+So the kernel correctly implements the desired operation. 
+
+Thus, this code should be correct. 
+
+Therefore, the final answer is the code block above.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for diag(A) @ B operation
+diag_mult_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void diag_mult_kernel(const float* A, const float* B, float* C, int N, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * M) {
+        int i = idx / M;
+        int j = idx % M;
+        C[idx] = A[i] * B[idx];
+    }
+}
+
+torch::Tensor diag_mult_cuda(torch::Tensor A, torch::Tensor B) {
+    int N = A.size(0);
+    int M = B.size(1);
+    auto C = torch::empty({N, M}, A.options());
+    const int threads_per_block = 256;
+    const int blocks_per_grid = (N * M + threads_per_block - 1) / threads_per_block;
+    diag_mult_kernel<<<blocks_per_grid, threads_per_block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), N, M);
+    return C;
+}
+"""
+
+diag_mult_cpp_source = "torch::Tensor diag_mult_cuda(torch::Tensor A, torch::Tensor B);"
+
+# Compile the inline CUDA code
+diag_mult = load_inline(
+    name="diag_mult",
+    cpp_sources=diag_mult_cpp_source,
+    cuda_sources=diag_mult_source,
+    functions=["diag_mult_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.diag_mult = diag_mult
+
+    def forward(self, A, B):
+        return self.diag_mult.diag_mult_cuda(A, B)
+
+M = 4096
+N = 4096
+
+def get_inputs():
+    A = torch.rand(N).cuda()
+    B = torch.rand(N, M).cuda()
+    return [A, B]
+
+def get_init_inputs():
+    return []
+```

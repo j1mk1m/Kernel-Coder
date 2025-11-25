@@ -1,0 +1,102 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D transposed convolution
+conv_transpose3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose3d_kernel(const float* input, const float* weight, float* output, int N, int C_in, int D_out, int H_out, int W_out, int C_out, int D_in, int H_in, int W_in) {
+    int n = blockIdx.z;
+    int c_out = blockIdx.y;
+    int d_out = blockIdx.x / (H_out * W_out);
+    int h_out = (blockIdx.x % (H_out * W_out)) / W_out;
+    int w_out = blockIdx.x % W_out;
+
+    float sum = 0.0f;
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        for (int d_in = 0; d_in < D_in; ++d_in) {
+            for (int h_in = 0; h_in < H_in; ++h_in) {
+                for (int w_in = 0; w_in < W_in; ++w_in) {
+                    int i = ((n * C_in + c_in) * D_in + d_in) * H_in + h_in;
+                    int j = ((c_out * C_in + c_in) * D_in + d_in) * H_in + h_in;
+                    int k = ((d_out * H_out + h_out) * W_out + w_out) * D_in + d_in;
+                    int l = ((h_out * W_out + w_out) * D_in + d_in) * H_in + h_in;
+                    int m = ((w_out * D_in + d_in) * H_in + h_in) * W_in + w_in;
+                    sum += input[i] * weight[j];
+                }
+            }
+        }
+    }
+    output[(n * C_out + c_out) * D_out + d_out] = sum;
+}
+
+torch::Tensor conv_transpose3d_cuda(torch::Tensor input, torch::Tensor weight) {
+    int N = input.size(0);
+    int C_in = input.size(1);
+    int D_out = weight.size(2);
+    int H_out = weight.size(3);
+    int W_out = weight.size(4);
+    int C_out = weight.size(1);
+    int D_in = input.size(2);
+    int H_in = input.size(3);
+    int W_in = input.size(4);
+
+    auto output = torch::zeros({N, C_out, D_out, H_out, W_out}, input.options());
+
+    dim3 blocks(D_out * H_out * W_out, C_out, N);
+    dim3 threads(1);
+
+    conv_transpose3d_kernel<<<blocks, threads>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), N, C_in, D_out, H_out, W_out, C_out, D_in, H_in, W_in);
+
+    return output;
+}
+"""
+
+conv_transpose3d_cpp_source = (
+    "torch::Tensor conv_transpose3d_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for 3D transposed convolution
+conv_transpose3d = load_inline(
+    name="conv_transpose3d",
+    cpp_sources=conv_transpose3d_cpp_source,
+    cuda_sources=conv_transpose3d_source,
+    functions=["conv_transpose3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = conv_transpose3d
+        self.batch_norm = nn.BatchNorm3d(out_channels)
+        self.avg_pool1 = nn.AvgPool3d(kernel_size=2)
+        self.avg_pool2 = nn.AvgPool3d(kernel_size=2)
+
+    def forward(self, x):
+        x = self.conv_transpose.conv_transpose3d_cuda(x, torch.randn(out_channels, in_channels, kernel_size, kernel_size, kernel_size))
+        x = self.batch_norm(x)
+        x = self.avg_pool1(x)
+        x = self.avg_pool2(x)
+        return x
+
+
+batch_size = 64
+in_channels = 3
+out_channels = 16
+depth, height, width = 32, 32, 32
+kernel_size = 3
+stride = 2
+padding = 1
+bias_shape = (out_channels, 1, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, bias_shape]

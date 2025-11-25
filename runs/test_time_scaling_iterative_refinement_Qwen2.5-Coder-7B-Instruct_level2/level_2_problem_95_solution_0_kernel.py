@@ -1,0 +1,241 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 16;
+    dim3 grid((n + block_size - 1) / block_size, (m + block_size - 1) / block_size);
+    dim3 block(block_size, block_size);
+
+    matmul_kernel<<<grid, block>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for adding a value
+add_value_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void add_value_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor add_value_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    add_value_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+add_value_cpp_source = (
+    "torch::Tensor add_value_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for adding a value
+add_value = load_inline(
+    name="add_value",
+    cpp_sources=add_value_cpp_source,
+    cuda_sources=add_value_source,
+    functions=["add_value_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Swish activation
+swish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void swish_kernel(const float* a, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] * sigmoid(a[idx]);
+    }
+}
+
+torch::Tensor swish_cuda(torch::Tensor a) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    swish_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+
+__device__ float sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+"""
+
+swish_cpp_source = (
+    "torch::Tensor swish_cuda(torch::Tensor a);"
+)
+
+# Compile the inline CUDA code for Swish activation
+swish = load_inline(
+    name="swish",
+    cpp_sources=swish_cpp_source,
+    cuda_sources=swish_source,
+    functions=["swish_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for GELU activation
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_kernel(const float* a, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = 0.5f * a[idx] * (1.0f + tanh(sqrt(2.0f / M_PI) * (a[idx] + 0.044715f * pow(a[idx], 3.0f))));
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor a) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    gelu_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+gelu_cpp_source = (
+    "torch::Tensor gelu_cuda(torch::Tensor a);"
+)
+
+# Compile the inline CUDA code for GELU activation
+gelu = load_inline(
+    name="gelu",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Hardtanh activation
+hardtanh_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void hardtanh_kernel(const float* a, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = fmaxf(fminf(a[idx], 1.0f), -1.0f);
+    }
+}
+
+torch::Tensor hardtanh_cuda(torch::Tensor a) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    hardtanh_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+hardtanh_cpp_source = (
+    "torch::Tensor hardtanh_cuda(torch::Tensor a);"
+)
+
+# Compile the inline CUDA code for Hardtanh activation
+hardtanh = load_inline(
+    name="hardtanh",
+    cpp_sources=hardtanh_cpp_source,
+    cuda_sources=hardtanh_source,
+    functions=["hardtanh_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, add_value_shape):
+        super(ModelNew, self).__init__()
+        self.matmul = matmul
+        self.add_value = add_value
+        self.swish = swish
+        self.tanh = F.tanh
+        self.gelu = gelu
+        self.hardtanh = hardtanh
+
+    def forward(self, x):
+        x = self.matmul.matmul_cuda(x)
+        x = self.add_value.add_value_cuda(x, self.add_value)
+        x = self.swish.swish_cuda(x)
+        x = self.tanh(x)
+        x = self.gelu.gelu_cuda(x)
+        x = self.hardtanh(x)
+        return x

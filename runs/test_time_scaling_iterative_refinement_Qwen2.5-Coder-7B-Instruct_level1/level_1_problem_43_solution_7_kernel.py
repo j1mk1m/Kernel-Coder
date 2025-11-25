@@ -1,0 +1,96 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for max pool 3d
+max_pool_3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void max_pool_3d_forward_kernel(const float* input, float* output, int batch_size, int channels, int dim1, int dim2, int dim3, int kernel_size, int stride, int padding) {
+    int batch_idx = blockIdx.x / (dim1 * dim2 * dim3);
+    int channel_idx = (blockIdx.x % (dim1 * dim2 * dim3)) / (dim1 * dim2);
+    int d1_idx = ((blockIdx.x % (dim1 * dim2 * dim3)) % (dim1 * dim2)) / dim2;
+    int d2_idx = ((blockIdx.x % (dim1 * dim2 * dim3)) % (dim1 * dim2)) % dim2;
+    int d3_idx = blockIdx.x % (dim1 * dim2 * dim3) % dim3;
+
+    int start_d1 = d1_idx * stride - padding;
+    int start_d2 = d2_idx * stride - padding;
+    int start_d3 = d3_idx * stride - padding;
+
+    int end_d1 = start_d1 + kernel_size;
+    int end_d2 = start_d2 + kernel_size;
+    int end_d3 = start_d3 + kernel_size;
+
+    float max_val = -FLT_MAX;
+    for (int i = start_d1; i < end_d1 && i >= 0 && i < dim1; ++i) {
+        for (int j = start_d2; j < end_d2 && j >= 0 && j < dim2; ++j) {
+            for (int k = start_d3; k < end_d3 && k >= 0 && k < dim3; ++k) {
+                float val = input[(batch_idx * channels + channel_idx) * dim1 * dim2 * dim3 + i * dim2 * dim3 + j * dim3 + k];
+                if (val > max_val) {
+                    max_val = val;
+                }
+            }
+        }
+    }
+
+    output[batch_idx * channels * dim1 * dim2 * dim3 + d1_idx * dim2 * dim3 + d2_idx * dim3 + d3_idx] = max_val;
+}
+
+void max_pool_3d_backward_kernel(const float* grad_output, const float* input, float* grad_input, int batch_size, int channels, int dim1, int dim2, int dim3, int kernel_size, int stride, int padding) {
+    // Implement backward pass if needed
+}
+
+torch::Tensor max_pool_3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto dim1 = input.size(2);
+    auto dim2 = input.size(3);
+    auto dim3 = input.size(4);
+    auto output = torch::zeros({batch_size, channels, (dim1 + padding - kernel_size) / stride + 1, (dim2 + padding - kernel_size) / stride + 1, (dim3 + padding - kernel_size) / stride + 1}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * channels * dim1 * dim2 * dim3 + block_size - 1) / block_size;
+
+    max_pool_3d_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels, dim1, dim2, dim3, kernel_size, stride, padding);
+
+    return output;
+}
+"""
+
+max_pool_3d_cpp_source = (
+    "torch::Tensor max_pool_3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for max pool 3d
+max_pool_3d = load_inline(
+    name="max_pool_3d",
+    cpp_sources=max_pool_3d_cpp_source,
+    cuda_sources=max_pool_3d_source,
+    functions=["max_pool_3d_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, dilation: int = 1, return_indices: bool = False, ceil_mode: bool = False):
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+        self.ceil_mode = ceil_mode
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return max_pool_3d.max_pool_3d_forward_cuda(x, self.kernel_size, self.stride, self.padding)
+
+
+# Test the ModelNew class
+model_new = ModelNew(kernel_size=3, stride=2, padding=1)
+inputs = get_inputs()[0].cuda()
+output = model_new(inputs)
+print(output.shape)  # Should be (16, 32, 64, 64, 64)

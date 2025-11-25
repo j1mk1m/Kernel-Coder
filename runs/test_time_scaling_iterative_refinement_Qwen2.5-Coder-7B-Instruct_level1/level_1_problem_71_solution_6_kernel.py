@@ -1,0 +1,86 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed 2D convolution
+conv_transpose2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose2d_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int height_in, int width_in, int kernel_size) {
+    int batch_idx = blockIdx.x / (out_channels * height_in * width_in);
+    int out_channel_idx = (blockIdx.x / (height_in * width_in)) % out_channels;
+    int row_idx = (blockIdx.x / width_in) % height_in;
+    int col_idx = blockIdx.x % width_in;
+
+    float sum = 0.0f;
+    for (int i = 0; i < kernel_size; ++i) {
+        for (int j = 0; j < kernel_size; ++j) {
+            int input_row = row_idx + i - kernel_size / 2;
+            int input_col = col_idx + j - kernel_size / 2;
+            if (input_row >= 0 && input_row < height_in && input_col >= 0 && input_col < width_in) {
+                int input_index = ((batch_idx * in_channels + (i * kernel_size + j) * in_channels / kernel_size / kernel_size) * height_in + input_row) * width_in + input_col;
+                int weight_index = ((out_channel_idx * in_channels + i * kernel_size + j) * in_channels / kernel_size / kernel_size) * height_in + input_row;
+                sum += input[input_index] * weight[weight_index];
+            }
+        }
+    }
+
+    int output_index = ((batch_idx * out_channels + out_channel_idx) * height_in + row_idx) * width_in + col_idx;
+    output[output_index] = sum;
+}
+
+torch::Tensor conv_transpose2d_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto height_in = input.size(2);
+    auto width_in = input.size(3);
+    auto kernel_size = weight.size(2);
+
+    auto output = torch::zeros({batch_size, out_channels, height_in, width_in}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * out_channels * height_in * width_in + block_size - 1) / block_size;
+
+    conv_transpose2d_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, out_channels, height_in, width_in, kernel_size);
+
+    return output;
+}
+"""
+
+conv_transpose2d_cpp_source = (
+    "torch::Tensor conv_transpose2d_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for transposed 2D convolution
+conv_transpose2d = load_inline(
+    name="conv_transpose2d",
+    cpp_sources=conv_transpose2d_cpp_source,
+    cuda_sources=conv_transpose2d_source,
+    functions=["conv_transpose2d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int):
+        super(ModelNew, self).__init__()
+        self.conv_transpose2d = conv_transpose2d
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv_transpose2d.conv_transpose2d_cuda(x, self.weight)
+
+# Initialize weights for the transposed 2D convolution
+model_new = ModelNew(in_channels, out_channels, kernel_size)
+model_new.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size))
+
+# Get inputs
+inputs = get_inputs()
+
+# Forward pass
+output = model_new(inputs[0])
+
+print(output.shape)

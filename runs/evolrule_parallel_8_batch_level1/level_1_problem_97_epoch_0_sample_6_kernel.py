@@ -1,0 +1,219 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Inline CUDA kernel for scaled dot-product attention
+scaled_dot_product_attention_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+
+template <typename scalar_t>
+__global__ void compute_attention_scores(
+    const scalar_t* __restrict__ Q,
+    const scalar_t* __restrict__ K,
+    scalar_t* __restrict__ scores,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int embed_dim,
+    int k_dim) {
+
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int q_idx = threadIdx.x;
+
+    if (q_idx >= seq_len) return;
+
+    const auto q_ptr = Q + batch_idx * num_heads * seq_len * embed_dim +
+                       head_idx * seq_len * embed_dim + q_idx * embed_dim;
+
+    for (int k_idx = 0; k_idx < seq_len; k_idx += blockDim.y) {
+        int k_idx_ = k_idx + threadIdx.y;
+        if (k_idx_ >= seq_len) continue;
+
+        const auto k_ptr = K + batch_idx * num_heads * seq_len * embed_dim +
+                           head_idx * seq_len * embed_dim + k_idx_ * embed_dim;
+
+        scalar_t sum = 0;
+        for (int d = 0; d < embed_dim; ++d) {
+            sum += q_ptr[d] * k_ptr[d];
+        }
+        scores[batch_idx * num_heads * seq_len * seq_len +
+               head_idx * seq_len * seq_len +
+               q_idx * seq_len + k_idx_] = sum;
+    }
+}
+
+template <typename scalar_t>
+__global__ void softmax_kernel(
+    scalar_t* __restrict__ scores,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    scalar_t inv_sqrt_d) {
+
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int q_idx = threadIdx.x;
+
+    if (q_idx >= seq_len) return;
+
+    scalar_t* row = scores + batch_idx*num_heads*seq_len*seq_len +
+                    head_idx*seq_len*seq_len +
+                    q_idx*seq_len;
+
+    // Compute max in the row
+    scalar_t max_val = row[0];
+    for (int k = 1; k < seq_len; ++k) {
+        if (row[k] > max_val) {
+            max_val = row[k];
+        }
+    }
+
+    __shared__ scalar_t shared_max;
+    shared_max = max_val;
+    __syncthreads();
+
+    scalar_t sum_exp = 0;
+    for (int k = 0; k < seq_len; ++k) {
+        scalar_t exp_val = exp(row[k] - shared_max);
+        sum_exp += exp_val;
+        row[k] = exp_val;
+    }
+
+    // Reduce sum_exp
+    scalar_t local_sum = sum_exp;
+    __shared__ scalar_t shared_sum[32];
+    shared_sum[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = 16; s > 0; s /= 2) {
+        if (threadIdx.x < s) {
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    scalar_t denom = shared_sum[0] + 1e-6;
+    for (int k = 0; k < seq_len; ++k) {
+        row[k] = row[k] / denom;
+    }
+}
+
+template <typename scalar_t>
+__global__ void compute_output(
+    const scalar_t* __restrict__ scores,
+    const scalar_t* __restrict__ V,
+    scalar_t* __restrict__ out,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int embed_dim) {
+
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    int v_idx = threadIdx.x;
+
+    if (v_idx >= seq_len) return;
+
+    const auto v_ptr = V + batch_idx*num_heads*seq_len*embed_dim +
+                       head_idx*seq_len*embed_dim + v_idx*embed_dim;
+
+    for (int o_idx = 0; o_idx < seq_len; o_idx += blockDim.y) {
+        int o_idx_ = o_idx + threadIdx.y;
+        if (o_idx_ >= seq_len) continue;
+
+        const auto score = scores[batch_idx*num_heads*seq_len*seq_len +
+                                 head_idx*seq_len*seq_len +
+                                 o_idx_*seq_len + v_idx];
+
+        for (int d = 0; d < embed_dim; ++d) {
+            atomicAdd(&out[batch_idx*num_heads*seq_len*embed_dim +
+                          head_idx*seq_len*embed_dim +
+                          o_idx_*embed_dim + d],
+                      score * v_ptr[d + v_idx*embed_dim]);
+        }
+    }
+}
+
+torch::Tensor scaled_dot_product_attention_cuda(
+    torch::Tensor Q,
+    torch::Tensor K,
+    torch::Tensor V,
+    float dropout_p,
+    bool is_causal) {
+
+    const int batch_size = Q.size(0);
+    const int num_heads = Q.size(1);
+    const int seq_len = Q.size(2);
+    const int embed_dim = Q.size(3);
+    const int k_dim = K.size(3);
+
+    auto scores_size = {batch_size, num_heads, seq_len, seq_len};
+    auto scores = torch::empty(scores_size, Q.options());
+
+    const dim3 threads(128, 8);
+    const dim3 blocks(batch_size, num_heads);
+
+    AT_DISPATCH_FLOATING_TYPES(Q.scalar_type(), "compute_attention_scores", ([&] {
+        using scalar_t = scalar_t;
+        compute_attention_scores<scalar_t><<<blocks, threads>>>(
+            Q.data_ptr<scalar_t>(),
+            K.data_ptr<scalar_t>(),
+            scores.data_ptr<scalar_t>(),
+            batch_size, num_heads, seq_len, embed_dim, k_dim);
+    }));
+
+    const float inv_sqrt_d = 1.0 / sqrt(embed_dim);
+
+    AT_DISPATCH_FLOATING_TYPES(Q.scalar_type(), "softmax_kernel", ([&] {
+        using scalar_t = scalar_t;
+        softmax_kernel<scalar_t><<<dim3(batch_size, num_heads), seq_len>>>(
+            scores.data_ptr<scalar_t>(),
+            batch_size, num_heads, seq_len, inv_sqrt_d);
+    }));
+
+    auto out = torch::empty({batch_size, num_heads, seq_len, embed_dim}, Q.options());
+
+    AT_DISPATCH_FLOATING_TYPES(Q.scalar_type(), "compute_output", ([&] {
+        using scalar_t = scalar_t;
+        compute_output<scalar_t><<<blocks, threads>>>(
+            scores.data_ptr<scalar_t>(),
+            V.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            batch_size, num_heads, seq_len, embed_dim);
+    }));
+
+    return out;
+}
+"""
+
+scaled_dot_product_attention_cpp_source = """
+torch::Tensor scaled_dot_product_attention_cuda(
+    torch::Tensor Q,
+    torch::Tensor K,
+    torch::Tensor V,
+    float dropout_p,
+    bool is_causal);
+"""
+
+# Compile the inline CUDA code
+sdpa_cuda = load_inline(
+    name="sdpa_cuda",
+    cpp_sources=scaled_dot_product_attention_cpp_source,
+    cuda_sources=scaled_dot_product_attention_source,
+    functions=["scaled_dot_product_attention_cuda"],
+    verbose=True,
+    extra_cflags=["-D_FORCE_INLINES"],
+    extra_cuda_cflags=["-lineinfo", "-use_fast_math"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sdpa = sdpa_cuda
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        return self.sdpa.scaled_dot_product_attention_cuda(Q, K, V, 0.0, False)

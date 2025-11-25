@@ -1,0 +1,2 @@
+// This is the CUDA kernel code embedded within the Python script via load_inline.
+// The code provided in the Python script already includes the necessary CUDA implementation for the sigmoid function.

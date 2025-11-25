@@ -1,0 +1,191 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b) {
+    int m = a.size(0);
+    int n = b.size(1);
+    int k = a.size(1);
+
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 16;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    matmul_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for average pooling
+avg_pool_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pool_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int kernel_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * channels * height * width) {
+        int b = idx / (channels * height * width);
+        int c = (idx % (channels * height * width)) / (height * width);
+        int h = (idx % (channels * height * width)) % height;
+        int w = (idx % (channels * height * width)) % width;
+
+        int ph_start = h / kernel_size;
+        int pw_start = w / kernel_size;
+
+        float sum = 0.0f;
+        for (int ph = 0; ph < kernel_size; ++ph) {
+            for (int pw = 0; pw < kernel_size; ++pw) {
+                int nh = ph_start + ph;
+                int nw = pw_start + pw;
+                if (nh >= 0 && nh < height && nw >= 0 && nw < width) {
+                    sum += input[b * channels * height * width + c * height * width + nh * width + nw];
+                }
+            }
+        }
+
+        output[idx] = sum / (kernel_size * kernel_size);
+    }
+}
+
+torch::Tensor avg_pool_cuda(torch::Tensor input, int kernel_size) {
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    auto output = torch::zeros({batch_size, channels, height // kernel_size, width // kernel_size}, input.options());
+
+    const int block_size = 16;
+    const int num_blocks = (batch_size * channels * height * width + block_size - 1) / block_size;
+
+    avg_pool_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels, height, width, kernel_size);
+
+    return output;
+}
+"""
+
+avg_pool_cpp_source = (
+    "torch::Tensor avg_pool_cuda(torch::Tensor input, int kernel_size);"
+)
+
+# Compile the inline CUDA code for average pooling
+avg_pool = load_inline(
+    name="avg_pool",
+    cpp_sources=avg_pool_cpp_source,
+    cuda_sources=avg_pool_source,
+    functions=["avg_pool_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for GELU activation
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__device__ float gelu_device(float x) {
+    return 0.5 * x * (1.0 + tanh(sqrt(2.0 / M_PI) * (x + 0.044715 * x * x * x)));
+}
+
+__global__ void gelu_kernel(float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = gelu_device(input[idx]);
+    }
+}
+
+void gelu_cuda(torch::Tensor input, torch::Tensor output) {
+    int size = input.numel();
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    gelu_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+}
+"""
+
+gelu_cpp_source = (
+    "void gelu_cuda(torch::Tensor input, torch::Tensor output);"
+)
+
+# Compile the inline CUDA code for GELU activation
+gelu = load_inline(
+    name="gelu",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.matmul = matmul
+        self.avg_pool = avg_pool
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        x = self.matmul.matmul_cuda(x.view(x.size(0), -1), torch.eye(x.size(1)).to(x.device))
+        x = x.view(x.size(0), x.size(1), 1, 1)
+        x = self.avg_pool.avg_pool_cuda(x, self.pool_kernel_size)
+        x = x.squeeze(2).squeeze(3)
+        gelu_input = x.clone()
+        gelu_output = torch.zeros_like(gelu_input)
+        gelu.gelu_cuda(gelu_input, gelu_output)
+        x = gelu_output * self.scale_factor
+        x = torch.max(x, dim=1).values
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+pool_kernel_size = 16
+scale_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, pool_kernel_size, scale_factor]

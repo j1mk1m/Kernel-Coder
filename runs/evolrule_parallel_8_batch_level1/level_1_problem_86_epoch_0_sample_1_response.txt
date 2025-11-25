@@ -1,0 +1,1301 @@
+Understand the architecture first: The model uses depthwise separable convolution, which involves a depthwise convolution followed by a pointwise convolution. The depthwise convolution applies a single filter per input channel, while the pointwise convolution mixes the channels. The existing code uses PyTorch's nn.Conv2d for both steps, but we can potentially optimize this by fusing the two convolutions into a single custom CUDA kernel to reduce memory overhead and kernel launch overhead. Alternatively, we can optimize individual operators. 
+
+Possible optimizations:
+
+1. **Fusion of Depthwise and Pointwise Convolutions**: Instead of launching two separate CUDA kernels (one for depthwise and one for pointwise), we can combine them into a single kernel. This would avoid intermediate memory copies and reduce the number of kernel launches, which can be beneficial for small tensors. However, the implementation might be complex due to the different structures of depthwise and pointwise convolutions.
+
+2. **Algorithmic Optimization for Depthwise Convolution**: The depthwise convolution can be optimized by using a more efficient kernel. For example, using shared memory to store input tiles and reusing data for multiple computations. This can reduce global memory access and improve performance.
+
+3. **Algorithmic Optimization for Pointwise Convolution**: Pointwise convolutions are 1x1 convolutions, which can be optimized by treating them as matrix multiplications. However, PyTorch might already optimize this, so custom kernels may not provide significant gains.
+
+4. **Combined Optimization**: Combining both the fused kernel approach and algorithmic optimizations for each convolution step.
+
+The most promising approach here is likely to fuse the depthwise and pointwise convolutions into a single kernel. This would eliminate the intermediate storage and reduce the number of kernel launches, leading to better performance. However, implementing this requires handling both convolution operations in a single CUDA kernel, which can be complex but feasible.
+
+Another approach is to optimize each convolution separately. For the depthwise convolution, since it's applied per channel, we can implement a custom kernel that efficiently processes each channel, possibly with optimized memory access patterns. The pointwise convolution can be handled via a matrix multiplication approach, which might be faster for certain input sizes.
+
+The user specified that operator fusion opportunities should be considered, so fusing depthwise and pointwise into a single kernel is a good candidate. Let's proceed with that approach.
+
+The challenge is to compute both convolutions in a single step. The depthwise convolution processes each input channel independently with its own kernel, while the pointwise convolution mixes all channels after the depthwise step.
+
+To fuse them:
+
+- First, compute the depthwise convolution for each input channel.
+- Then, immediately apply the pointwise convolution's 1x1 kernel on the results.
+
+But since pointwise is 1x1, it's effectively a channel-wise linear combination. So, after the depthwise convolution, the pointwise can be seen as a matrix multiply between the output channels and the input channels.
+
+Wait, perhaps the pointwise is a 1x1 convolution, so it can be expressed as a matrix multiplication. So, the overall computation would be:
+
+Output = Pointwise( Depthwise(Input) )
+
+But if we can represent the pointwise as a matrix multiplication, then perhaps the combined operation can be expressed as:
+
+For each output channel:
+    For each input channel:
+        Compute depthwise on input channel
+        Multiply by pointwise weight (input channel -> output channel)
+    Sum over input channels, add bias if needed.
+
+Alternatively, to fuse the two steps, the depthwise convolution for all channels first, then apply the pointwise's weights in a matrix form.
+
+However, the depthwise convolution's output has the same number of channels as the input, so the pointwise can be considered a linear layer across channels, applied at each spatial location.
+
+Therefore, the total computation for an output channel o at position (h,w) is:
+
+sum_{c_in} ( depthwise_out[c_in, h, w] * pointwise_weight[o, c_in] ) + bias[o]
+
+Thus, the fused kernel can compute the depthwise for each input channel and accumulate into the pointwise's output.
+
+This requires, for each spatial location, first computing the depthwise result for each input channel, then using those results to compute the pointwise output.
+
+However, the depthwise convolution requires a kernel of size kernel_size x kernel_size for each input channel, so the fused kernel must handle both steps.
+
+This is quite involved, but let's outline the steps:
+
+1. For each output position (h_out, w_out) in the depthwise output:
+    a. Compute the depthwise result for each input channel c_in at (h_out, w_out).
+    b. For each output channel o in pointwise, accumulate the depthwise result multiplied by pointwise's weights[o][c_in].
+
+But the depthwise's output is used immediately in the pointwise computation, so there's no need to store it in memory, thus saving memory and bandwidth.
+
+This approach requires handling both convolutions in a single kernel, which may lead to higher computational efficiency.
+
+Now, let's think about the implementation steps.
+
+First, the fused kernel must process all input channels, apply the depthwise convolution (for each input channel independently), then apply the pointwise convolution's weights across all channels.
+
+The kernel would need to read the input tensor, the depthwise filters (one per input channel), and the pointwise filters (out_channels x in_channels), and compute the combined output.
+
+But in PyTorch, the depthwise and pointwise convolutions have their own weights and biases. The depthwise's weights are of shape [in_channels, 1, kernel_size, kernel_size], since it's depthwise (groups=in_channels). The pointwise's weights are [out_channels, in_channels, 1, 1].
+
+So, to implement this in a fused kernel:
+
+The fused kernel must:
+
+- Iterate over output positions (h_out, w_out)
+- For each output channel o in 0..out_channels-1:
+    - The output value at (o, h_out, w_out) is the sum over c_in (depthwise's output for c_in at h_out,w_out multiplied by pointwise's weight[o][c_in])
+    - Plus the pointwise's bias[o], if any.
+
+To compute depthwise's output for each c_in:
+
+For each c_in, the depthwise convolution applies a kernel of size [kernel_size, kernel_size] at the input channel c_in's spatial positions. The stride, padding, and dilation are as per the input parameters.
+
+So, for depthwise convolution:
+
+The input for channel c_in is a 2D tensor (height, width). The output spatial position h_out, w_out corresponds to input positions computed via the convolution parameters (stride, padding, dilation).
+
+The depthwise's output for c_in at h_out,w_out is the sum over kernel elements (kh, kw) of input[c_in, h_in, w_in] * depthwise_weight[c_in][kh][kw], where h_in = h_out*stride - padding + kh*dilation, etc.
+
+Wait, the exact indexing would need to be handled carefully.
+
+Alternatively, the standard convolution formula applies.
+
+Thus, the fused kernel must:
+
+For each output position (o, h_out, w_out):
+
+1. Compute the depthwise contribution for each input channel c_in:
+   - Iterate over the kernel's kh and kw.
+   - For each kh, kw, get the input pixel at position (h_in, w_in) = (h_out*stride + (kh - padding) * dilation, similar for width)
+   - Multiply by the depthwise kernel for c_in's kernel at (kh, kw)
+   - Sum over kh and kw to get depthwise_out[c_in][h_out][w_out]
+
+2. Multiply each depthwise_out[c_in] by pointwise_weight[o][c_in], sum over c_in to get the pointwise contribution for o, h_out, w_out.
+
+3. Add bias if present.
+
+But doing this naively would require storing the depthwise_out, which may not be feasible in shared memory for large channels. Alternatively, we can compute the depthwise_out for each c_in and immediately multiply by pointwise's weights and accumulate into the output.
+
+This way, we can compute the depthwise and pointwise contributions in a single loop, without needing to store the depthwise output.
+
+Therefore, the algorithm can be structured as:
+
+for each output spatial position (h_out, w_out):
+
+    for each output channel o:
+
+        acc = 0
+
+        for each input channel c_in:
+
+            depthwise_val = 0
+
+            for kh in 0..kernel_size-1:
+
+                for kw in 0..kernel_size-1:
+
+                    h_in = h_out * stride + (kh - padding) * dilation
+
+                    w_in = w_out * stride + (kw - padding) * dilation
+
+                    if h_in and w_in are within bounds:
+
+                        depthwise_val += input[c_in][h_in][w_in] * depthwise_weight[c_in][kh][kw]
+
+            acc += depthwise_val * pointwise_weight[o][c_in]
+
+        output[o][h_out][w_out] = acc + bias[o]
+
+But this is O( out_channels * in_channels * kernel_size^2 ), which could be expensive for large channels or kernel sizes. However, given that the problem statement mentions kernel_size=3, in_channels=64, out_channels=128, this may be manageable.
+
+But the problem is that in CUDA, this would require a lot of loops and may not be the most efficient.
+
+Alternative approach: reorganize the loops to process in a way that can exploit parallelism.
+
+Another thing to consider is that the pointwise's weights are a matrix of size [out_channels, in_channels], so for each output channel o, the weights are [in_channels] elements. Therefore, for each o, we can loop over all input channels c_in, multiply by the pointwise's weight, and accumulate.
+
+But in CUDA, the threads can be arranged to handle different output positions and channels.
+
+Perhaps the following approach:
+
+- The kernel is launched with a grid of blocks covering the output spatial dimensions (height_out, width_out), and each block processes all output channels. Alternatively, the threads can be mapped to output channels.
+
+Alternatively, using a 3D grid: blocks for each output channel, and threads for spatial positions. But the dimensions may vary.
+
+Alternatively, the following grid structure:
+
+Each thread processes an output channel and a spatial position. For example:
+
+blockIdx.x = output channel o
+
+blockIdx.y = h_out
+
+blockIdx.z = w_out
+
+But this may not be efficient due to CUDA's block limits.
+
+Alternatively, flatten the indices:
+
+Each thread is responsible for an output channel and a spatial position. The total number of threads would be out_channels * height_out * width_out. But if out_channels is 128, height_out and width_out are 512 (assuming stride=1, padding=1, kernel_size=3, so output spatial dimensions remain the same), then 128 * 512 * 512 = ~33 million threads, which is too much.
+
+Thus, that approach isn't feasible.
+
+Alternative idea: Use a grid where each block handles a spatial position (h_out, w_out). Each block has threads that handle different output channels.
+
+Let's structure it as:
+
+- Grid dimensions: height_out x width_out
+
+- Each block (h_out, w_out) processes all output channels o.
+
+- Each thread within the block processes a single output channel o.
+
+The number of threads per block would be the number of output channels. However, if out_channels is 128, this is feasible since CUDA allows up to 1024 threads per block.
+
+Wait, but 128 is within the limit.
+
+So, per block (h_out, w_out):
+
+- For each thread t (o = t):
+
+    compute the output at o, h_out, w_out.
+
+This way:
+
+Each block's threads can compute all output channels for a given (h_out, w_out).
+
+This reduces the number of blocks to height_out * width_out (512x512 = ~262k blocks, which may be manageable? Not sure, but let's see.)
+
+The steps for a thread t (o = threadIdx.x):
+
+1. For the given h_out, w_out (determined by blockIdx.x, blockIdx.y):
+
+    Compute the output for channel o.
+
+    Initialize acc = 0.
+
+    For each input channel c_in in 0..in_channels-1:
+
+        Compute depthwise_val for c_in at h_out, w_out.
+
+        To compute depthwise_val:
+
+            depthwise_val = 0
+
+            for kh in 0..kernel_size-1:
+
+                for kw in 0..kernel_size-1:
+
+                    h_in = h_out * stride + (kh - padding) * dilation
+
+                    w_in = w_out * stride + (kw - padding) * dilation
+
+                    if h_in and w_in are within the input's spatial dimensions (0 <= h_in < height, 0 <= w_in < width):
+
+                        input_val = input[c_in][h_in][w_in]
+
+                        kernel_val = depthwise_weight[c_in][kh][kw]
+
+                        depthwise_val += input_val * kernel_val
+
+            acc += depthwise_val * pointwise_weight[o][c_in]
+
+    output[o][h_out][w_out] = acc + pointwise_bias[o] (if bias is present)
+
+This approach requires nested loops over c_in and over kh, kw. The computation of depthwise_val for each c_in is O(kernel_size^2). For kernel_size=3, this is manageable, but for larger kernels, it could be a problem.
+
+However, given the parameters in the test code (kernel_size=3), this is acceptable.
+
+Now, for memory access patterns, we need to optimize the way we access input and weights.
+
+The input is a 4D tensor (batch, in_channels, height, width). Since the batch size is 16, but in the code above, the kernel is processing a single spatial position per block. Wait, actually, the batch is also a dimension that needs to be considered.
+
+Wait, the original code's forward function processes the entire batch. So the kernel must handle the batch dimension as well.
+
+Oops! I forgot the batch dimension. So in the fused kernel, we need to process each batch element as well.
+
+Thus, the problem becomes more complex. Each thread must also process a batch element.
+
+This complicates the grid dimensions. Perhaps the batch dimension can be handled by launching multiple blocks along the batch dimension.
+
+Alternatively, structure the grid as:
+
+blockIdx.x = batch element
+
+blockIdx.y = h_out
+
+blockIdx.z = w_out
+
+Then, each block processes all output channels for a particular (batch, h_out, w_out). The threads within the block process each output channel.
+
+But with batch_size=16, and h_out,w_out=512 each, the total blocks would be 16 * 512 * 512 = ~4 million, which may be excessive.
+
+Alternatively, we can process the batch in parallel with threads. However, CUDA has a maximum number of threads per block (1024), so it's challenging to cover the batch dimension efficiently.
+
+This suggests that a fused kernel might be too complex to implement efficiently, especially considering the batch dimension.
+
+Perhaps an alternative approach is better: optimizing each convolution separately, but in a way that reduces overhead.
+
+Another idea: since depthwise convolution can be optimized using shared memory to reduce global memory accesses. Let's consider optimizing the depthwise and pointwise convolutions separately with custom kernels, but fused into a single kernel call.
+
+Alternatively, since the pointwise is 1x1 convolution, it can be implemented as a matrix multiplication, which can be done efficiently with cuBLAS or a custom kernel. So perhaps optimizing the depthwise convolution first.
+
+Let me think of the steps again. The original code uses two separate Conv2d layers. The depthwise is implemented as a standard convolution with groups=in_channels, and pointwise as a standard 1x1 convolution.
+
+The problem is that each of these calls launches a separate kernel, which has overhead. So even if the individual kernels are efficient, the overhead of two kernel launches can be significant for small tensors.
+
+Alternatively, fusing the two operations into a single kernel call would save that overhead.
+
+But implementing that fused kernel with all dimensions considered (batch, in_channels, out_channels, etc.) is quite involved.
+
+Perhaps an alternative approach is to write separate custom kernels for depthwise and pointwise, but with optimized code, to see if that provides a speedup. Let's consider that path first.
+
+First, let's consider optimizing the depthwise convolution.
+
+A depthwise convolution applies a single kernel to each input channel independently. So for each channel, it's a standard 2D convolution, but with kernel size kernel_size x kernel_size, and the same stride, padding, etc.
+
+Therefore, a custom kernel for depthwise can be written, which loops over each input channel, applies the convolution, and stores the result.
+
+Then, the pointwise convolution is a 1x1 convolution, which can be optimized as a matrix multiplication.
+
+Wait, for a 1x1 convolution with output channels O and input channels I, the computation can be viewed as a matrix multiply of the input tensor's spatial dimensions (flattened) with the weight matrix of size O x I.
+
+Specifically, for a 1x1 convolution with kernel [O, I, 1, 1], the output for each spatial position is a linear combination of the input channels. Thus, for each spatial position (h,w), the output channels are computed as:
+
+output[:, :, h, w] = weight_matrix * input[:, :, h, w]
+
+Therefore, if we reshape the input to (batch, I, H*W) and the output to (batch, O, H*W), then the 1x1 convolution is equivalent to a batch matrix multiply of the weights (O x I) with the input (I x H*W), resulting in O x H*W, then reshaped back.
+
+Thus, the pointwise convolution can be implemented with a matrix multiplication, which can be optimized using cuBLAS or a custom kernel.
+
+Therefore, combining these two steps:
+
+- Compute the depthwise convolution using a custom kernel (to possibly reduce overhead and improve performance).
+
+- Compute the pointwise as a matrix multiplication using an optimized implementation.
+
+Alternatively, fusing the two into a single kernel might still be beneficial, but let's see.
+
+First, let's try writing a custom depthwise convolution kernel.
+
+Depthwise Convolution Custom Kernel:
+
+The depthwise convolution has the following parameters:
+
+- Input: (batch, in_channels, height, width)
+
+- Depthwise weights: (in_channels, 1, kernel_size, kernel_size) [since it's depthwise]
+
+- Output: (batch, in_channels, height_out, width_out)
+
+The computation for each input channel is a standard 2D convolution. The kernel applies to each channel independently.
+
+To implement this in CUDA:
+
+Each thread can handle an output element. The grid can be organized as:
+
+- blockIdx.x: batch
+
+- blockIdx.y: output channel (since in_channels is the number of channels, which can be up to 64)
+
+- threadIdx.x: output x position (h_out)
+
+- threadIdx.y: output y position (w_out)
+
+Wait, but CUDA blocks have maximum dimensions. Alternatively, arrange the grid such that each block handles a single batch and channel, and the threads handle the output spatial positions.
+
+Alternatively, use a grid where each block processes a spatial position (h_out, w_out) across all batches and channels.
+
+Alternatively, to simplify, let's consider the following kernel structure:
+
+For each output element (b, c_in, h_out, w_out):
+
+    The value is the sum over kh, kw of input[b][c_in][h_in][w_in] * weight[c_in][kh][kw]
+
+where h_in = h_out * stride + (kh - padding) * dilation
+
+w_in = w_out * stride + (kw - padding) * dilation
+
+We can structure the kernel such that each thread computes one output element.
+
+Thus:
+
+- Grid dimensions: batch x in_channels x height_out x width_out → but this is too large (batch=16, in_channels=64, height_out=512, width_out=512 → 16*64*512*512 ~ 268 million threads, which is way too much. Not feasible.
+
+Therefore, need a more efficient way.
+
+An optimized approach is to use shared memory to load input tiles and reuse them for multiple kernel applications.
+
+Alternatively, the standard approach for 2D convolution in CUDA is to use tiled processing, where each thread block computes a block of output elements, using shared memory to cache the input tile needed for the convolution.
+
+For depthwise convolution:
+
+Each thread block can process a block of output spatial locations for a single channel and batch.
+
+Let's outline the steps for the depthwise kernel:
+
+1. Each block is assigned to process a spatial block of the output, e.g., a block of H TILE x W TILE, for a particular batch and input channel.
+
+2. The block loads the corresponding input tile into shared memory, including the necessary padding.
+
+3. Each thread in the block computes a subset of the output elements by applying the kernel to the shared memory tile.
+
+However, this requires careful management of shared memory and tiling.
+
+Alternatively, here's a possible kernel structure:
+
+- The kernel is launched with a grid of (batch, in_channels, blocks_h, blocks_w), where blocks_h and blocks_w divide the output spatial dimensions.
+
+But this may be complex.
+
+Alternatively, let's use the following approach:
+
+The kernel is structured to handle one output spatial position per thread, but grouped into blocks for efficiency.
+
+Alternatively, let's look for existing examples or think of a simpler approach.
+
+Alternatively, here's a possible simplified kernel for the depthwise convolution:
+
+The kernel is written to process one output element per thread.
+
+The grid is set as:
+
+blockDim.x = 256
+
+gridDim.x = ceil( (batch * in_channels * height_out * width_out) / blockDim.x )
+
+Each thread computes one output element:
+
+threadIdx = blockIdx.x * blockDim.x + threadIdx.x
+
+Compute batch, c_in, h_out, w_out from threadIdx.
+
+Then compute the value by looping over kh and kw.
+
+But with batch=16, in_channels=64, height_out=512, width_out=512:
+
+Total elements: 16 * 64 * 512 * 512 = ~268 million. Each thread would handle one element, but with a block size of 256, this would require 268M / 256 ≈ 1 million blocks, which is possible but may have high launch overhead.
+
+Moreover, the computation per thread is O(kernel_size^2), which for kernel_size=3 is manageable.
+
+But this approach may not be optimal for performance due to the high number of threads and potential memory access patterns.
+
+Alternatively, using a tiled approach with shared memory can reduce memory accesses.
+
+Given time constraints, perhaps writing a straightforward kernel with per-thread computation is manageable, even if not optimal.
+
+Let's proceed with that approach.
+
+Here's a draft for the depthwise kernel:
+
+__global__ void depthwise_conv2d(
+    const float* input,   // shape (batch, in_channels, height, width)
+    const float* weight,  // shape (in_channels, 1, kernel_h, kernel_w)
+    float* output,        // shape (batch, in_channels, height_out, width_out)
+    int batch, int in_channels, int height, int width,
+    int kernel_h, int kernel_w,
+    int stride, int padding, int dilation,
+    int height_out, int width_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * in_channels * height_out * width_out) return;
+
+    // Compute batch, c_in, h_out, w_out
+    int w_out = idx % width_out;
+    int rem = idx / width_out;
+    int h_out = rem % height_out;
+    rem /= height_out;
+    int c_in = rem % in_channels;
+    int b = rem / in_channels;
+
+    // Compute output value
+    float acc = 0.0f;
+    for (int kh = 0; kh < kernel_h; ++kh) {
+        for (int kw = 0; kw < kernel_w; ++kw) {
+            int h_in = h_out * stride + (kh - padding) * dilation;
+            int w_in = w_out * stride + (kw - padding) * dilation;
+            if (h_in >= 0 && h_in < height && w_in >= 0 && w_in < width) {
+                acc += input[b * in_channels * height * width + c_in * height * width + h_in * width + w_in] *
+                       weight[c_in * kernel_h * kernel_w + kh * kernel_w + kw];
+            }
+        }
+    }
+    output[b * in_channels * height_out * width_out + c_in * height_out * width_out + h_out * width_out + w_out] = acc;
+}
+
+This is a very straightforward kernel but may have poor performance due to global memory accesses and lack of shared memory optimization. However, it's a starting point.
+
+Similarly, the pointwise convolution can be implemented as a matrix multiply.
+
+The pointwise convolution has weights of size (out_channels, in_channels, 1, 1). So, the weights can be viewed as a matrix of shape [out_channels, in_channels].
+
+The pointwise computation is equivalent to:
+
+output_pointwise[b][o][h][w] = sum_{c_in} (depthwise_out[b][c_in][h][w] * pointwise_weight[o][c_in]) + bias[o]
+
+Since the pointwise is 1x1, the spatial dimensions are preserved (assuming same padding as depthwise, which in this case stride=1, padding=1, so output spatial is same).
+
+Thus, for each spatial position (h,w), the output is a matrix multiply of the depthwise's output channels and the pointwise's weight matrix.
+
+Therefore, the pointwise can be implemented as a batch matrix multiply.
+
+The input to the pointwise is (batch, in_channels, height, width).
+
+The output is (batch, out_channels, height, width).
+
+The weights are (out_channels, in_channels).
+
+So, the operation can be expressed as:
+
+output = weight_matrix @ input_channels + bias
+
+To perform this efficiently, we can use cuBLAS' gemm functions, or write a custom kernel.
+
+Using cuBLAS would be more efficient, but requires reshaping the tensors.
+
+Alternatively, a custom kernel:
+
+__global__ void pointwise_conv2d(
+    const float* depthwise_out,
+    const float* pointwise_weight,
+    float* output,
+    const float* bias,
+    int batch, int in_channels, int out_channels, int height, int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * out_channels * height * width) return;
+
+    int w = idx % width;
+    int rem = idx / width;
+    int h = rem % height;
+    rem /= height;
+    int o = rem % out_channels;
+    int b = rem / out_channels;
+
+    float acc = 0.0f;
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        acc += depthwise_out[b * in_channels * height * width + c_in * height * width + h * width + w] * 
+               pointwise_weight[o * in_channels + c_in];
+    }
+    if (bias) {
+        acc += bias[o];
+    }
+    output[b * out_channels * height * width + o * height * width + h * width + w] = acc;
+}
+
+This kernel would also be straightforward but may have high arithmetic intensity and may benefit from optimizations.
+
+Now, the fused approach would combine these two steps into a single kernel, avoiding the intermediate depthwise_out tensor.
+
+The fused kernel would process each output element directly:
+
+output[b][o][h_out][w_out] = sum_{c_in} [ (sum_{kh,kw} input[b][c_in][h_in][w_in] * depthwise_weight[c_in][kh][kw]) * pointwise_weight[o][c_in] ] + bias[o]
+
+Which can be written as:
+
+output[b][o][h_out][w_out] = sum_{c_in} [ (depthwise_val[c_in] ) * pointwise_weight[o][c_in] ] + bias[o]
+
+where depthwise_val[c_in] is the depthwise convolution result for channel c_in.
+
+To compute this in a single kernel, we can structure the computation as:
+
+for each b, o, h_out, w_out:
+
+    acc = 0.0
+
+    for each c_in:
+
+        compute depthwise_val for c_in at (h_out, w_out)
+
+        acc += depthwise_val * pointwise_weight[o][c_in]
+
+    acc += bias[o]
+
+    output[b][o][h_out][w_out] = acc
+
+This way, we avoid storing the depthwise intermediate result.
+
+Thus, the fused kernel would have the following structure:
+
+__global__ void fused_conv2d(
+    const float* input,
+    const float* depthwise_weight,
+    const float* pointwise_weight,
+    float* output,
+    const float* bias,
+    int batch, int in_channels, int out_channels,
+    int height, int width, int kernel_h, int kernel_w,
+    int stride, int padding, int dilation,
+    int height_out, int width_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * out_channels * height_out * width_out) return;
+
+    // Compute indices
+    int w_out = idx % width_out;
+    int rem = idx / width_out;
+    int h_out = rem % height_out;
+    rem /= height_out;
+    int o = rem % out_channels;
+    int b = rem / out_channels;
+
+    float acc = 0.0f;
+
+    // Iterate over input channels
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        // Compute depthwise_val for c_in at (h_out, w_out)
+        float depthwise_val = 0.0f;
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                int h_in = h_out * stride + (kh - padding) * dilation;
+                int w_in = w_out * stride + (kw - padding) * dilation;
+                if (h_in >= 0 && h_in < height && w_in >= 0 && w_in < width) {
+                    const float input_val = input[ 
+                        b * in_channels * height * width + 
+                        c_in * height * width + 
+                        h_in * width + w_in
+                    ];
+                    const float weight_val = depthwise_weight[ 
+                        c_in * kernel_h * kernel_w + kh * kernel_w + kw
+                    ];
+                    depthwise_val += input_val * weight_val;
+                }
+            }
+        }
+        // Multiply by pointwise weight and accumulate
+        acc += depthwise_val * pointwise_weight[o * in_channels + c_in];
+    }
+
+    // Add bias if present
+    if (bias) {
+        acc += bias[o];
+    }
+
+    // Write output
+    output[ 
+        b * out_channels * height_out * width_out + 
+        o * height_out * width_out + 
+        h_out * width_out + w_out 
+    ] = acc;
+}
+
+This fused kernel combines both convolutions into a single kernel, eliminating the intermediate depthwise output tensor. The key advantage is reduced memory traffic and fewer kernel launches, which can lead to better performance.
+
+Now, implementing this in PyTorch requires wrapping the kernel in a Python extension.
+
+However, the kernel needs to handle all the parameters, including the weights and bias tensors, as well as the input tensor's shape and the convolution parameters.
+
+Now, to integrate this into the ModelNew class, we need to define the fused kernel and call it in the forward method.
+
+The steps are:
+
+1. Define the CUDA kernel code as a string.
+
+2. Use torch.utils.cpp_extension.load_inline to compile the kernel.
+
+3. In ModelNew, store references to the depthwise and pointwise weights and bias (or not, since the kernel can access them directly via pointers).
+
+Wait, but in PyTorch, the model's parameters are managed by the model instance. So in the forward method, the fused kernel needs to access the weights and bias of the depthwise and pointwise convolutions.
+
+However, in the original Model class, the depthwise and pointwise are nn.Conv2d modules. Thus, their weights and bias are stored in self.depthwise.weight, self.depthwise.bias, etc.
+
+Thus, in the ModelNew's forward method, the fused kernel must be able to access these parameters.
+
+Therefore, the fused CUDA function must take pointers to these tensors.
+
+In the example code, the custom kernel function (elementwise_add_cuda) takes tensors a and b as inputs, and returns the output.
+
+Similarly, the fused_conv2d_cuda function would take input, depthwise_weight, depthwise_bias, pointwise_weight, pointwise_bias, etc. as parameters.
+
+Wait, but in the original code, the depthwise and pointwise convolutions have their own bias terms. The depthwise convolution may have bias=False, but the pointwise may have bias.
+
+Looking back at the original code:
+
+class Model(nn.Module):
+    def __init__(self, ... , bias: bool = False):
+        self.depthwise = nn.Conv2d(..., bias=bias)
+        self.pointwise = nn.Conv2d(..., bias=bias)
+
+Wait, in the __init__ of Model, the depthwise and pointwise both take the 'bias' argument. So if bias=True, both have biases; else, both don't.
+
+Thus, the fused kernel must account for whether bias is present.
+
+Therefore, the fused kernel must take the bias tensors as parameters, and check if they are non-null.
+
+But in PyTorch, when a convolution has no bias, the bias attribute is None. So in the kernel, we can pass the pointer to the bias tensor, and in the kernel, check if it's null before adding.
+
+Now, putting this all together, here's the plan:
+
+Implement the fused_conv2d kernel, and wrap it in a Python function using load_inline.
+
+The kernel requires the following parameters:
+
+- input: input tensor (batch, in_channels, H, W)
+
+- depthwise_weight: weight of depthwise (in_channels, 1, kernel_size, kernel_size)
+
+- pointwise_weight: weight of pointwise (out_channels, in_channels, 1, 1)
+
+- depthwise_bias: bias of depthwise (optional)
+
+- pointwise_bias: bias of pointwise (optional)
+
+Wait, but in the original model, the depthwise and pointwise both can have biases, but the user's example uses bias=False as default. However, in the fused kernel, the bias from depthwise is not used, because the depthwise's bias is added to its output, which is then used in the pointwise's computation.
+
+Wait a minute! In the original code:
+
+The forward path is:
+
+x = self.depthwise(x)  # applies depthwise conv, including bias if present
+
+x = self.pointwise(x)  # applies pointwise conv, including bias if present
+
+Therefore, the fused kernel must also include the depthwise's bias in the depthwise computation, and the pointwise's bias in the final output.
+
+In the fused approach, the depthwise's bias would be added to the depthwise_val before multiplying by pointwise's weights.
+
+Wait, the depthwise computation is:
+
+depthwise_out[c_in] = sum_{kh,kw} input * kernel + bias_depthwise[c_in]
+
+Then, the pointwise computation is:
+
+pointwise_out[o] = sum_{c_in} (depthwise_out[c_in] * pointwise_weight[o][c_in]) + bias_pointwise[o]
+
+Therefore, in the fused kernel:
+
+For each c_in:
+
+depthwise_val = (sum_{kh,kw} input*kernel) + (depthwise_bias[c_in] if present)
+
+Then, the pointwise computation is:
+
+acc += depthwise_val * pointwise_weight[o][c_in]
+
+plus the pointwise's bias.
+
+Therefore, the kernel must also account for the depthwise's bias.
+
+This complicates things, as the depthwise's bias is per input channel, and the pointwise's is per output channel.
+
+Thus, the fused kernel must include:
+
+- depthwise_weight (input_channels, kernel_h, kernel_w)
+
+- depthwise_bias (input_channels)
+
+- pointwise_weight (output_channels, input_channels)
+
+- pointwise_bias (output_channels)
+
+Therefore, the kernel's parameters include all these tensors.
+
+Thus, in the fused kernel code, the parameters would be:
+
+input: torch.Tensor,
+
+depthwise_weight: torch.Tensor,
+
+depthwise_bias: torch.Tensor,
+
+pointwise_weight: torch.Tensor,
+
+pointwise_bias: torch.Tensor,
+
+plus the convolution parameters like stride, padding, dilation, etc.
+
+Wait, but in the original model, the stride, padding, dilation are parameters passed to the Conv2d layers.
+
+Therefore, in the fused kernel, we must also pass these parameters as arguments.
+
+Hence, the fused_conv2d_cuda function will need to take these parameters.
+
+This is getting quite complex.
+
+Now, let's write the code.
+
+First, define the CUDA kernel:
+
+```python
+fused_conv2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void fused_conv2d(
+    const scalar_t* input,
+    const scalar_t* depthwise_weight,
+    const scalar_t* depthwise_bias,
+    const scalar_t* pointwise_weight,
+    const scalar_t* pointwise_bias,
+    scalar_t* output,
+    int batch, int in_channels, int out_channels,
+    int height, int width, int kernel_h, int kernel_w,
+    int stride, int padding, int dilation,
+    int height_out, int width_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * out_channels * height_out * width_out) return;
+
+    int w_out = idx % width_out;
+    int rem = idx / width_out;
+    int h_out = rem % height_out;
+    rem /= height_out;
+    int o = rem % out_channels;
+    int b = rem / out_channels;
+
+    scalar_t acc = 0;
+
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        // Compute depthwise_val for this channel
+        scalar_t depthwise_val = 0;
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                int h_in = h_out * stride + (kh - padding) * dilation;
+                int w_in = w_out * stride + (kw - padding) * dilation;
+                if (h_in >= 0 && h_in < height && w_in >= 0 && w_in < width) {
+                    // Compute input index
+                    int input_offset = 
+                        b * in_channels * height * width +
+                        c_in * height * width +
+                        h_in * width + w_in;
+                    scalar_t input_val = input[input_offset];
+
+                    // Compute depthwise kernel weight
+                    int dw_weight_offset = 
+                        c_in * kernel_h * kernel_w +
+                        kh * kernel_w + kw;
+                    scalar_t dw_weight = depthwise_weight[dw_weight_offset];
+
+                    depthwise_val += input_val * dw_weight;
+                }
+            }
+        }
+        // Add depthwise bias if present
+        if (depthwise_bias) {
+            depthwise_val += depthwise_bias[c_in];
+        }
+
+        // Multiply by pointwise weight and accumulate
+        int pw_weight_offset = o * in_channels + c_in;
+        acc += depthwise_val * pointwise_weight[pw_weight_offset];
+    }
+
+    // Add pointwise bias if present
+    if (pointwise_bias) {
+        acc += pointwise_bias[o];
+    }
+
+    // Write output
+    int output_offset = 
+        b * out_channels * height_out * width_out +
+        o * height_out * width_out +
+        h_out * width_out + w_out;
+    output[output_offset] = acc;
+}
+
+std::tuple<torch::Tensor> fused_conv2d_cuda(
+    torch::Tensor input,
+    torch::Tensor depthwise_weight,
+    torch::Tensor depthwise_bias,
+    torch::Tensor pointwise_weight,
+    torch::Tensor pointwise_bias,
+    int stride, int padding, int dilation,
+    int height_out, int width_out
+) {
+    const auto batch = input.size(0);
+    const auto in_channels = input.size(1);
+    const auto out_channels = pointwise_weight.size(0);
+    const auto height = input.size(2);
+    const auto width = input.size(3);
+    const auto kernel_h = depthwise_weight.size(2);
+    const auto kernel_w = depthwise_weight.size(3);
+
+    auto output = torch::zeros({batch, out_channels, height_out, width_out}, input.options());
+
+    const int threads_per_block = 256;
+    const int num_elements = batch * out_channels * height_out * width_out;
+    const int num_blocks = (num_elements + threads_per_block - 1) / threads_per_block;
+
+    // Launch kernel
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "fused_conv2d", ([&] {
+        fused_conv2d<scalar_t><<<num_blocks, threads_per_block>>>(
+            input.data_ptr<scalar_t>(),
+            depthwise_weight.data_ptr<scalar_t>(),
+            depthwise_bias.defined() ? depthwise_bias.data_ptr<scalar_t>() : nullptr,
+            pointwise_weight.data_ptr<scalar_t>(),
+            pointwise_bias.defined() ? pointwise_bias.data_ptr<scalar_t>() : nullptr,
+            output.data_ptr<scalar_t>(),
+            batch, in_channels, out_channels,
+            height, width, kernel_h, kernel_w,
+            stride, padding, dilation,
+            height_out, width_out
+        );
+    }));
+
+    return output;
+}
+"""
+
+fused_conv2d_cpp_source = """
+torch::Tensor fused_conv2d_cuda(
+    torch::Tensor input,
+    torch::Tensor depthwise_weight,
+    torch::Tensor depthwise_bias,
+    torch::Tensor pointwise_weight,
+    torch::Tensor pointwise_bias,
+    int stride, int padding, int dilation,
+    int height_out, int width_out
+);
+"""
+
+# Compile the fused kernel
+fused_conv2d = load_inline(
+    name="fused_conv2d",
+    cpp_sources=[fused_conv2d_cpp_source],
+    cuda_sources=[fused_conv2d_source],
+    functions=["fused_conv2d_cuda"],
+    verbose=True,
+)
+```
+
+Now, the ModelNew class must use this fused kernel. However, to get the parameters from the original Model, we need to access them in the forward function.
+
+Wait, but in PyTorch, the model parameters are stored in the modules. Thus, in the ModelNew class, we can have the depthwise and pointwise layers as before, but replace their forward with the fused kernel.
+
+Wait, no. The ModelNew class should not contain the Conv2d layers, since we are replacing them with the fused kernel. But the parameters (weights and biases) must still be part of the model.
+
+Therefore, in ModelNew, we should have parameters that are the weights and biases from the original depthwise and pointwise layers.
+
+Alternatively, we can have the ModelNew class accept the same parameters as the original Model and initialize the weights and biases as parameters.
+
+Wait, perhaps the best way is to have the ModelNew class contain the same parameters as the original Model's depthwise and pointwise layers.
+
+Therefore, the ModelNew class would have parameters:
+
+- depthwise_weight: Parameter of shape (in_channels, 1, kernel_size, kernel_size)
+
+- depthwise_bias: Parameter of shape (in_channels) or None
+
+- pointwise_weight: Parameter of shape (out_channels, in_channels, 1, 1)
+
+- pointwise_bias: Parameter of shape (out_channels) or None
+
+But this would require copying the parameters from the original model's layers.
+
+Alternatively, the user expects that the ModelNew is a drop-in replacement for the original Model, so the parameters should be initialized the same way. Thus, the ModelNew should initialize the parameters in the same way as the original Model's layers.
+
+Therefore, the ModelNew class should have parameters for depthwise and pointwise, similar to the original Model.
+
+Wait, but the original Model uses nn.Conv2d instances, which handle their own parameters. To replicate this, the ModelNew must have equivalent parameters.
+
+Therefore, the code would be:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super().__init__()
+        # Initialize parameters similar to depthwise and pointwise convolutions
+        self.depthwise_weight = nn.Parameter(torch.empty(in_channels, 1, kernel_size, kernel_size))
+        if bias:
+            self.depthwise_bias = nn.Parameter(torch.empty(in_channels))
+        else:
+            self.register_parameter('depthwise_bias', None)
+        
+        self.pointwise_weight = nn.Parameter(torch.empty(out_channels, in_channels, 1, 1))
+        if bias:
+            self.pointwise_bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter('pointwise_bias', None)
+        
+        # Initialize weights and biases similar to nn.Conv2d
+        nn.init.kaiming_uniform_(self.depthwise_weight, a=math.sqrt(5))
+        if self.depthwise_bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.depthwise_weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.depthwise_bias, -bound, bound)
+        nn.init.kaiming_uniform_(self.pointwise_weight, a=math.sqrt(5))
+        if self.pointwise_bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.pointwise_weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.pointwise_bias, -bound, bound)
+        
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        # Compute output dimensions
+        # Assuming same padding as in the original model (same as depthwise's calculation)
+        # height_out = (height + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
+        # Similarly for width. To compute dynamically:
+        N, C, H, W = x.shape
+        kernel_h = self.kernel_size
+        kernel_w = self.kernel_size
+        padding_h = self.padding
+        padding_w = self.padding
+        dilation_h = self.dilation
+        dilation_w = self.dilation
+        stride_h = self.stride
+        stride_w = self.stride
+
+        effective_kernel_h = dilation_h * (kernel_h - 1) + 1
+        effective_kernel_w = dilation_w * (kernel_w - 1) + 1
+
+        output_h = (H + 2 * padding_h - effective_kernel_h) // stride_h + 1
+        output_w = (W + 2 * padding_w - effective_kernel_w) // stride_w + 1
+
+        # Get the parameters as tensors
+        dw_weight = self.depthwise_weight
+        dw_bias = self.depthwise_bias
+        pw_weight = self.pointwise_weight
+        pw_bias = self.pointwise_bias
+
+        # Call the fused kernel
+        output = fused_conv2d.fused_conv2d_cuda(
+            x,
+            dw_weight,
+            dw_bias if dw_bias is not None else torch.Tensor(),  # Pass empty tensor if no bias
+            pw_weight,
+            pw_bias if pw_bias is not None else torch.Tensor(),
+            self.stride, self.padding, self.dilation,
+            output_h, output_w
+        )
+
+        return output
+
+However, this requires that the parameters are initialized identically to the original nn.Conv2d layers. The initialization code above mirrors the default initialization of nn.Conv2d, so this should be okay.
+
+Wait, in PyTorch's nn.Conv2d, the parameters are initialized with kaiming_uniform_, which is what we have here. So that's correct.
+
+But the original Model uses the groups=in_channels for depthwise, which in the parameters is handled by the kernel shape (depthwise_weight has groups=in_channels, i.e., one kernel per input channel). So that's correctly represented.
+
+Now, the problem is that when the user instantiates ModelNew, it needs to have parameters that are compatible with the original Model's initialization. The code above does that.
+
+However, there's an issue with the depthwise_weight's shape. In the original Model's depthwise layer:
+
+self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=in_channels, bias=bias)
+
+The weight shape for this layer is (in_channels, 1, kernel_size, kernel_size), which matches our depthwise_weight's shape.
+
+Similarly, the pointwise layer is nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias), so its weight is (out_channels, in_channels, 1, 1), which matches our pointwise_weight's shape.
+
+Therefore, the parameters are correctly set.
+
+Another consideration: the fused_conv2d_cuda function requires the depthwise_weight to have shape (in_channels, kernel_h, kernel_w). Since in PyTorch, the weight is stored as (out_channels, in_channels / groups, kernel_h, kernel_w), but for groups=in_channels, the depthwise layer's weight is (in_channels, 1, kernel_h, kernel_w). So the code is correct.
+
+Now, testing the kernel dimensions:
+
+For example, in the test case given:
+
+batch_size = 16
+
+in_channels = 64
+
+out_channels = 128
+
+kernel_size = 3
+
+width = 512
+
+height = 512
+
+stride = 1
+
+padding = 1
+
+dilation = 1
+
+The depthwise_weight has shape (64, 1, 3, 3)
+
+The pointwise_weight has shape (128, 64, 1, 1)
+
+The depthwise_bias is (64) if bias is True.
+
+The output dimensions for depthwise are computed as:
+
+effective_kernel_h = 1*(3-1)+1 = 3
+
+output_h = (512 + 2*1 -3)/1 +1 = (512+2-3)/1 +1 = (511)+1 =512.
+
+Same for width, so output_h and output_w remain 512.
+
+Thus, the kernel will compute correctly.
+
+Now, in the fused_conv2d_cuda function, the parameters are passed correctly.
+
+The code for the ModelNew is as above.
+
+But there's a potential issue with passing the depthwise_bias and pointwise_bias. In the kernel, if the bias is not present, we pass a null pointer. In the Python function, if the bias is None, we pass an empty tensor, but in the kernel, we check if depthwise_bias is null.
+
+Wait, in the fused_conv2d_cuda Python function:
+
+depthwise_bias.defined() ? depthwise_bias.data_ptr() : nullptr
+
+Thus, in Python, if depthwise_bias is a Tensor that's not defined (e.g., self.depthwise_bias is None), then in the function call, we have to pass a Tensor that is not defined, but in Python, how is that done?
+
+Wait, in the ModelNew's forward, for the depthwise_bias:
+
+if self.depthwise_bias is not None:
+
+    dw_bias = self.depthwise_bias
+
+else:
+
+    dw_bias = torch.Tensor()  # empty tensor
+
+But in C++, the Tensor's defined() function will return false for an empty Tensor, so the kernel will treat it as nullptr.
+
+Thus, this should work.
+
+Now, compiling this code:
+
+The fused_conv2d_source uses template for scalar_t, which is necessary for different data types (e.g., float vs double). The AT_DISPATCH_FLOATING_TYPES macro dispatches to the correct type.
+
+The kernel function is launched with the correct parameters.
+
+Thus, this should work.
+
+Now, putting it all together, the final code is as follows.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused CUDA kernel for depthwise-separable convolution
+fused_conv2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void fused_conv2d(
+    const scalar_t* input,
+    const scalar_t* depthwise_weight,
+    const scalar_t* depthwise_bias,
+    const scalar_t* pointwise_weight,
+    const scalar_t* pointwise_bias,
+    scalar_t* output,
+    int batch, int in_channels, int out_channels,
+    int height, int width, int kernel_h, int kernel_w,
+    int stride, int padding, int dilation,
+    int height_out, int width_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * out_channels * height_out * width_out) return;
+
+    int w_out = idx % width_out;
+    int rem = idx / width_out;
+    int h_out = rem % height_out;
+    rem /= height_out;
+    int o = rem % out_channels;
+    int b = rem / out_channels;
+
+    scalar_t acc = 0;
+
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        scalar_t depthwise_val = 0;
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                int h_in = h_out * stride + (kh - padding) * dilation;
+                int w_in = w_out * stride + (kw - padding) * dilation;
+                if (h_in >= 0 && h_in < height && w_in >= 0 && w_in < width) {
+                    int input_offset = 
+                        b * in_channels * height * width +
+                        c_in * height * width +
+                        h_in * width + w_in;
+                    scalar_t input_val = input[input_offset];
+
+                    int dw_weight_offset = 
+                        c_in * kernel_h * kernel_w +
+                        kh * kernel_w + kw;
+                    scalar_t dw_weight = depthwise_weight[dw_weight_offset];
+
+                    depthwise_val += input_val * dw_weight;
+                }
+            }
+        }
+        if (depthwise_bias) {
+            depthwise_val += depthwise_bias[c_in];
+        }
+
+        int pw_weight_offset = o * in_channels + c_in;
+        acc += depthwise_val * pointwise_weight[pw_weight_offset];
+    }
+
+    if (pointwise_bias) {
+        acc += pointwise_bias[o];
+    }
+
+    int output_offset = 
+        b * out_channels * height_out * width_out +
+        o * height_out * width_out +
+        h_out * width_out + w_out;
+    output[output_offset] = acc;
+}
+
+std::tuple<torch::Tensor> fused_conv2d_cuda(
+    torch::Tensor input,
+    torch::Tensor depthwise_weight,
+    torch::Tensor depthwise_bias,
+    torch::Tensor pointwise_weight,
+    torch::Tensor pointwise_bias,
+    int stride, int padding, int dilation,
+    int height_out, int width_out
+) {
+    const auto batch = input.size(0);
+    const auto in_channels = input.size(1);
+    const auto out_channels = pointwise_weight.size(0);
+    const auto height = input.size(2);
+    const auto width = input.size(3);
+    const auto kernel_h = depthwise_weight.size(2);
+    const auto kernel_w = depthwise_weight.size(3);
+
+    auto output = torch::zeros({batch, out_channels, height_out, width_out}, input.options());
+
+    const int threads_per_block = 256;
+    const int num_elements = batch * out_channels * height_out * width_out;
+    const int num_blocks = (num_elements + threads_per_block - 1) / threads_per_block;
+
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "fused_conv2d", ([&] {
+        fused_conv2d<scalar_t><<<num_blocks, threads_per_block>>>(
+            input.data_ptr<scalar_t>(),
+            depthwise_weight.data_ptr<scalar_t>(),
+            depthwise_bias.defined() ? depthwise_bias.data_ptr<scalar_t>() : nullptr,
+            pointwise_weight.data_ptr<scalar_t>(),
+            pointwise_bias.defined() ? pointwise_bias.data_ptr<scalar_t>() : nullptr,
+            output.data_ptr<scalar_t>(),
+            batch, in_channels, out_channels,
+            height, width, kernel_h, kernel_w,
+            stride, padding, dilation,
+            height_out, width_out
+        );
+    }));
+
+    cudaDeviceSynchronize();  // Ensure kernel completion
+    return output;
+}
+"""
+
+fused_conv2d_cpp_source = """
+torch::Tensor fused_conv2d_cuda(
+    torch::Tensor input,
+    torch::Tensor depthwise_weight,
+    torch::Tensor depthwise_bias,
+    torch::Tensor pointwise_weight,
+    torch::Tensor pointwise_bias,
+    int stride, int padding, int dilation,
+    int height_out, int width_out
+);
+"""
+
+# Compile the fused CUDA kernel
+fused_conv2d = load_inline(
+    name="fused_conv2d",
+    cpp_sources=[fused_conv2d_cpp_source],
+    cuda_sources=[fused_conv2d_source],
+    functions=["fused_conv2d_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super().__init__()
+        self.depthwise_weight = nn.Parameter(torch.empty(in_channels, 1, kernel_size, kernel_size))
+        self.depthwise_bias = nn.Parameter(torch.empty(in_channels)) if bias else None
+        self.pointwise_weight = nn.Parameter(torch.empty(out_channels, in_channels, 1, 1))
+        self.pointwise_bias = nn.Parameter(torch.empty(out_channels)) if bias else None
+
+        # Initialize parameters similarly to PyTorch's default initialization
+        nn.init.kaiming_uniform_(self.depthwise_weight, a=math.sqrt(5))
+        if self.depthwise_bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.depthwise_weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.depthwise_bias, -bound, bound)
+        nn.init.kaiming_uniform_(self.pointwise_weight, a=math.sqrt(5))
+        if self.pointwise_bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.pointwise_weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.pointwise_bias, -bound, bound)
+
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+    def forward(self, x):
+        N, C, H, W = x.shape
+        kernel_h = self.kernel_size
+        kernel_w = self.kernel_size
+        padding_h = self.padding
+        padding_w = self.padding
+        dilation_h = self.dilation
+        dilation_w = self.dilation
+        stride_h = self.stride
+        stride_w = self.stride
+
+        effective_kernel_h = dilation_h * (kernel_h - 1) + 1
+        effective_kernel_w = dilation_w * (kernel_w - 1) + 1
+
+        height_out = (H + 2 * padding_h - effective_kernel_h) // stride_h + 1
+        width_out = (W + 2 * padding_w - effective_kernel_w) // stride_w + 1
+
+        # Prepare bias tensors
+        dw_bias = self.depthwise_bias if self.depthwise_bias is not None else torch.Tensor()
+        pw_bias = self.pointwise_bias if self.pointwise_bias is not None else torch.Tensor()
+
+        # Call fused kernel
+        output = fused_conv2d.fused_conv2d_cuda(
+            x,
+            self.depthwise_weight,
+            dw_bias,
+            self.pointwise_weight,
+            pw_bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            height_out,
+            width_out
+        )
+
+        return output
+```
+
+Please note that the code assumes you have the necessary CUDA environment set up and that the PyTorch version supports the used extensions. The fused convolution combines both depthwise and pointwise operations into a single kernel to minimize memory access and kernel launch overhead. The parameters are initialized to match PyTorch's default initialization for consistency.

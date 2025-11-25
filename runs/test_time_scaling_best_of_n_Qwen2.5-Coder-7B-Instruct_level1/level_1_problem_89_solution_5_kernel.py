@@ -1,0 +1,109 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for cumulative sum
+cumulative_sum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void cumulative_sum_kernel(const float* input, float* output, int batch_size, int seq_len) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int bid = blockIdx.y;
+
+    if (tid < seq_len) {
+        output[bid * seq_len + tid] = input[bid * seq_len + tid];
+        for (int i = 1; i <= tid; ++i) {
+            output[bid * seq_len + tid] += input[bid * seq_len + tid - i];
+        }
+    }
+}
+
+torch::Tensor cumulative_sum_cuda(torch::Tensor input, int dim) {
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(dim);
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (seq_len + block_size - 1) / block_size;
+
+    cumulative_sum_kernel<<<num_blocks * batch_size, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, seq_len);
+
+    return output;
+}
+"""
+
+cumulative_sum_cpp_source = (
+    "torch::Tensor cumulative_sum_cuda(torch::Tensor input, int dim);"
+)
+
+# Compile the inline CUDA code for cumulative sum
+cumulative_sum = load_inline(
+    name="cumulative_sum",
+    cpp_sources=cumulative_sum_cpp_source,
+    cuda_sources=cumulative_sum_source,
+    functions=["cumulative_sum_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    A simple model that performs a cumulative sum (prefix sum) operation along a specified dimension using a custom CUDA kernel.
+
+    Parameters:
+        dim (int): The dimension along which to perform the scan operation.
+    """
+
+    def __init__(self, dim):
+        """
+        Initialize the Scan model.
+
+        Args:
+            dim (int): The dimension along which to perform the cumulative sum.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.cumulative_sum = cumulative_sum
+
+    def forward(self, x):
+        """
+        Forward pass for the Scan model, computing the cumulative sum along the specified dimension using a custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape), where `*input_shape` 
+                              can vary depending on the use case.
+
+        Returns:
+            torch.Tensor: Tensor of the same shape as `x` after applying cumulative sum along `dim`.
+        """
+        if self.dim == 1:
+            return self.cumulative_sum.cumulative_sum_cuda(x, self.dim)
+        else:
+            raise ValueError("Custom CUDA kernel currently supports only dim=1")
+
+# Define input dimensions and parameters
+batch_size = 32768
+input_shape = (32768,)
+dim = 1
+
+def get_inputs():
+    """
+    Generates random inputs for testing the Scan model.
+
+    Returns:
+        list: A list containing a single randomly generated tensor with shape 
+              (batch_size, *input_shape).
+    """
+    return [torch.rand(batch_size, *input_shape)]
+
+def get_init_inputs():
+    """
+    Returns the initialization parameters for the Scan model.
+
+    Returns:
+        list: A list containing the `dim` parameter for model initialization.
+    """
+    return [dim]

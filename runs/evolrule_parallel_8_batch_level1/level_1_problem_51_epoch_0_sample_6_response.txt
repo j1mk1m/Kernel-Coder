@@ -1,0 +1,179 @@
+Your implementation must have a function called `get_inputs()` and `get_init_inputs()` that are compatible with the provided ones. Make sure that the new `get_inputs()` and `get_init_inputs()` do not change the input shapes or the number of outputs, so that the original and new models can be compared in the same framework. 
+
+The custom CUDA kernel must be inlined, i.e., written as a string in the Python file, using the torch.utils.cpp_extension.load_inline function. 
+
+Do not use any third-party libraries. The code must be compatible with PyTorch 2.1.0 and CUDA 12.1. 
+
+Make sure your code works for any batch_size, dim1, dim2. 
+
+The kernel should be a single CUDA kernel. You can replace the argmax operator with a custom CUDA kernel. 
+
+The ArgMax operator is a reduction over a dimension, returning the indices of the maximum values. For example, given a tensor of shape (batch_size, dim1, dim2), the output after argmax over dim=1 will have shape (batch_size, dim2). 
+
+The CUDA kernel must correctly handle tensors of arbitrary sizes and dimensions, not just the specific example shapes. 
+
+The ArgMax operation requires, for each slice along the specified dimension, finding the index of the maximum value. This can be parallelized by processing each element in the output tensor with a thread, where each thread is responsible for a particular position in the output and computes the argmax over the corresponding slice in the input.
+
+For example, for a 3D tensor input with shape (B, D1, D2) and dim=1, each output element at (b, d2) corresponds to the argmax over input[b, :, d2]. So, each thread can process one (b, d2) position, iterate over the D1 elements in that slice, track the maximum value and its index, then write the index to the output.
+
+The CUDA kernel should handle this logic efficiently, using appropriate memory access patterns and thread organization. 
+
+The kernel should be written in a way that is as efficient as possible, considering coalesced memory access and minimizing divergence. Threads could be grouped in a way that each block handles a block of output positions, and threads within a block process individual elements. 
+
+You can use shared memory to store the slice being processed by a block to improve memory access efficiency, but it's optional. 
+
+The kernel needs to handle all possible cases, including when the input tensor has more than 3 dimensions. The dim argument can be negative (e.g., dim=-1 refers to the last dimension). 
+
+Make sure that your kernel correctly handles the dim argument, including negative dimensions, by converting it to a positive index based on the input tensor's number of dimensions.
+
+The output tensor's shape should match what torch.argmax would produce, with the specified dimension removed. 
+
+The kernel must be type-agnostic; it should work for any floating-point tensor type (float16, float32, etc.), but for simplicity, you can focus on float32 as the input type unless you can implement type promotion. 
+
+The kernel should not use any PyTorch CUDA extensions or ATen functions internally but instead use raw CUDA and thrust if needed. However, thrust might complicate things, so better to avoid it. 
+
+The kernel must be written to handle all possible valid input shapes and dimensions. 
+
+The final Python class ModelNew must have the same interface as the original Model class, including the dim parameter in __init__, and the forward method taking a single tensor x and returning the argmax result.
+
+The function get_init_inputs() must return the same as the original, which is [1], so in ModelNew's __init__, you can just forward the dim parameter as before.
+
+When compiling the CUDA code with load_inline, ensure that all necessary headers are included, and that the functions are properly exposed.
+
+Make sure that the kernel is correctly dimensioned and that the launch configuration (block and grid sizes) are chosen appropriately for performance, e.g., using a reasonable block size like 256 or 512, and computing the grid size based on the total number of output elements.
+
+Also, ensure that the output tensor is initialized correctly with the appropriate size and device.
+
+Now, write the optimized code for the given architecture.
+
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+def _get_output_shape(input_shape, dim):
+    # Handle negative dimensions
+    dim = dim if dim >= 0 else len(input_shape) + dim
+    output_shape = list(input_shape)
+    del output_shape[dim]
+    return output_shape
+
+argmax_kernel_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void argmax_kernel(const scalar_t* __restrict__ input, int64_t* output,
+                             int total_elements, int input_dims, int dim_size,
+                             int output_strides[], int input_strides[],
+                             int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+
+    // Compute the output coordinates
+    int out_coords[input_dims - 1];
+    int temp = idx;
+    for (int i = input_dims - 2; i >= 0; --i) {
+        out_coords[i] = temp % output_strides[i];
+        temp /= output_strides[i];
+    }
+
+    // Compute the input index range along the dimension
+    int input_offset = 0;
+    int dim_pos = 0;
+    for (int d = 0; d < input_dims; ++d) {
+        if (d == dim) {
+            dim_pos = input_offset;
+            input_offset += dim_size * input_strides[d];
+        } else {
+            input_offset += out_coords[d >= dim ? d - 1 : d] * input_strides[d];
+        }
+    }
+
+    // Find the maximum value's index in the current slice
+    scalar_t max_val = -INFINITY;
+    int max_idx = 0;
+    for (int i = 0; i < dim_size; ++i) {
+        int pos = input_offset + i * input_strides[dim];
+        scalar_t val = input[pos];
+        if (val > max_val) {
+            max_val = val;
+            max_idx = i;
+        }
+    }
+
+    output[idx] = max_idx;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> argmax_cuda(torch::Tensor input, int64_t dim) {
+    const int64_t* input_shape = input.sizes().data();
+    int input_dims = input.dim();
+    dim = dim < 0 ? dim + input_dims : dim;
+    int dim_size = input.size(dim);
+
+    auto output_shape = _get_output_shape(input.sizes().vec(), dim);
+    auto output = torch::empty(output_shape, input.options().dtype(torch::kLong)).cuda();
+
+    int64_t total_elements = output.numel();
+
+    // Compute strides for input and output
+    int64_t input_strides[input_dims];
+    int64_t output_strides[input_dims - 1];
+    input.strides(input_strides);
+    torch::Tensor output_cpu = output.cpu(); // To compute strides on CPU
+    output_cpu.strides(output_strides);
+
+    const int block_size = 256;
+    int grid_size = (total_elements + block_size - 1) / block_size;
+
+    // Launch kernel with appropriate template
+    AT_DISPATCH_ALL_TYPES(input.scalar_type(), "argmax_kernel", ([&] {
+        argmax_kernel<scalar_t><<<grid_size, block_size>>>(
+            input.data<scalar_t>(), output.data_ptr<int64_t>(),
+            total_elements, input_dims, dim_size,
+            output_strides, input_strides, dim);
+    }));
+
+    cudaDeviceSynchronize();
+    return std::make_tuple(output, input); // Returning input to avoid optimization removal
+}
+"""
+
+argmax_kernel_cpp_source = """
+std::tuple<torch::Tensor, torch::Tensor> argmax_cuda(torch::Tensor input, int64_t dim);
+"""
+
+argmax_cuda = load_inline(
+    name="argmax_cuda",
+    cpp_sources=argmax_kernel_cpp_source,
+    cuda_sources=argmax_kernel_source,
+    functions=["argmax_cuda"],
+    verbose=True,
+    extra_cflags=["-D_GLIBCXX_USE_CXX11_ABI=0"],
+    extra_cuda_cflags=["-arch=sm_75"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.argmax_cuda = argmax_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure the input is on the correct device
+        x = x.cuda()
+        # Call the CUDA kernel and return only the output
+        output, _ = self.argmax_cuda(x, self.dim)
+        return output.long()  # Ensure output is long type as per torch.argmax
+
+def get_inputs():
+    x = torch.rand(batch_size, dim1, dim2).cuda()
+    return [x]
+
+def get_init_inputs():
+    return [1]
+```
+</think>

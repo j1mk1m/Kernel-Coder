@@ -1,0 +1,81 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_min_subtract_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_min_subtract_kernel(const float* a, const float* b, float* c, const float* constant, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = fmin(sum, constant[0]) - constant[0];
+    }
+}
+
+torch::Tensor matmul_min_subtract_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor constant) {
+    int m = a.size(0);
+    int n = b.size(1);
+    int k = a.size(1);
+
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 256;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    matmul_min_subtract_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(
+        a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), constant.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matmul_min_subtract_cpp_source = (
+    "torch::Tensor matmul_min_subtract_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor constant);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul_min_subtract = load_inline(
+    name="matmul_min_subtract",
+    cpp_sources=matmul_min_subtract_cpp_source,
+    cuda_sources=matmul_min_subtract_source,
+    functions=["matmul_min_subtract_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, constant):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.constant = nn.Parameter(torch.tensor(constant))
+        self.matmul_min_subtract = matmul_min_subtract
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.matmul_min_subtract.matmul_min_subtract_cuda(x, x, self.constant)
+        return x
+
+
+if __name__ == "__main__":
+    batch_size = 128
+    in_features = 16384
+    out_features = 16384
+    constant = 2.0
+
+    model = ModelNew(in_features, out_features, constant)
+    inputs = get_inputs()
+
+    output = model(inputs[0])
+    print(output.shape)

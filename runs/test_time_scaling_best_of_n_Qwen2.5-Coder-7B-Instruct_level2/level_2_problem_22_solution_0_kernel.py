@@ -1,0 +1,89 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+
+    auto c = torch::zeros({m, n}, a.options());
+
+    dim3 threadsPerBlock(16, 16);
+    dim3 blocksPerGrid((n + threadsPerBlock.x - 1) / threadsPerBlock.x, (m + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    matmul_kernel<<<blocksPerGrid, threadsPerBlock>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scale_factor = scale_factor
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        x = self.matmul.matmul_cuda(x, self.weight)
+        x = x * self.scale_factor
+        x = x + x
+        x = torch.clamp(x, self.clamp_min, self.clamp_max)
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        x = x * torch.nn.functional.mish(x)
+        return x
+
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+scale_factor = 2.0
+clamp_min = -10.0
+clamp_max = 10.0
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, scale_factor, clamp_min, clamp_max]
+
+model_new = ModelNew(input_size, hidden_size, scale_factor, clamp_min, clamp_max)
+
+x = torch.rand(batch_size, input_size)
+output = model_new(x)
+print(output.shape)

@@ -1,0 +1,130 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for batch matrix multiplication
+bmm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bmm_kernel(const float* a, const float* b, float* c, int batch_size, int in_features, int out_features) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < out_features) {
+        float sum = 0.0f;
+        for (int k = 0; k < in_features; ++k) {
+            sum += a[row * in_features + k] * b[k * out_features + col];
+        }
+        c[row * out_features + col] = sum;
+    }
+}
+
+torch::Tensor bmm_cuda(torch::Tensor a, torch::Tensor b) {
+    auto batch_size = a.size(0);
+    auto in_features = a.size(1);
+    auto out_features = b.size(1);
+
+    auto c = torch::zeros({batch_size, out_features}, a.options());
+
+    const int block_size = 256;
+    const int num_cols = (out_features + block_size - 1) / block_size;
+    const int num_rows = (batch_size + block_size - 1) / block_size;
+
+    bmm_kernel<<<dim3(num_rows, num_cols), dim3(block_size, block_size)>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), batch_size, in_features, out_features);
+
+    return c;
+}
+"""
+
+bmm_cpp_source = (
+    "torch::Tensor bmm_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for batch matrix multiplication
+bmm_module = load_inline(
+    name="bmm_module",
+    cpp_sources=bmm_cpp_source,
+    cuda_sources=bmm_source,
+    functions=["bmm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for summation
+summation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void summation_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor summation_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    summation_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+summation_cpp_source = (
+    "torch::Tensor summation_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for summation
+summation_module = load_inline(
+    name="summation_module",
+    cpp_sources=summation_cpp_source,
+    cuda_sources=summation_source,
+    functions=["summation_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA operators for batch matrix multiplication and summation.
+    """
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = bmm_module
+        self.summation = summation_module
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x, y):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+            y (torch.Tensor): Input tensor of shape (batch_size, out_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.bmm.bmm_cuda(x, y)
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        x = self.summation.summation_cuda(x, y)
+        x = x * y
+        return x
+
+batch_size = 1024  # Increased batch size
+in_features = 8192  # Increased input features
+out_features = 8192  # Increased output features
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features), torch.rand(batch_size, out_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]

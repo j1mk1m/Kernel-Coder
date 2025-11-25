@@ -1,0 +1,689 @@
+    You can define multiple custom CUDA operators. For example, you can combine the GroupNorm and Tanh into a single kernel. Or the Residual Addition and LogSumExp into another kernel. 
+
+    The goal is to create a ModelNew that replaces parts of the original Model with custom CUDA kernels for better performance. The rest of the code should remain the same. 
+
+    Please make sure the code compiles and is functional. If you need to use pytorch extensions, use torch.utils.cpp_extension.load_inline. 
+
+    You should also make sure that the get_inputs() and get_init_inputs() functions are compatible with the original ones (i.e., if the original get_inputs() returns a list of tensors, the new one should too).
+Alright, let's tackle optimizing the provided PyTorch model with custom CUDA kernels. The original model has several operations: convolution, group normalization, tanh, hardswish, residual addition, and logsumexp. The goal is to replace some of these with custom CUDA kernels for better performance. 
+
+First, I need to identify which operators can be fused or optimized. The residual addition (adding x_conv and x_hard_swish) and logsumexp are two operations that might be candidates. The group norm followed by tanh could also be fused since they are sequential and might benefit from reduced memory transfers.
+
+Starting with the residual addition and logsumexp. The residual addition is a simple element-wise addition between x_conv and x_hard_swish. Then logsumexp is applied over dimension 1. Since both are element-wise operations, perhaps combining them into a single kernel could reduce overhead. 
+
+Wait, logsumexp is a bit more complex. It involves computing the sum of exponentials then taking the log. Let me recall the formula: log(sum(exp(x))). The residual addition is x_conv + x_hard_swish. So after the addition, we need to compute logsumexp over dim 1. 
+
+Hmm, perhaps fusing the residual addition with the logsumexp might not be straightforward because logsumexp requires a reduction. But maybe combining the residual addition with the preceding operations? Alternatively, let's see which parts are most compute-bound. 
+
+Looking at the group norm and tanh. Group norm involves computing mean and variance per group, then normalizing and scaling. Doing this in a custom kernel could be beneficial, especially if it can be combined with the tanh activation. Since tanh is an element-wise function, after normalization, applying tanh immediately could be done in the same kernel, saving memory and computation steps.
+
+So, perhaps creating a fused group norm + tanh kernel would be a good start. Let me think about the steps involved in group norm:
+
+For each group:
+1. Compute mean of the group's elements.
+2. Compute variance.
+3. Normalize each element: (x - mean) / sqrt(var + eps).
+4. Scale and shift (but since there's no affine, maybe no scale/shift? The original group norm here uses default affine parameters (no weights/biases?), so the output is (x - mean)/sqrt(var + eps).
+
+Wait, the GroupNorm in PyTorch by default has affine parameters (learnable scale and shift). However, in the given model, the GroupNorm is initialized with "eps=eps", but the affine is not mentioned. Wait, the constructor for GroupNorm is groups, num_channels, eps, and affine (default is True). Wait, no, checking the PyTorch docs: GroupNorm's parameters are groups, num_channels, eps (default 1e-5), and affine (default True). So if the user doesn't specify affine, it's True. But in the original model, the GroupNorm is created with groups, out_channels, and eps=1e-5, so affine is True. Wait, the original model's group_norm is initialized as self.group_norm = nn.GroupNorm(groups, out_channels, eps=eps). Since affine is not set, it's True by default, so the group norm has learnable parameters. Hmm, but when fusing, we might need to include those parameters in the kernel. Wait, but in the model, the parameters are part of the module (the group_norm has weights and biases). Therefore, the custom kernel would need to take those weights and biases as inputs. 
+
+Hmm, that complicates things. So the fused group norm + tanh would need to take the group parameters (weights, biases, groups, eps), perform the group norm, then apply tanh. Since the group norm has learnable parameters, the kernel would need to handle the scaling and shifting as well.
+
+Alternatively, maybe it's better to separate the group norm into its own kernel. Let's see.
+
+Alternatively, perhaps the residual addition and logsumexp can be fused. The residual addition is simply x_conv + x_hard_swish. Then logsumexp over dim 1. Since logsumexp is a reduction, perhaps combining the residual addition with the logsumexp isn't straightforward, but maybe the residual addition can be done in the same kernel as the previous operation (hard_swish). Let's see.
+
+The hard_swish is an element-wise activation. So perhaps fusing the hard_swish with the residual addition? But the residual addition requires adding x_conv (the convolution output) to the result of hard_swish(x_tanh). Wait, the order is:
+
+x_conv is the output of the convolution.
+
+Then group norm is applied to x_conv: x_norm = group_norm(x_conv).
+
+Then tanh is applied to x_norm: x_tanh = tanh(x_norm).
+
+Then hard_swish is applied to x_tanh: x_hard_swish = hard_swish(x_tanh).
+
+Then residual addition: x_res = x_conv + x_hard_swish.
+
+Ah, so the residual addition adds the original convolution output to the post-activation result. That's interesting because the convolution output is before any normalization/activation. So the residual connection is between the input to the group norm and the output of the hard_swish. 
+
+This might be a point where the residual addition can be combined with the hard_swish. Since hard_swish is element-wise, after computing it, adding x_conv could be done in the same kernel. That could save a memory transfer.
+
+Alternatively, perhaps fusing the group norm and tanh into a single kernel, then hard_swish into another, and then the residual addition with logsumexp. 
+
+Alternatively, another candidate is the logsumexp, which is a reduction over a dimension. The logsumexp is applied after the residual addition, so perhaps combining those steps.
+
+Let me try to outline possible fusion points:
+
+1. GroupNorm + Tanh: Since both are element-wise after normalization (except for the mean/variance computation in group norm), combining them into a single kernel could save time.
+
+2. HardSwish + Residual Addition: Since the hard_swish is element-wise, and the residual addition requires adding x_conv (which is already stored), but x_conv's shape may differ. Wait, the shapes: 
+
+The convolution's output is (batch_size, out_channels, height, width). The x_conv is the result of the convolution. The hard_swish's output is the same shape as x_conv. The residual addition is x_conv + x_hard_swish, so their shapes must match. Since x_conv comes from a Conv2d with out_channels as the output channels, and the group norm and subsequent layers keep the same shape, the addition is valid.
+
+Thus, after computing the hard_swish, the residual addition can be done in the same kernel, avoiding an extra step. However, x_conv is needed. So the kernel would need to have access to x_conv's data. That's possible if we pass it as an input tensor.
+
+Wait, in the forward pass:
+
+After the hard_swish, we have x_hard_swish. Then x_res = x_conv + x_hard_swish. 
+
+So, if we can compute hard_swish(x_tanh) and then add x_conv in the same kernel, we can eliminate the intermediate x_hard_swish tensor. That would save memory and computation steps. 
+
+Similarly, the logsumexp can be done after that, but logsumexp is a reduction over dim 1, so it might be better to compute that as a separate step, but perhaps combined with the residual addition.
+
+Alternatively, perhaps the residual addition and logsumexp can be fused into a single kernel, but since logsumexp is a reduction, which requires accumulating over elements, it's a bit more complex. Let's think:
+
+The residual addition is straightforward, but logsumexp requires:
+
+log( sum(exp(x_res[:,i,:,:])) over all i in dim 1. Wait, for each position in the spatial dimensions, we need to sum over the channels (dim 1) of x_res. Wait, no: logsumexp(x_res, dim=1, keepdim=True) would compute for each element in the batch and spatial dimensions, the log of the sum over the channel dimension (dim 1) of exp(x_res). 
+
+Wait, the logsumexp along dim 1 would reduce the channels to 1, so the output is (batch_size, 1, height, width).
+
+Hmm, perhaps combining the residual addition with logsumexp is possible but would require handling the reduction in the kernel. Let me see:
+
+Suppose the residual addition is x_conv + x_hard_swish. Then, the logsumexp over dim 1 is done. 
+
+Alternatively, after the residual addition, we can compute the logsumexp in a separate kernel. But if we can combine the two steps (residual addition and logsumexp), that might save some time.
+
+Alternatively, since logsumexp is a reduction, maybe it's better to keep it as a separate kernel. 
+
+So, possible kernels to write:
+
+1. Fused GroupNorm + Tanh kernel.
+
+2. Fused HardSwish + Residual Addition kernel.
+
+3. LogSumExp kernel (since it's a reduction and might need to be handled separately).
+
+Alternatively, perhaps the residual addition and the logsumexp can be combined. Let me see:
+
+Suppose after the hard_swish, we have x_hard_swish. Then, the residual addition is x_conv + x_hard_swish, which is x_res. Then, the logsumexp is applied over dim 1.
+
+Alternatively, we could compute the logsumexp of (x_conv + hard_swish(x_tanh)) in a single kernel. 
+
+But the logsumexp requires computing the sum over dim 1. So, if we can compute the residual addition and then compute the logsumexp in one kernel, that's better. Let me think of the steps:
+
+For each element in the spatial dimensions (height and width), and for each batch, we need to process all channels in dim 1. The residual addition is element-wise, so each element in x_res is x_conv[i] + x_hard_swish[i]. Then, for each spatial position, we need to compute the logsumexp over the channels (dim 1). 
+
+The logsumexp computation over dim 1 can be parallelized per spatial location and batch, with each thread handling a channel, and then performing a reduction across channels. But this might be complex. Alternatively, the logsumexp can be implemented in a separate kernel, but combining with the residual addition might not be worth the effort. 
+
+Alternatively, the residual addition can be done in the same kernel as the hard_swish, as they are both element-wise, so the kernel can compute hard_swish and then add x_conv in place, saving an intermediate tensor. That seems manageable.
+
+So let's outline the plan:
+
+1. Implement a fused GroupNorm + Tanh kernel. This would handle the normalization and tanh in a single step.
+
+2. Implement a fused HardSwish + Residual Addition kernel. This would compute the hard_swish on the tanh output and then add the original x_conv tensor.
+
+3. Implement a LogSumExp kernel for the final reduction over dim 1.
+
+Alternatively, maybe the logsumexp can be left as a PyTorch function since it's a reduction, but perhaps a custom kernel would be faster for large tensors.
+
+Now, let's start writing the code.
+
+First, the GroupNorm + Tanh kernel. The group norm involves:
+
+For each group:
+
+- Compute the mean and variance of the group's elements.
+
+- Normalize each element (x - mean) / sqrt(var + eps).
+
+- Then apply the tanh function.
+
+But since group norm has learnable weights and biases, we need to include those in the computation. The formula for group norm is:
+
+y = (x - mean) / sqrt(var + eps) * gamma + beta
+
+Where gamma and beta are the learnable parameters (weights and biases) of the GroupNorm layer.
+
+So the kernel needs to take as inputs:
+
+- Input tensor (x_conv)
+
+- Gamma (weights) and Beta (biases) of the group norm
+
+- Number of groups
+
+- Epsilon
+
+- The output tensor.
+
+So the kernel would need to loop over each element, compute the group it belongs to, compute the mean and variance for that group, then normalize and apply gamma and beta, then apply tanh.
+
+Wait, but computing mean and variance per group requires reductions, which complicates things. Since the group norm's computation is across each group's channels and spatial dimensions, it's a bit involved. 
+
+Calculating mean and variance for each group is a per-group reduction. Since this is part of the kernel, this requires that for each group, the kernel first computes the mean and variance, then applies the normalization. However, this would require some synchronization between threads, which can be tricky in CUDA.
+
+Alternatively, perhaps it's better to compute the mean and variance for each group in a separate step before applying the normalization and tanh. But that might not be helpful. Alternatively, the group norm can be implemented in a kernel, but it's going to be a bit complex.
+
+Alternatively, perhaps using PyTorch's existing group norm implementation isn't worth replacing, but the problem requires us to replace some operators with custom CUDA kernels for speedup. 
+
+Alternatively, maybe the tanh can be fused with the group norm's output, but the group norm itself might be too involved for a custom kernel. Let's see.
+
+Alternatively, perhaps the group norm is better left as is, and instead focus on the residual addition and logsumexp, which are element-wise and reduction steps.
+
+Alternatively, the group norm could be fused with tanh, but I need to think through the steps.
+
+Let me try to sketch the group norm kernel:
+
+The input is a 4D tensor of shape (N, C, H, W). The number of groups G divides C.
+
+For each group g (0 to G-1):
+
+- Channels in group g are from (g*C/G) to ((g+1)*C/G).
+
+Wait, actually, group norm divides the channels into G groups. Each group has C/G channels.
+
+For each group g, the elements are all the channels in that group, across all spatial dimensions and batch elements.
+
+The mean and variance are computed over all elements in the group across all spatial and batch dimensions.
+
+Wait, no: group norm computes the mean and variance for each group's channels for each sample in the batch, but across the spatial dimensions. Wait, actually, group norm normalizes per sample, per group. The mean and variance are computed for each group within each sample. 
+
+Wait, according to the PyTorch documentation:
+
+GroupNorm divides the channels into groups and computes within each group the mean and variance for normalization. The formula is:
+
+y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x] + \epsilon}} * \gamma + \beta
+
+The expectation and variance are computed per group and per sample.
+
+Therefore, for each group g and each sample n, the mean and variance are computed over all the channels in group g and over the spatial dimensions (H and W).
+
+Therefore, for each sample n, the group's channels are flattened (H*W) and the mean and variance are computed across those elements.
+
+Therefore, for each group and each sample, we need to compute the mean and variance over the spatial dimensions and the group's channels.
+
+This complicates things because the computation is per group and per sample.
+
+Therefore, the kernel would need to:
+
+1. For each element in the input tensor, determine which sample n, group g, and channel it belongs to.
+
+2. For each group g and sample n, compute the mean and variance over the group's channels and spatial dimensions.
+
+This requires that for each group and sample, we accumulate the sum and sum of squares.
+
+Implementing this in CUDA would require a per-group and per-sample reduction. This is feasible but requires careful handling. 
+
+Given the time constraints, perhaps it's better to proceed with other kernels first, like the residual addition and logsumexp.
+
+Alternatively, maybe the group norm can be left as a PyTorch operator and focus on other parts. The problem states that we can choose which operators to replace, so maybe it's better to focus on the residual addition and logsumexp.
+
+Let me proceed with the residual addition and logsumexp.
+
+First, the residual addition is x_conv + x_hard_swish. Since both tensors have the same shape, this is element-wise. The hard_swish is also element-wise, so perhaps combining the hard_swish with the residual addition in a single kernel could save memory. 
+
+Wait, the hard_swish is applied to x_tanh, which is the output of group norm and tanh. So the sequence is:
+
+x_tanh = tanh(group_norm(x_conv))
+
+x_hard_swish = hard_swish(x_tanh)
+
+x_res = x_conv + x_hard_swish
+
+So, to fuse the hard_swish and the residual addition, we can compute x_hard_swish and then add x_conv in the same kernel. This way, we can compute the result directly into an output tensor without needing to store the intermediate x_hard_swish.
+
+Therefore, a fused kernel for hard_swish and residual addition:
+
+The inputs would be x_tanh (output of group norm and tanh), x_conv, and the output would be x_res = x_conv + hard_swish(x_tanh).
+
+The hard_swish function is defined as:
+
+hard_swish(x) = x * ReLU6(x + 3) / 6
+
+So, in the kernel, we can compute the hard_swish on x_tanh, then add x_conv.
+
+This would save one intermediate tensor and reduce memory usage. 
+
+Next, the logsumexp over dim 1. The logsumexp is applied to the residual addition's result. The logsumexp over dim 1 will reduce the channels to 1, so the output shape is (N, 1, H, W).
+
+Implementing logsumexp in CUDA requires, for each element in the spatial dimensions and batch, to compute the sum over the channels (dim 1) of exp(x), then take the log.
+
+This can be done with a kernel that, for each spatial position and batch, loops over the channels, computes exp(x), sums them, and takes the log. 
+
+Alternatively, using atomic operations for the summation. But for large channels, it might be better to use a reduction approach. 
+
+Let me outline the steps for the logsumexp kernel:
+
+Each thread block handles a single spatial position (H, W) and batch element. The block then has as many threads as needed to cover the channels (C). 
+
+Each thread in the block processes one channel (c), computes exp(x[c]), and accumulates the sum. The sum is stored in shared memory, then the block reduces it. Finally, the log of the sum is written to the output.
+
+Alternatively, for simplicity, given that the channels are 64 (out_channels=64), a block could have one thread per channel, and each thread adds their exp value to a shared variable.
+
+Wait, let's think of the input tensor x_res of shape (N, C, H, W). The output is (N, 1, H, W). 
+
+The kernel could be structured as follows:
+
+For each element in the output (each position in N, H, W):
+
+- Iterate over all channels C for that position.
+
+- Compute the sum of exp(x_res[n, c, h, w]) for all c.
+
+- Compute log(sum).
+
+The problem is that for large C (like 64), this might be manageable per thread block.
+
+Let me consider the dimensions:
+
+Assuming that the batch size is 128, H and W are 128 each, so total spatial elements are 128*128=16384 per batch, and with batch size 128, total spatial positions are 128*16384 = ~2 million. That's a lot, but manageable with CUDA.
+
+Alternatively, the kernel can process each spatial position independently. So, each thread block can handle one spatial position (H, W) across all batches. 
+
+Alternatively, perhaps the best way is to launch a kernel where each thread block handles a single spatial position (H, W) across all batches, and within the block, threads handle the channels. 
+
+The logsumexp kernel steps:
+
+1. For each spatial position (h, w):
+
+   a. For each batch n in 0..N-1:
+
+      i. Compute the sum over all c in 0..C-1 of exp(x_res[n][c][h][w]).
+
+      ii. Compute log(sum) and store in output[n][0][h][w].
+
+The challenge is efficiently computing this across all batches and spatial positions.
+
+Alternatively, the kernel can be designed to handle a single batch element and spatial position at a time. 
+
+Perhaps using a 3D grid where the first dimension is the batch, second is height, third is width. Each thread block processes a single (n, h, w) position. 
+
+Inside the block, each thread processes a channel, computes exp(x_res), and accumulates into shared memory. Then, reduce the shared memory to get the sum, compute the log, and write to output.
+
+This approach requires:
+
+- For each (n, h, w), a block of threads.
+
+- The number of threads per block is at least the number of channels (C=64), so 64 threads.
+
+- The block size can be 64 or higher (e.g., 128 to have more threads and handle multiple channels).
+
+Wait, but with 64 channels, 64 threads would suffice.
+
+Let me outline the kernel code for logsumexp:
+
+__global__ void logsumexp_kernel(
+    const float* input, float* output, 
+    int N, int C, int H, int W) {
+
+    // Each block handles a (n, h, w) position
+    int n = blockIdx.x;
+    int h = blockIdx.y;
+    int w = blockIdx.z;
+
+    // Shared memory for partial sums
+    __shared__ float shared_sum;
+
+    // Initialize shared_sum to zero
+    if (threadIdx.x == 0) {
+        shared_sum = 0.0f;
+    }
+    __syncthreads();
+
+    // Each thread handles a channel
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float val = exp(input[INDEX(n, c, h, w)]);
+        atomicAdd(&shared_sum, val);
+    }
+
+    __syncthreads();
+
+    // Only one thread computes the log and writes the result
+    if (threadIdx.x == 0) {
+        output[INDEX(n, 0, h, w)] = logf(shared_sum);
+    }
+}
+
+But the indexing here is crucial. The input is stored as (N, C, H, W), so the index would be n * C*H*W + c * H*W + h * W + w. 
+
+Alternatively, using a helper macro for indexing:
+
+#define INDEX(n, c, h, w) ((n)*C*H*W + (c)*H*W + (h)*W + w)
+
+Wait, but in CUDA, the memory is stored in row-major order, so the actual layout is contiguous in the order of n, c, h, w? Or maybe it's stored as (n, h, w, c)? Wait, PyTorch tensors are stored in C order, so for a 4D tensor (N, C, H, W), the strides are such that the last dimension (W) is contiguous, then H, then C, then N. So the index would be n * C*H*W + c * H*W + h * W + w.
+
+Yes. So the kernel would correctly index that way.
+
+The block size would be the number of channels, so for C=64, blockDim.x=64. The grid dimensions would be N x H x W.
+
+But N is 128, H and W are 128 each. So the grid size would be 128 (batch) * 128 (height) * 128 (width) = 2,097,152 blocks. That's a lot. However, CUDA can handle that, but might have some overhead.
+
+Alternatively, perhaps we can have the batch dimension handled as part of the block's x dimension, and h and w as y and z. 
+
+Wait, the block dimensions are set as (blockDim.x, blockDim.y, blockDim.z), but for the kernel above, the block is 1D (blockDim.x = 64). The grid is 3D (N, H, W). 
+
+Wait, the kernel uses a 3D grid where each block corresponds to a (n, h, w) position. The blockIdx.x is n, blockIdx.y is h, blockIdx.z is w. 
+
+So the gridDim.x is N, gridDim.y is H, gridDim.z is W. 
+
+This way, each block is responsible for one (n, h, w) position. 
+
+The blockDim.x is the number of threads per block, which should be at least the number of channels C (64). 
+
+This would require:
+
+- Block dimensions: (C, 1, 1) (if using 1D blocks).
+
+- Grid dimensions: (N, H, W).
+
+This should work.
+
+Now, the atomicAdd might be a bottleneck if multiple threads are writing to the same address. Wait, in the code above, each thread is adding their value to shared_sum. But shared_sum is a single variable, so using atomicAdd is necessary to prevent race conditions. However, with 64 threads, atomicAdd on a single variable could lead to contention. 
+
+Alternatively, instead of using atomicAdd, we can have each thread store their contribution in shared memory and then perform a reduction. 
+
+Let me revise the kernel to use shared memory for the partial sums, then do a reduction:
+
+__global__ void logsumexp_kernel(
+    const float* input, float* output, 
+    int N, int C, int H, int W) {
+
+    extern __shared__ float shared_sums[];
+
+    int n = blockIdx.x;
+    int h = blockIdx.y;
+    int w = blockIdx.z;
+    int tid = threadIdx.x;
+
+    // Each thread computes its contribution and stores in shared memory
+    if (tid < C) {
+        int c = tid;
+        float val = exp(input[INDEX(n, c, h, w)]);
+        shared_sums[tid] = val;
+    } else {
+        shared_sums[tid] = 0.0f;
+    }
+
+    __syncthreads();
+
+    // Perform reduction in shared memory
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sums[tid] += shared_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[INDEX(n, 0, h, w)] = logf(shared_sums[0]);
+    }
+}
+
+Wait, but the block size is C (64), so the shared memory size would be blockDim.x * sizeof(float). Since each thread writes their val to shared_sums[tid], which is their thread index. 
+
+Wait, in this code, each thread with tid < C (since blockDim.x is C) will compute their val and store in shared_sums[tid]. Then, the rest (if any) can be zero.
+
+Wait, but if C is equal to the block size, then all threads (up to C) have a c to process. 
+
+The reduction step uses a standard parallel reduction in shared memory. Since the block size is C, the loop would go from C/2 down to 1. 
+
+The total shared memory needed is blockDim.x * sizeof(float), which for C=64 is 256 bytes, which is acceptable.
+
+This approach avoids atomic operations and is more efficient. 
+
+Now, the kernel launch would be:
+
+logsumexp_kernel<<<dim3(N, H, W), dim3(C), C * sizeof(float)>>>(
+    input, output, N, C, H, W);
+
+But in the PyTorch model, the parameters N, C, H, W are known at runtime, so in the CUDA kernel, they need to be passed as parameters.
+
+Wait, in the PyTorch extension, the kernel function would have to handle the parameters. 
+
+This seems manageable.
+
+Now, moving to the fused hard_swish and residual addition kernel. 
+
+The inputs are:
+
+- x_tanh: the output of the previous layer (group norm and tanh)
+
+- x_conv: the output of the convolution (same shape as x_tanh)
+
+The kernel needs to compute for each element:
+
+out[i] = x_conv[i] + hard_swish(x_tanh[i])
+
+The hard_swish can be computed as:
+
+hard_swish(x) = x * max(0, x + 3) / 6
+
+Alternatively, the formula is:
+
+hard_swish(x) = x * ReLU6(x + 3)/6 
+
+So in code:
+
+float hw = x_tanh_val;
+float temp = hw + 3.0f;
+temp = max(temp, 0.0f);
+temp = min(temp, 6.0f); // ReLU6
+temp /= 6.0f;
+float res = hw * temp;
+
+Then, add x_conv_val to res.
+
+The kernel would be straightforward. 
+
+The kernel would take x_tanh and x_conv as inputs, and produce the output as the sum.
+
+The kernel code:
+
+__global__ void fused_hw_add_kernel(
+    const float* x_tanh, const float* x_conv, float* out, 
+    int size) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float hw = x_tanh[idx];
+        float temp = hw + 3.0f;
+        temp = max(temp, 0.0f);
+        temp = min(temp, 6.0f); // ReLU6
+        temp /= 6.0f;
+        float res = hw * temp;
+        res += x_conv[idx];
+        out[idx] = res;
+    }
+}
+
+The size would be the total number of elements, which is N*C*H*W.
+
+Now, putting this together, the model's forward would be:
+
+def forward(self, x):
+    x_conv = self.conv(x)
+    # GroupNorm and Tanh (PyTorch's implementation)
+    x_norm = self.group_norm(x_conv)
+    x_tanh = torch.tanh(x_norm)
+    # Fused HardSwish and Residual Addition
+    x_res = self.fused_hw_add(x_conv, x_tanh)
+    # LogSumExp via custom kernel
+    x_logsumexp = self.logsumexp(x_res)
+    return x_logsumexp
+
+Wait, but in the original model, after group norm and tanh, it's x_tanh, then hard_swish is applied to x_tanh, so the fused kernel should take x_tanh and x_conv, compute hard_swish(x_tanh), add to x_conv. 
+
+Yes, that's correct.
+
+So the fused kernel is indeed handling that step.
+
+Now, the group norm and tanh can be left as is, since implementing a fused version might be too involved given the time constraints, but the problem allows choosing which operators to replace. 
+
+Alternatively, perhaps the group norm can be replaced with a custom kernel, but given the complexity, let's proceed with the other kernels first.
+
+Now, the code structure would involve defining three custom kernels:
+
+1. The fused hard_swish and residual addition (fused_hw_add).
+
+2. The logsumexp kernel.
+
+Additionally, perhaps the group norm could be replaced, but I'll focus on the other parts first.
+
+Now, writing the code in Python with the inline CUDA extensions.
+
+First, define the fused_hw_add kernel:
+
+fused_hw_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_hw_add_kernel(
+    const float* x_tanh, const float* x_conv, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float hw = x_tanh[idx];
+        float temp = hw + 3.0f;
+        temp = max(temp, 0.0f);
+        temp = min(temp, 6.0f);
+        temp /= 6.0f;
+        out[idx] = hw * temp + x_conv[idx];
+    }
+}
+
+torch::Tensor fused_hw_add_cuda(
+    torch::Tensor x_tanh, torch::Tensor x_conv) {
+    auto size = x_tanh.numel();
+    auto out = torch::empty_like(x_tanh);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_hw_add_kernel<<<num_blocks, block_size>>>(
+        x_tanh.data_ptr<float>(), x_conv.data_ptr<float>(), 
+        out.data_ptr<float>(), size);
+    return out;
+}
+"""
+
+fused_hw_add_cpp_source = "torch::Tensor fused_hw_add_cuda(torch::Tensor x_tanh, torch::Tensor x_conv);"
+
+Then, the logsumexp kernel:
+
+logsumexp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void logsumexp_kernel(
+    const float* input, float* output, 
+    int N, int C, int H, int W) {
+    extern __shared__ float shared_sums[];
+    int n = blockIdx.x;
+    int h = blockIdx.y;
+    int w = blockIdx.z;
+    int tid = threadIdx.x;
+
+    if (tid < C) {
+        int c = tid;
+        shared_sums[tid] = exp(input[n * C * H * W + c * H * W + h * W + w]);
+    } else {
+        shared_sums[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sums[tid] += shared_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[n * H * W + 0 * H * W + h * W + w] = logf(shared_sums[0]);
+    }
+}
+
+torch::Tensor logsumexp_cuda(
+    torch::Tensor input) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+
+    auto output = torch::empty({N, 1, H, W}, input.options());
+
+    // Block size is C (number of channels)
+    const int block_size = C;
+    dim3 grid(N, H, W);
+    dim3 block(block_size);
+
+    logsumexp_kernel<<<grid, block, block_size * sizeof(float)>>>(
+        input.data_ptr<float>(), output.data_ptr<float>(), 
+        N, C, H, W);
+
+    return output;
+}
+"""
+
+logsumexp_cpp_source = "torch::Tensor logsumexp_cuda(torch::Tensor input);"
+
+Now, compiling these inline:
+
+elementwise_add = load_inline(...) for each kernel.
+
+Wait, in the example, they compiled each kernel separately. Let's compile both kernels into separate modules.
+
+Wait, in the example, each kernel had its own source and cpp sources. Here, we need to compile two different kernels.
+
+Alternatively, can we combine them into a single extension? Probably yes, but for simplicity, perhaps compile each as separate modules.
+
+Wait, but in the example, they used load_inline with a single kernel. Here, since we have two kernels (fused_hw_add and logsumexp), each with their own source code, we need to load them separately.
+
+Wait, the load_inline function can handle multiple functions in one call, but each function must be declared in the cpp sources.
+
+Alternatively, let's define both kernels in a single CUDA source, then compile them together.
+
+Let me try to merge the two CUDA sources into one:
+
+combined_source = fused_hw_add_source + logsumexp_source
+
+combined_cpp_sources = fused_hw_add_cpp_source + logsumexp_cpp_source
+
+Wait, but the fused_hw_add_source includes the header and the kernel code. Let me check:
+
+Wait, the first kernel's source code (fused_hw_add_source) starts with the headers and then defines the kernel and the wrapper function. The second kernel's source also includes headers again, which would cause duplicate definitions. So to merge them, we need to combine the kernels and their wrapper functions into a single source.
+
+Let me adjust:
+
+combined_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_hw_add_kernel(
+    const float* x_tanh, const float* x_conv, float* out, int size) {
+    // ... (same as before)
+}
+
+torch::Tensor fused_hw_add_cuda(
+    torch::Tensor x_tanh, torch::Tensor x_conv) {
+    // ... (same as before)
+}
+
+__global__ void logsumexp_kernel(
+    const float* input, float* output, 
+    int N, int C, int H, int W) {
+    // ... (same as before)
+}
+
+torch::Tensor logsumexp_cuda(
+    torch::Tensor input) {
+    // ... (same as before)
+}
+"""
+
+combined_cpp_source = (
+    "torch::Tensor fused_hw_add_cuda(torch::Tensor x_tanh, torch::Tensor x_conv);"
+    "torch::Tensor logsumexp_cuda(torch::Tensor input);"
+)
+
+Then, compile both together:
+
+combined_module = load_inline(
+    name="combined_kernels",
+    cpp_sources

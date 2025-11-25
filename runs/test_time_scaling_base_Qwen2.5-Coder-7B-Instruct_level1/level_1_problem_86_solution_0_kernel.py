@@ -1,0 +1,123 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for depthwise convolution
+depthwise_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void depthwise_conv_kernel(const float* x, const float* weight, float* out, int batch_size, int in_channels, int height, int width, int kernel_size, int stride, int padding, int dilation) {
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+    int h_start = blockIdx.z * stride - padding;
+    int w_start = blockIdx.w * stride - padding;
+
+    if (h_start >= 0 && h_start < height && w_start >= 0 && w_start < width) {
+        int h_end = h_start + kernel_size * dilation;
+        int w_end = w_start + kernel_size * dilation;
+
+        for (int kh = 0; kh < kernel_size; ++kh) {
+            for (int kw = 0; kw < kernel_size; ++kw) {
+                int x_idx = b * in_channels * height * width + c * height * width + (h_start + kh * dilation) * width + (w_start + kw * dilation);
+                int weight_idx = c * kernel_size * kernel_size + kh * kernel_size + kw;
+                out[x_idx] += x[x_idx] * weight[weight_idx];
+            }
+        }
+    }
+}
+
+torch::Tensor depthwise_conv_cuda(torch::Tensor x, torch::Tensor weight, int stride, int padding, int dilation) {
+    auto batch_size = x.size(0);
+    auto in_channels = x.size(1);
+    auto height = x.size(2);
+    auto width = x.size(3);
+    auto kernel_size = weight.size(2);
+
+    auto out = torch::zeros({batch_size, in_channels, height, width}, x.options());
+
+    dim3 blocks_per_grid(batch_size, in_channels, (height + padding - kernel_size * dilation + stride - 1) / stride, (width + padding - kernel_size * dilation + stride - 1) / stride);
+    dim3 threads_per_block(1, 1, 1);
+
+    depthwise_conv_kernel<<<blocks_per_grid, threads_per_block>>>(x.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(), batch_size, in_channels, height, width, kernel_size, stride, padding, dilation);
+
+    return out;
+}
+"""
+
+depthwise_conv_cpp_source = (
+    "torch::Tensor depthwise_conv_cuda(torch::Tensor x, torch::Tensor weight, int stride, int padding, int dilation);"
+)
+
+# Compile the inline CUDA code for depthwise convolution
+depthwise_conv = load_inline(
+    name="depthwise_conv",
+    cpp_sources=depthwise_conv_cpp_source,
+    cuda_sources=depthwise_conv_source,
+    functions=["depthwise_conv_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for pointwise convolution
+pointwise_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void pointwise_conv_kernel(const float* x, const float* weight, float* out, int batch_size, int in_channels, int out_channels, int height, int width) {
+    int b = blockIdx.x;
+    int c_in = blockIdx.y;
+    int c_out = blockIdx.z;
+    int h = blockIdx.w;
+    int w = blockIdx.x;
+
+    int x_idx = b * in_channels * height * width + c_in * height * width + h * width + w;
+    int weight_idx = c_in * out_channels + c_out;
+    out[b * out_channels * height * width + c_out * height * width + h * width + w] = x[x_idx] * weight[weight_idx];
+}
+
+torch::Tensor pointwise_conv_cuda(torch::Tensor x, torch::Tensor weight, int height, int width) {
+    auto batch_size = x.size(0);
+    auto in_channels = x.size(1);
+    auto out_channels = weight.size(0);
+
+    auto out = torch::zeros({batch_size, out_channels, height, width}, x.options());
+
+    dim3 blocks_per_grid(batch_size, in_channels, out_channels, height, width);
+    dim3 threads_per_block(1, 1, 1);
+
+    pointwise_conv_kernel<<<blocks_per_grid, threads_per_block>>>(x.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(), batch_size, in_channels, out_channels, height, width);
+
+    return out;
+}
+"""
+
+pointwise_conv_cpp_source = (
+    "torch::Tensor pointwise_conv_cuda(torch::Tensor x, torch::Tensor weight, int height, int width);"
+)
+
+# Compile the inline CUDA code for pointwise convolution
+pointwise_conv = load_inline(
+    name="pointwise_conv",
+    cpp_sources=pointwise_conv_cpp_source,
+    cuda_sources=pointwise_conv_source,
+    functions=["pointwise_conv_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.depthwise = depthwise_conv
+        self.pointwise = pointwise_conv
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.depthwise.depthwise_conv_cuda(x, self.weight, stride=self.stride, padding=self.padding, dilation=self.dilation)
+        x = self.pointwise.pointwise_conv_cuda(x, self.weight, height=x.size(2), width=x.size(3))
+        return x

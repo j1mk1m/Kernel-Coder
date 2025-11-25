@@ -1,0 +1,32 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Your custom CUDA kernel for matrix multiplication
+matrix_mult_source = """
+// Your CUDA kernel implementation here
+"""
+
+matrix_mult_cpp_source = (
+    // Your CUDA function declaration here
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matrix_mult = load_inline(
+    name="matrix_mult",
+    cpp_sources=matrix_mult_cpp_source,
+    cuda_sources=matrix_mult_source,
+    functions=["matrix_mult_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matrix_mult = matrix_mult
+    
+    def forward(self, A, B):
+        # Use your custom CUDA kernel for matrix multiplication
+        return self.matrix_mult.matrix_mult_cuda(A, B)

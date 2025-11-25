@@ -1,0 +1,719 @@
+Also, consider operator fusion and algorithmic changes (like online softmax). You can replace multiple operators with fused kernels. 
+
+First, analyze the given architecture. Let's see the forward path:
+
+conv_transpose -> maxpool -> hardtanh -> mean -> tanh
+
+The user wants to optimize this pipeline by replacing some or all operators with custom CUDA kernels.
+
+Possible candidates for optimization:
+
+1. ConvTranspose2d: This is a computationally heavy operation. However, writing a custom CUDA kernel for convolution transpose is quite involved. Maybe it's better to look for other easier operators first.
+
+2. MaxPool2d: Pooling can be optimized, but again, existing PyTorch implementations are highly optimized.
+
+3. Hardtanh: This is an element-wise operation. Combining this with other element-wise operations might help.
+
+4. Mean + tanh: The mean over spatial dimensions followed by tanh. These are both element-wise operations. Maybe they can be fused into a single kernel.
+
+Looking for operator fusion opportunities:
+
+- The hardtanh (clamp between -1 and 1) followed by the mean and tanh. Maybe these can be fused into a single kernel.
+
+Wait, the sequence is: hardtanh, then mean over (2,3), then tanh. The mean reduces the spatial dimensions, so the hardtanh must be applied first, then the mean.
+
+But perhaps the hardtanh and mean can be combined. Let me see:
+
+After the maxpool, the output is passed through hardtanh, then mean, then tanh.
+
+Alternatively, perhaps the hardtanh can be inlined into the kernel that does the mean and tanh? Not sure.
+
+Alternatively, maybe the mean and tanh can be fused. The tanh is applied to the mean value. Since the mean is a scalar per channel (since dim (2,3)), then tanh of that scalar.
+
+Wait, the mean is computed over dimensions 2 and 3 (height and width), so the output of mean is (batch, channels, 1, 1). Then tanh is applied to this tensor, so it's element-wise again.
+
+Therefore, the steps after maxpool are:
+
+x = hardtanh(x)
+
+x = mean(x, (2,3), keepdim=True)
+
+x = tanh(x)
+
+These three steps can potentially be fused into a single kernel. Let's see:
+
+First, the hardtanh is an element-wise operation: clamp between min and max.
+
+Then, the mean is over spatial dimensions. This requires summing over the spatial dimensions, then dividing by the number of elements. But since the hardtanh is applied first, perhaps the mean can be computed on the clamped values.
+
+Then, the tanh is applied to the resulting mean.
+
+Alternatively, maybe we can compute the mean of the clamped values, then compute tanh of that mean. Since these are sequential steps, perhaps they can be combined in a single kernel.
+
+Alternatively, we can compute the hardtanh, then compute the mean and tanh in a single kernel.
+
+Wait, the hardtanh is applied to the maxpool output. The mean is computed over the spatial dimensions of the clamped tensor, then tanh is applied to the resulting tensor (which is now batch x channels x 1 x 1).
+
+Therefore, the operations after maxpool can be viewed as:
+
+x_clamped = hardtanh(x)
+
+sum_clamped = sum(x_clamped, dim=2,3) --> then divide by (height*width) to get mean.
+
+Then, tanh(sum_clamped / (h*w))
+
+But since the mean is sum divided by the number of elements, and then tanh is applied. So perhaps, we can combine the clamping, summing, and tanh into a single kernel.
+
+Wait, but hardtanh is an element-wise operation on each element of x, so we can do that first. Then, the sum over spatial dimensions is needed for the mean. Then tanh of the mean.
+
+Alternatively, combining the hardtanh and the mean into a single step (clamp each element, then accumulate sum), then compute mean and apply tanh.
+
+So, the sequence after maxpool is:
+
+- Apply hardtanh: clamp each element between -1 and 1.
+
+- Compute the sum over spatial dimensions (h and w), then divide by (h*w) to get mean.
+
+- Apply tanh to the mean.
+
+But the sum can be computed as part of the kernel, so perhaps we can write a kernel that does the hardtanh, accumulates the sum per channel, then compute mean and tanh.
+
+Wait, but the sum is over spatial dimensions. So for each element in the spatial dimensions, we can clamp it, then accumulate the sum. Since the output after maxpool is (batch, channels, h', w'), where h' and w' depend on maxpool parameters. Let me see the parameters:
+
+Original input to conv_transpose is (batch_size, in_channels, height, width). ConvTranspose2d with kernel_size 3, stride 1, padding 1 would output (batch, out_channels, height, width). Then the maxpool with kernel_size 2, stride 2 would reduce spatial dimensions by half. So the output after maxpool is (batch, channels, 128, 128). Then hardtanh is applied, then mean over (2,3) gives (batch, channels, 1,1).
+
+So, the spatial dimensions after maxpool are 128x128. So the number of elements per channel is 128*128=16384.
+
+The sum over spatial dimensions for each channel and batch would require:
+
+For each element in spatial dimensions, compute the clamped value (hardtanh), accumulate into a sum for each (batch, channel).
+
+Then, divide by 16384 to get mean, then apply tanh.
+
+Therefore, the three steps (hardtanh, mean, tanh) can be fused into a single kernel.
+
+The kernel would process each spatial element, clamp it, accumulate into a sum for each batch and channel, then compute the mean and tanh.
+
+But how to structure this in a kernel?
+
+The approach would be:
+
+- For each element in the input tensor (after maxpool):
+
+    - Clamp it between min and max (hardtanh).
+
+    - Accumulate this value into a sum for the corresponding (batch, channel).
+
+Then, after all elements are processed, for each (batch, channel):
+
+    - Divide the sum by (height * width) to get the mean.
+
+    - Apply tanh to the mean.
+
+    - Store this result in the output tensor at (batch, channel, 0, 0).
+
+So, the problem is how to efficiently accumulate the sums per batch and channel. Since each thread can process an element, and accumulate into a per-channel per-batch sum. This would require atomic operations, but since multiple threads are writing to the same sum, that could be an issue.
+
+Alternatively, we can use a reduction approach. Since each element in the spatial dimensions contributes to the sum for their (batch, channel).
+
+To handle this efficiently, perhaps we can use a kernel that processes the input tensor in parallel, and uses shared memory for partial sums, then combines them into global memory.
+
+Alternatively, given that the spatial dimensions are 128x128, which is 16384 elements per channel per batch, we can structure the kernel such that each thread block handles a single (batch, channel) pair, and each thread in the block processes a spatial element.
+
+This way, each block can compute the sum for its (batch, channel), and then compute the mean and tanh.
+
+Let me think:
+
+Suppose the input tensor after maxpool is of size (B, C, H, W).
+
+We can launch a kernel with B * C blocks, each block handling one (b, c) pair.
+
+Each block has H * W threads, each thread handles one spatial element (h, w).
+
+But this would require H*W threads per block, which may be too many (since H and W are 128 here, so 16384 threads per block, which exceeds the maximum thread per block limit (1024)). So this is not feasible.
+
+Alternative approach: use a grid of blocks, each block processes a (b, c) pair, and uses multiple threads to process the spatial elements.
+
+Each block can have multiple threads, and each thread handles a subset of the spatial elements.
+
+The block can use shared memory to accumulate partial sums.
+
+Let me outline the steps for the kernel:
+
+For each (batch, channel):
+
+1. Initialize a sum to 0.
+
+2. For each spatial element (h, w):
+
+    a. Read the value x[b, c, h, w].
+
+    b. Clamp it between min and max (hardtanh).
+
+    c. Add it to the sum.
+
+3. After processing all elements, divide the sum by (H*W) to get mean_val.
+
+4. Compute tanh(mean_val).
+
+5. Write the result to the output tensor at (b, c, 0, 0).
+
+To implement this efficiently:
+
+- Use a grid of blocks, each block corresponds to a (b, c) pair.
+
+- Each block has a certain number of threads (e.g., 256 threads). Each thread processes a chunk of the spatial elements.
+
+- The sum is accumulated in shared memory within the block.
+
+- Threads within the block can cooperatively reduce the sum using shared memory.
+
+This requires careful synchronization and reduction steps.
+
+Alternatively, since H and W are both 128, the total spatial elements are 16384 per channel per batch. To process this with a block size of, say, 256 threads:
+
+Each thread would process 16384 / 256 = 64 elements.
+
+Each thread can loop over their assigned elements, compute the clamped value, and accumulate into a local register, then write to shared memory.
+
+Then, perform a parallel reduction within the block to get the total sum.
+
+This is manageable.
+
+Now, let's consider the CUDA kernel code.
+
+First, the kernel would take as input the maxpooled tensor, and output the tensor after hardtanh, mean, and tanh.
+
+The parameters would include:
+
+- The input tensor (after maxpool): input of shape (B, C, H, W).
+
+- The min and max for hardtanh (hardtanh_min and hardtanh_max).
+
+- The output tensor (shape B, C, 1, 1).
+
+The kernel's logic would be:
+
+For each block (b, c):
+
+- Initialize a shared memory array to hold partial sums.
+
+- Each thread processes a chunk of spatial elements (h, w).
+
+- For each element:
+
+    val = input[b][c][h][w]
+
+    clamped_val = max(min_val, min(max_val, val))
+
+    sum += clamped_val
+
+Wait, but in parallel across threads.
+
+Alternatively, each thread processes a portion of the spatial elements, accumulates their contributions to a local sum, then write to shared memory.
+
+Then, after all threads have contributed, the block can compute the total sum.
+
+Here's a possible approach:
+
+In the kernel:
+
+Each block is assigned to a (b, c). The block index can be calculated as blockIdx.x * gridDim.y + blockIdx.y, but perhaps it's easier to compute the block index as blockIdx.x, and have gridDim.x = B * C.
+
+Wait, the grid is set up so that each block corresponds to a (b, c) pair.
+
+So, the block index is blockIdx.x = b * C + c.
+
+Each block has blockDim.x threads (e.g., 256).
+
+The spatial dimensions H and W are 128 each, so total elements per block's data is H*W = 16384.
+
+Each thread in the block processes a number of elements equal to ceil(H*W / blockDim.x).
+
+For example, with 256 threads, each thread would handle 16384 / 256 ≈ 64 elements.
+
+So, per thread:
+
+for (int i = threadIdx.x; i < H*W; i += blockDim.x) {
+
+    h = i / W;
+
+    w = i % W;
+
+    val = input[b][c][h][w]
+
+    clamped_val = clamp(val, min_val, max_val)
+
+    local_sum += clamped_val;
+
+}
+
+Then, the local sums from each thread need to be summed into a shared memory array.
+
+Use a parallel reduction within the block to get the total sum.
+
+Once the total sum is obtained, compute the mean and tanh, then write to output[b][c][0][0].
+
+This requires:
+
+- Using shared memory for partial sums.
+
+- Synchronizing threads after each step.
+
+The kernel code outline would be something like:
+
+__global__ void fused_hmt_kernel(
+    const float* input,
+    float* output,
+    int B,
+    int C,
+    int H,
+    int W,
+    float min_val,
+    float max_val) {
+
+    // Each block processes a (b, c) pair
+    int block_idx = blockIdx.x;
+    int b = block_idx / C;
+    int c = block_idx % C;
+
+    // Shared memory for partial sums
+    __shared__ float shared_sums[THREADS_PER_BLOCK];
+
+    // Each thread processes some elements
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < H * W; i += blockDim.x) {
+        int h = i / W;
+        int w = i % W;
+        float val = input[get_offset(b, c, h, w, B, C, H, W)];
+        float clamped_val = fmaxf(min_val, fminf(max_val, val));
+        local_sum += clamped_val;
+    }
+
+    // Write to shared memory
+    shared_sums[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    // Perform parallel reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared_sums[threadIdx.x] += shared_sums[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float total_sum = shared_sums[0];
+        float mean = total_sum / (H * W);
+        float result = tanhf(mean);
+        // Write to output
+        output[get_offset(b, c, 0, 0, B, C, 1, 1)] = result;
+    }
+}
+
+Note: Need to implement get_offset function, which is a helper to compute the linear index given the dimensions. The input is stored in a contiguous tensor, so the offset would be:
+
+offset = b * (C * H * W) + c * (H * W) + h * W + w.
+
+But in practice, tensors in PyTorch are stored in row-major order, so the exact strides may vary, but assuming contiguous, we can compute it this way.
+
+Another thing to consider is that the input and output tensors may have different strides, so we need to ensure that the kernel correctly accesses the memory.
+
+Alternatively, use PyTorch's Tensor.data_ptr() and compute the indices properly.
+
+Now, the parameters passed to the kernel need to include B, C, H, W, min_val, max_val.
+
+In the Python wrapper, when calling the kernel, these parameters are derived from the input tensor.
+
+Now, the fused kernel replaces the hardtanh, mean, and tanh operations. This reduces three operations into one, which could lead to better performance by reducing kernel launches and memory accesses.
+
+Additionally, since the original code applies hardtanh, which is an element-wise operation, then computes the mean over spatial dimensions, then applies tanh, which is again element-wise. The fused kernel combines all these steps into a single kernel, which may save time.
+
+Another candidate for optimization is the ConvTranspose2d. However, writing a custom CUDA kernel for convolution transpose is quite complex, as it involves more involved computation and memory management. The existing PyTorch implementation might already be optimized, so it may not be worth the effort. The user might prefer to focus on the latter part which is easier.
+
+Therefore, the plan is to replace the hardtanh, mean, and tanh operations with a single fused kernel.
+
+Now, let's write the code.
+
+First, the custom CUDA kernel for the fused operation.
+
+Then, the ModelNew class will replace those three operations with the custom kernel.
+
+In the forward function:
+
+x = self.conv_transpose(x)
+
+x = self.maxpool(x)
+
+Then, instead of:
+
+x = self.hardtanh(x)
+
+x = torch.mean(x, dim=(2,3), keepdim=True)
+
+x = torch.tanh(x)
+
+We call the custom kernel.
+
+Thus, the code structure would be:
+
+class ModelNew(nn.Module):
+
+    def __init__(self, ...):
+
+        super().__init__()
+
+        # Initialize the same ConvTranspose2d and MaxPool2d as before
+
+        # Also, define the custom fused kernel
+
+    def forward(self, x):
+
+        x = self.conv_transpose(x)
+
+        x = self.maxpool(x)
+
+        # Then call the custom kernel on x, with parameters min_val, max_val, etc.
+
+        return output_of_kernel
+
+Now, implementing the CUDA code:
+
+First, define the CUDA kernel source code.
+
+The kernel must be written in CUDA C++, then compiled via load_inline.
+
+The Python code would have to define the CUDA source as a string, then load it.
+
+So, here's the code outline:
+
+First, define the CUDA kernel code:
+
+fused_hmt_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define THREADS_PER_BLOCK 256
+
+__device__ inline int get_offset(int b, int c, int h, int w, int B, int C, int H, int W) {
+    return ((b * C + c) * H + h) * W + w;
+}
+
+__global__ void fused_hmt_kernel(
+    const float* input,
+    float* output,
+    int B,
+    int C,
+    int H,
+    int W,
+    float min_val,
+    float max_val) {
+
+    // Block index corresponds to (b, c)
+    int block_idx = blockIdx.x;
+    int b = block_idx / C;
+    int c = block_idx % C;
+
+    // Shared memory for partial sums
+    extern __shared__ float shared_sums[];
+
+    // Each thread processes some elements
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < H * W; i += blockDim.x) {
+        int h = i / W;
+        int w = i % W;
+        float val = input[get_offset(b, c, h, w, B, C, H, W)];
+        float clamped_val = fmaxf(min_val, fminf(max_val, val));
+        local_sum += clamped_val;
+    }
+
+    // Write to shared memory
+    shared_sums[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared_sums[threadIdx.x] += shared_sums[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float total_sum = shared_sums[0];
+        float mean = total_sum / (H * W);
+        float result = tanhf(mean);
+        // Write to output
+        output[get_offset(b, c, 0, 0, B, C, 1, 1)] = result;
+    }
+}
+
+torch::Tensor fused_hmt_cuda(torch::Tensor input, float min_val, float max_val) {
+    const int B = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+
+    // Output tensor has shape (B, C, 1, 1)
+    auto output = torch::empty({B, C, 1, 1}, input.options());
+
+    // Number of blocks: B * C
+    const int num_blocks = B * C;
+    const int threads_per_block = THREADS_PER_BLOCK;
+
+    // Launch the kernel
+    fused_hmt_kernel<<<num_blocks, threads_per_block, threads_per_block * sizeof(float)>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        B, C, H, W,
+        min_val, max_val
+    );
+
+    return output;
+}
+"""
+
+Then, the CPP source declaration:
+
+fused_hmt_cpp_source = (
+    "torch::Tensor fused_hmt_cuda(torch::Tensor input, float min_val, float max_val);"
+)
+
+Then, load the kernel:
+
+fused_hmt = load_inline(
+    name="fused_hmt",
+    cpp_sources=fused_hmt_cpp_source,
+    cuda_sources=fused_hmt_source,
+    functions=["fused_hmt_cuda"],
+    verbose=True,
+)
+
+In the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.maxpool = nn.MaxPool2d(kernel_size=maxpool_kernel_size, stride=maxpool_stride)
+        self.fused_hmt = fused_hmt
+        self.min_val = hardtanh_min
+        self.max_val = hardtanh_max
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.maxpool(x)
+        # Call the fused kernel
+        x = self.fused_hmt.fused_hmt_cuda(x, self.min_val, self.max_val)
+        return x
+
+Wait, but the output of the fused kernel is already the result of applying hardtanh, mean, and tanh. So that's the final output.
+
+Wait, let me check:
+
+The fused kernel's steps are:
+
+- Apply hardtanh (clamp between min and max).
+
+- Compute the mean over spatial dimensions.
+
+- Apply tanh to the mean.
+
+Yes, so that's exactly the sequence of operations after maxpool. Therefore, replacing those three operations with the fused kernel.
+
+Now, the problem is that the fused kernel's output has shape (B, C, 1, 1), which matches the original code's output.
+
+Now, compiling this code: The CUDA kernel must be correctly implemented.
+
+Potential issues:
+
+1. The get_offset function: the indices must be correct. Let me confirm.
+
+The input tensor is 4D: (B, C, H, W). So the offset for (b,c,h,w) would be:
+
+b * (C*H*W) + c * (H*W) + h*W + w.
+
+Which is what get_offset does.
+
+2. The kernel's shared memory allocation: the shared_sums array is of size THREADS_PER_BLOCK (256), and the extern __shared__ syntax is used. The third argument to the kernel launch specifies the shared memory size per block: threads_per_block * sizeof(float). Wait, since THREADS_PER_BLOCK is 256, the shared memory needed is 256 * sizeof(float). The kernel uses shared_sums[threadIdx.x], so that's okay.
+
+3. The reduction step:
+
+In the kernel, after writing to shared_sums, each thread's local_sum is stored in shared memory. Then the reduction is done by looping over s = blockDim.x / 2 down to 1. The first step, s starts at 128 (since 256/2=128), so threads with index <128 will add the next 128 elements. This is a standard parallel reduction.
+
+At the end, the sum is in shared_sums[0].
+
+Then the mean is computed, tanh applied, and stored.
+
+Yes, this should work.
+
+Another point: The input to the kernel is the output of the maxpool, which is a contiguous tensor? If the input is not contiguous, the get_offset may not work. To ensure this, in the forward pass, we can make sure that x is contiguous before passing to the kernel. So in the forward function:
+
+x = self.maxpool(x).contiguous()
+
+Then pass to the kernel.
+
+Alternatively, the kernel can handle non-contiguous tensors, but that complicates things. For simplicity, adding .contiguous() would make sure the input is stored in a contiguous block in memory, so the offset calculation works.
+
+Thus, in the forward:
+
+x = self.maxpool(x).contiguous()
+
+Then x is passed to the kernel.
+
+This is important because PyTorch tensors may have strides that are not contiguous, so the linear offset calculation assumes contiguous layout.
+
+So, the forward function should have:
+
+x = self.maxpool(x).contiguous()
+
+x = self.fused_hmt.fused_hmt_cuda(x, self.min_val, self.max_val)
+
+Now, putting all together, here is the complete code.
+
+Additionally, the parameters for the fused kernel are min_val and max_val, which are provided as parameters to the model (hardtanh_min and hardtanh_max in the original Model's __init__).
+
+Thus, in ModelNew's __init__, we store self.min_val and self.max_val.
+
+Now, the original code's get_init_inputs() function returns the parameters in the order:
+
+[in_channels, out_channels, kernel_size, stride, padding, maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max]
+
+Therefore, when initializing ModelNew, these parameters should be passed similarly.
+
+Thus, the code should work.
+
+Now, I will write the full code in the required format.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused CUDA kernel for hardtanh, mean, and tanh
+fused_hmt_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define THREADS_PER_BLOCK 256
+
+__device__ inline int get_offset(int b, int c, int h, int w, int B, int C, int H, int W) {
+    return ((b * C + c) * H + h) * W + w;
+}
+
+__global__ void fused_hmt_kernel(
+    const float* input,
+    float* output,
+    int B,
+    int C,
+    int H,
+    int W,
+    float min_val,
+    float max_val) {
+
+    int block_idx = blockIdx.x;
+    int b = block_idx / C;
+    int c = block_idx % C;
+
+    extern __shared__ float shared_sums[];
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < H * W; i += blockDim.x) {
+        int h = i / W;
+        int w = i % W;
+        float val = input[get_offset(b, c, h, w, B, C, H, W)];
+        float clamped_val = fmaxf(min_val, fminf(max_val, val));
+        local_sum += clamped_val;
+    }
+
+    shared_sums[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared_sums[threadIdx.x] += shared_sums[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float total_sum = shared_sums[0];
+        float mean = total_sum / (H * W);
+        float result = tanhf(mean);
+        output[get_offset(b, c, 0, 0, B, C, 1, 1)] = result;
+    }
+}
+
+torch::Tensor fused_hmt_cuda(torch::Tensor input, float min_val, float max_val) {
+    const int B = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+
+    auto output = torch::empty({B, C, 1, 1}, input.options());
+
+    const int num_blocks = B * C;
+    const int threads_per_block = THREADS_PER_BLOCK;
+
+    fused_hmt_kernel<<<num_blocks, threads_per_block, threads_per_block * sizeof(float)>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        B, C, H, W,
+        min_val, max_val
+    );
+
+    return output;
+}
+"""
+
+fused_hmt_cpp_source = (
+    "torch::Tensor fused_hmt_cuda(torch::Tensor input, float min_val, float max_val);"
+)
+
+# Compile the fused kernel
+fused_hmt = load_inline(
+    name="fused_hmt",
+    cpp_sources=fused_hmt_cpp_source,
+    cuda_sources=fused_hmt_source,
+    functions=["fused_hmt_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.maxpool = nn.MaxPool2d(kernel_size=maxpool_kernel_size, stride=maxpool_stride)
+        self.fused_hmt = fused_hmt
+        self.min_val = hardtanh_min
+        self.max_val = hardtanh_max
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.maxpool(x).contiguous()
+        x = self.fused_hmt.fused_hmt_cuda(x, self.min_val, self.max_val)
+        return x
+
+batch_size = 128
+in_channels  = 64  
+out_channels = 64  
+height = width = 256  
+kernel_size  = 3
+stride = 1
+padding = 1
+maxpool_kernel_size = 2
+maxpool_stride = 2
+hardtanh_min = -1
+hardtanh_max = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max]
+```
+
+This code replaces the sequence of `hardtanh`, `mean`, and `tanh` operations with a single fused CUDA kernel. The kernel efficiently combines these steps into one pass over the data, reducing kernel launch overhead and memory traffic. The fusion leverages parallel reduction to compute the mean across spatial dimensions and applies the clamping and final activation in a streamlined manner. The `ConvTranspose2d` and `MaxPool2d` layers remain unchanged, as their implementations are already optimized in PyTorch. The kernel ensures thread-safe reductions using shared memory and synchronization, leading to improved performance over sequential PyTorch operations.

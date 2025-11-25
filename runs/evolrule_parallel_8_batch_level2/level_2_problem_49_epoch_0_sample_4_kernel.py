@@ -1,0 +1,112 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            bias=bias
+        )
+
+        # Define the fused softmax and sigmoid CUDA kernel
+        fused_softmax_sigmoid_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+        #include <math.h>
+
+        template <typename scalar_t>
+        __device__ scalar_t safe_exp(scalar_t x) {
+            return expf(x);
+        }
+
+        template <>
+        __device__ double safe_exp<double>(double x) {
+            return exp(x);
+        }
+
+        __global__ void fused_softmax_sigmoid_kernel(
+            const torch::PackedTensorAccessor<scalar_t, 5, torch::RestrictPtrTraits> input,
+            torch::PackedTensorAccessor<scalar_t, 5, torch::RestrictPtrTraits> output,
+            int dim_size, int batch_size, int channels, int depth, int height, int width, int dim) {
+
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+            if (idx >= batch_size * channels * depth * height * width) {
+                return;
+            }
+
+            int batch = idx / (channels * depth * height * width);
+            int c = (idx % (channels * depth * height * width)) / (depth * height * width);
+            int d = (idx % (depth * height * width)) / (height * width);
+            int h = (idx % (height * width)) / width;
+            int w = idx % width;
+
+            // Compute softmax along dim=1 (channels)
+            scalar_t sum = 0.0;
+            for (int c_idx = 0; c_idx < channels; ++c_idx) {
+                sum += safe_exp(input[batch][c_idx][d][h][w]);
+            }
+            scalar_t softmax_val = safe_exp(input[batch][c][d][h][w]) / sum;
+
+            // Apply sigmoid
+            scalar_t sigmoid_val = 1.0 / (1.0 + safe_exp(-input[batch][c][d][h][w]));
+
+            // Assign to output
+            output[batch][c][d][h][w] = sigmoid_val * softmax_val;
+        }
+
+        torch::Tensor fused_softmax_sigmoid_cuda(torch::Tensor input) {
+            const auto dims = input.sizes();
+            int batch_size = dims[0];
+            int channels = dims[1];
+            int depth = dims[2];
+            int height = dims[3];
+            int width = dims[4];
+
+            auto output = torch::empty_like(input);
+
+            const int block_size = 256;
+            const int total_elements = batch_size * channels * depth * height * width;
+            const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+            AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "fused_softmax_sigmoid_cuda", ([&] {
+                fused_softmax_sigmoid_kernel<scalar_t><<<num_blocks, block_size>>>(
+                    input.packed_accessor<scalar_t, 5, torch::RestrictPtrTraits>(),
+                    output.packed_accessor<scalar_t, 5, torch::RestrictPtrTraits>(),
+                    channels, batch_size, channels, depth, height, width, 1);
+            }));
+
+            return output;
+        }
+        """
+
+        fused_softmax_sigmoid_cpp_source = (
+            "torch::Tensor fused_softmax_sigmoid_cuda(torch::Tensor input);"
+        )
+
+        # Compile the fused kernel
+        self.fused_softmax_sigmoid = load_inline(
+            name="fused_softmax_sigmoid",
+            cpp_sources=fused_softmax_sigmoid_cpp_source,
+            cuda_sources=fused_softmax_sigmoid_source,
+            functions=["fused_softmax_sigmoid_cuda"],
+            verbose=True,
+        )
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.fused_softmax_sigmoid.fused_softmax_sigmoid_cuda(x)
+        return x
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, D, H, W).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding]

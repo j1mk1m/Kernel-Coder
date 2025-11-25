@@ -1,0 +1,166 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused CUDA kernel for GEMM + BiasAdd + Activations + GroupNorm
+fused_kernel_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+#define THREADS 256
+
+template <typename scalar_t>
+__global__ void fused_gemm_bias_act_gn(
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    const scalar_t* __restrict__ groupnorm_weight,
+    const scalar_t* __restrict__ groupnorm_bias,
+    scalar_t* output,
+    const int batch_size,
+    const int in_features,
+    const int out_features,
+    const int num_groups) {
+
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int group_size = out_features / num_groups;
+
+    if (gid >= out_features) return;
+
+    // Compute GEMM and BiasAdd
+    scalar_t val = 0.0;
+    for (int i = 0; i < in_features; ++i) {
+        val += input[i] * weight[i * out_features + gid];
+    }
+    val += bias[gid];
+
+    // Apply Hardtanh and Mish activation functions
+    scalar_t x = val;
+    x = __fmaxf(x, static_cast<scalar_t>(-1)); // Hardtanh lower bound
+    x = __fminf(x, static_cast<scalar_t>(1));  // Hardtanh upper bound
+    x = x * (exp(x) / (1 + exp(-x))) / (exp(x) + 1); // Mish activation approximation
+
+    // Compute GroupNorm
+    const int group_id = gid / group_size;
+    const int channel_in_group = gid % group_size;
+
+    extern __shared__ scalar_t shared[];
+    scalar_t* mean = shared;
+    scalar_t* var = mean + blockDim.x;
+
+    scalar_t sum = 0, sq_sum = 0;
+    for (int i = 0; i < group_size; i += blockDim.x) {
+        int idx = channel_in_group + i;
+        if (idx < group_size) {
+            sum += shared[idx];
+            sq_sum += shared[idx] * shared[idx];
+        }
+    }
+
+    __syncthreads();
+
+    sum = blockReduceSum(sum);
+    sq_sum = blockReduceSum(sq_sum);
+
+    if (threadIdx.x == 0) {
+        const scalar_t mean_val = sum / group_size;
+        const scalar_t var_val = sq_sum / group_size - mean_val * mean_val;
+        mean[threadIdx.x] = mean_val;
+        var[threadIdx.x] = var_val;
+    }
+    __syncthreads();
+
+    const scalar_t norm_val = (x - mean[0]) / sqrt(var[0] + 1e-5);
+    output[gid] = norm_val * groupnorm_weight[group_id] + groupnorm_bias[group_id];
+}
+
+// Helper function for block-wise reduction
+template <typename scalar_t>
+__device__ scalar_t blockReduceSum(scalar_t val) {
+    extern __shared__ scalar_t shared[];
+    for (int i = blockDim.x/2; i > 0; i >>=1) {
+        if (threadIdx.x < i) {
+            val += shared[threadIdx.x + i];
+        }
+        __syncthreads();
+    }
+    return val;
+}
+
+torch::Tensor fused_gemm_bias_act_gn_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor groupnorm_weight,
+    torch::Tensor groupnorm_bias,
+    int batch_size,
+    int in_features,
+    int out_features,
+    int num_groups) {
+
+    auto output = torch::empty({batch_size, out_features}, input.options());
+    const int total_elements = batch_size * out_features;
+
+    dim3 blocks((total_elements + THREADS - 1) / THREADS);
+    dim3 threads(THREADS);
+
+    // Launch kernel with shared memory for mean/variance computation
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "fused_gemm_bias_act_gn_cuda", ([&] {
+        fused_gemm_bias_act_gn<scalar_t><<<blocks, threads, 2 * THREADS * sizeof(scalar_t)>>>(
+            input.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            bias.data_ptr<scalar_t>(),
+            groupnorm_weight.data_ptr<scalar_t>(),
+            groupnorm_bias.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            in_features,
+            out_features,
+            num_groups);
+    }));
+
+    return output;
+}
+"""
+
+fused_kernel_cpp = (
+    "torch::Tensor fused_gemm_bias_act_gn_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::Tensor groupnorm_weight, torch::Tensor groupnorm_bias, int batch_size, int in_features, int out_features, int num_groups);"
+)
+
+# Compile the fused kernel
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_kernel_cpp,
+    cuda_sources=fused_kernel_source,
+    functions=["fused_gemm_bias_act_gn_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super().__init__()
+        self.gemm_weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.groupnorm = nn.GroupNorm(num_groups=num_groups, num_channels=out_features)
+        self.fused_kernel = fused_ops
+
+    def forward(self, x):
+        return self.fused_kernel.fused_gemm_bias_act_gn_cuda(
+            x,
+            self.gemm_weight,
+            self.bias,
+            self.groupnorm.weight,
+            self.groupnorm.bias,
+            x.size(0),
+            x.size(1),
+            self.gemm_weight.size(0),
+            self.groupnorm.num_groups
+        )
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, bias_shape, num_groups]

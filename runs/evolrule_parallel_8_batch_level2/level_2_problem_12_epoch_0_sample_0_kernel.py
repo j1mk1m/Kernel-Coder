@@ -1,0 +1,150 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class FusedGemmLeakyReLUFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias, multiplier, negative_slope):
+        # Define the fused CUDA kernel source
+        kernel_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        template <typename scalar_t>
+        __global__ void fused_gemm_leakyrelu_forward_kernel(
+            const scalar_t* __restrict__ input,
+            const scalar_t* __restrict__ weight,
+            const scalar_t* __restrict__ bias,
+            scalar_t* __restrict__ output,
+            int batch_size,
+            int in_features,
+            int out_features,
+            scalar_t multiplier,
+            scalar_t negative_slope) {
+            
+            const int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (output_idx >= batch_size * out_features) return;
+
+            const int row = output_idx / out_features;
+            const int col = output_idx % out_features;
+
+            scalar_t sum = bias[col];
+            for (int k = 0; k < in_features; ++k) {
+                sum += input[row * in_features + k] * weight[col * in_features + k];
+            }
+
+            sum *= multiplier;
+
+            // Apply LeakyReLU
+            output[output_idx] = sum > 0 ? sum : sum * negative_slope;
+        }
+
+        int forward_cuda(
+            torch::Tensor input,
+            torch::Tensor weight,
+            torch::Tensor bias,
+            torch::Tensor output,
+            scalar_t multiplier,
+            scalar_t negative_slope) {
+
+            const int batch_size = input.size(0);
+            const int in_features = input.size(1);
+            const int out_features = weight.size(0);
+
+            const int threads = 256;
+            const int elements = batch_size * out_features;
+            const int blocks = (elements + threads - 1) / threads;
+
+            AT_DISPATCH_FLOATING_TYPES(input.type(), "fused_gemm_leakyrelu_forward", ([&] {
+                fused_gemm_leakyrelu_forward_kernel<scalar_t><<<blocks, threads>>>(
+                    input.data<scalar_t>(),
+                    weight.data<scalar_t>(),
+                    bias.data<scalar_t>(),
+                    output.data<scalar_t>(),
+                    batch_size,
+                    in_features,
+                    out_features,
+                    multiplier,
+                    negative_slope);
+            }));
+
+            cudaDeviceSynchronize();
+            return 1;
+        }
+        """
+
+        # Compile the CUDA kernel
+        fused_mod = load_inline(
+            name="fused_gemm_leakyrelu_forward",
+            cpp_sources="",
+            cuda_sources=kernel_source,
+            functions=["forward_cuda"],
+            verbose=False
+        )
+
+        # Prepare inputs and output
+        batch_size, in_features = input.shape
+        out_features = weight.size(0)
+        output = torch.empty(batch_size, out_features, device=input.device)
+
+        # Run the kernel
+        fused_mod.forward_cuda(
+            input.contiguous(),
+            weight.contiguous(),
+            bias.contiguous(),
+            output,
+            multiplier,
+            negative_slope
+        )
+
+        # Save context for backward
+        ctx.save_for_backward(input, weight, bias, output)
+        ctx.multiplier = multiplier
+        ctx.negative_slope = negative_slope
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight, bias, output = ctx.saved_tensors
+        multiplier = ctx.multiplier
+        negative_slope = ctx.negative_slope
+
+        # Compute dLeakyReLU/dx
+        grad_leakyrelu = grad_output.clone()
+        grad_leakyrelu[output <= 0] *= negative_slope
+
+        # Scale by multiplier
+        grad_leakyrelu.mul_(multiplier)
+
+        # Gradient w.r.t. input
+        grad_input = torch.mm(grad_leakyrelu, weight)
+        
+        # Gradient w.r.t. weight
+        grad_weight = torch.mm(grad_leakyrelu.t(), input)
+        
+        # Gradient w.r.t. bias
+        grad_bias = grad_leakyrelu.sum(0)
+
+        return grad_input, grad_weight, grad_bias, None, None
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.weight, a=negative_slope ** -1)
+        nn.init.zeros_(self.bias)
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+
+    def forward(self, x):
+        return FusedGemmLeakyReLUFunction.apply(
+            x, self.weight, self.bias, self.multiplier, self.negative_slope
+        )
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, multiplier, negative_slope]

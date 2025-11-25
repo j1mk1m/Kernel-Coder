@@ -1,0 +1,18 @@
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void my_custom_kernel(float* input, float* output, int n) {
+    // Kernel implementation goes here
+}
+
+torch::Tensor my_custom_function(torch::Tensor input) {
+    auto n = input.numel();
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (n + block_size - 1) / block_size;
+
+    my_custom_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), n);
+
+    return output;
+}

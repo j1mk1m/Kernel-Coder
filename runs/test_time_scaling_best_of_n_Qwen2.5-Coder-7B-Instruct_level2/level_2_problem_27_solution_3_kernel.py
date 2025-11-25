@@ -1,0 +1,42 @@
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Custom convolution kernel implementation here...
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int padding) {
+    // Kernel launch and execution here...
+    return output;
+}
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, num_groups=4, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x, weight, bias, stride, padding)  # (B, C, D, H, W)
+        x = F.hardswish(x)                               # Nonlinear activation
+        x = self.group_norm(x)                           # Normalization over channels
+        x = torch.mean(x, dim=[2, 3, 4])                 # Mean over spatial dims → (B, C)
+        return x

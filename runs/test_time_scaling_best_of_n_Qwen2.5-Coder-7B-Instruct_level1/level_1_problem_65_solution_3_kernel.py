@@ -1,0 +1,1 @@
+# Your optimized ModelNew class here

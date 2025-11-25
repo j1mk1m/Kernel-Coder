@@ -1,0 +1,637 @@
+    Please also make sure that the inputs/outputs of the new code are the same as the original code. 
+
+    The final submission should be a single code block with the complete ModelNew class and any necessary imports/functions. 
+
+    Additionally, ensure that all the functions are correctly inlined and the CUDA kernels are properly integrated.
+Alright, I need to optimize the given PyTorch model using custom CUDA kernels. Let me look at the original model's architecture first. The operations involved are Gemm (linear layer), Subtract, GlobalAvgPool, LogSumExp, GELU, and ResidualAdd. The goal is to replace some of these with custom CUDA kernels for speedup.
+
+Starting with the forward pass steps:
+
+1. **Gemm (Linear Layer):** The linear layer (nn.Linear) involves a matrix multiplication followed by an optional bias addition. PyTorch's implementation is already optimized, but maybe fusing with subsequent operations can help. However, the next operation is a subtraction with a parameter, so perhaps combining the linear and subtract into a single kernel could reduce memory access and latency.
+
+2. **Subtract:** After the linear layer, subtract a parameter. If this can be merged into the linear kernel, that would save an operation.
+
+3. **Global Average Pool (torch.mean):** This is a reduction over a dimension. Maybe a custom kernel could handle this more efficiently, especially since the input is a tensor with shape (batch_size, out_features) after the linear layer. The mean over dim=1 (features) reduces it to (batch_size, 1). Since the batch size is 2048 and out_features is 8192, this is a large tensor. A custom kernel could exploit parallelism here.
+
+4. **LogSumExp:** The logsumexp operation is more complex. It requires computing exponentials, sums, and logs. Combining this with the previous steps might be tricky, but perhaps fusing with the GlobalAvgPool or the subsequent GELU could help. However, logsumexp might be better handled in a separate kernel.
+
+5. **GELU:** The GELU activation function is commonly used and PyTorch's implementation is optimized, but if it can be combined with previous steps, that's a win. Alternatively, maybe a custom implementation could be faster, especially if fused with other operations.
+
+6. **ResidualAdd:** Adding the original input (original_x) back to the processed x. This is an element-wise addition, similar to the example given. However, since the original_x is of shape (batch_size, in_features) and the processed x is (batch_size, 1), they can't be added directly unless in_features equals out_features. Wait, in the original model, in_features and out_features are both 8192. So after the linear layer, x is (batch_size, out_features), then GlobalAvgPool reduces to (batch_size, 1), then logsumexp and gelu keep it at (batch_size, 1). Then residual add with original_x (batch_size, 8192) is impossible unless I'm misunderstanding.
+
+Wait, hold on. The original_x is a clone of the input x, which is of shape (batch_size, in_features). The linear layer's output is (batch_size, out_features). Since in_features and out_features are both 8192, that's okay. Then after GlobalAvgPool, it's (batch_size, 1), then LogSumExp also keeps the shape (batch_size, 1). GELU would keep the same shape. The residual add is x (shape (batch_size, 1)) added to original_x (shape (batch_size, 8192)), which is impossible unless there's a broadcast. But in the original code, they have:
+
+x = x + original_x
+
+Wait, that would cause a shape mismatch. The original code might have a mistake here. Because after GlobalAvgPool, x is (batch_size, 1), then after LogSumExp, still (batch_size, 1), GELU same. Original_x is (batch_size, in_features) = (2048, 8192). So adding a (2048,1) tensor to a (2048,8192) tensor would require broadcasting, which would expand x to (2048,8192) by repeating along the second dimension. But in PyTorch, that's allowed. However, that's a critical point because if the residual add requires broadcasting, perhaps that can be optimized by fusing with other operations.
+
+Alternatively, maybe there's an error in the model's design. But since the user provided it, I'll proceed assuming it's correct. So the residual add is between a (batch_size,1) and (batch_size, in_features) which must have in_features equal to the dimension of the other tensor? Wait, no. Let me check:
+
+The original_x is clone of input x, which is (batch_size, in_features). The processed x after Gemm is (batch_size, out_features). Since in_features and out_features are both 8192 (given as in_features=8192, out_features=8192), so after Gemm, x is (2048, 8192). Then subtract the parameter (out_features=8192), so still (2048,8192). Then GlobalAvgPool over dim=1: mean over features, resulting in (2048, 1). Then logsumexp over dim=1: (2048,1) becomes (2048,1). GELU same shape. Then x (2048,1) is added to original_x (2048,8192). How does this addition work? PyTorch allows broadcasting, so the (2048,1) tensor is broadcast to (2048,8192), then added to original_x. So the final output is (2048,8192). The user's code must be correct in that sense.
+
+Therefore, the residual add is a broadcasted addition. That's an important point. So the final x is (batch_size, 8192), which matches original_x's shape. 
+
+So, for optimizing:
+
+First, the Gemm (linear layer) can be fused with the subtract. The linear layer's computation is x = W*x + b (if bias is present). Wait, the model uses nn.Linear with bias=True. So the linear layer includes a bias addition. But in the original code, after the linear layer, there is a subtraction with self.subtract (a parameter). So the operations are:
+
+x = linear(x) → (Wx + b) → then subtract self.subtract (a tensor of shape (out_features,)), so x = (Wx + b) - subtract_param.
+
+Alternatively, this can be written as Wx + (b - subtract_param). Since both b and subtract_param are parameters, maybe we can precompute (b - subtract_param) and eliminate the separate subtraction. However, that might not be possible because the subtract_param is a parameter that's part of the model, so during training it can change. So instead, we can combine the linear layer's computation with the subtraction into a single kernel, avoiding an extra memory operation.
+
+Second, the GlobalAvgPool is a reduction over dim=1. The input is (batch_size, 8192), and the output is (batch_size, 1). Computing the mean over 8192 elements for each batch. A custom kernel can compute this efficiently by having each thread handle a batch and accumulate over the features.
+
+Third, the LogSumExp operation: torch.logsumexp(x, dim=1, keepdim=True). This requires computing the exponential of each element, summing them along the dimension, taking the log, and keeping the dimension. The formula is log(sum(exp(x))). This can be done in a custom kernel, perhaps fusing with the GlobalAvgPool. But since they are separate steps, maybe not. Alternatively, maybe after GlobalAvgPool (mean), the logsumexp is applied over the same dimension, but that might not be possible since GlobalAvgPool reduces the dimension. Wait, after GlobalAvgPool, the x becomes (batch_size, 1). Then LogSumExp is over dim=1 (which is size 1, so it would just be log(exp(x_i)), which is x_i. Wait, that can't be right. Wait, let's see:
+
+Suppose after GlobalAvgPool, x is (batch_size, 1). Then applying logsumexp over dim=1 (which is the second dimension here). For each sample, the logsumexp over dim=1 would be log(exp(x[i,0])) = x[i,0], since it's the log of the sum of exponentials of a single element. Therefore, the LogSumExp operation here does nothing except returning x itself. Wait, that's a problem. If the GlobalAvgPool reduces the tensor to (batch_size,1), then applying LogSumExp over dim=1 (which is size 1) will just return the same as the input. So this is redundant. That suggests there might be a mistake in the original model's architecture. Let me check:
+
+Original model's steps:
+
+After Gemm and Subtract, x is (2048,8192). Then GlobalAvgPool: mean over dim=1 → (2048,1). Then LogSumExp over dim=1 (same as GlobalAvgPool's dim). So the LogSumExp is over a dimension of size 1, which as I said, would compute log(exp(x_i)) = x_i. So this is redundant. So the LogSumExp does nothing here. That seems like an error. Unless the LogSumExp is applied over a different dimension. Wait, maybe the GlobalAvgPool was intended to be over a different dimension? Let me check the original code again:
+
+The GlobalAvgPool in the code is:
+
+x = torch.mean(x, dim=1, keepdim=True)
+
+So dim=1 is the features dimension (since input is (batch, features)). Then LogSumExp is also over dim=1, so same as the GlobalAvgPool. That's redundant. Therefore, perhaps there's a mistake in the model's architecture. However, the user provided this, so perhaps I should proceed under the assumption that it's correct, or maybe the LogSumExp is over a different dimension. Alternatively, maybe the LogSumExp is applied after the GlobalAvgPool, but the GlobalAvgPool reduces it to 1 element per batch, so the LogSumExp is redundant. Therefore, this might be an oversight in the model design, but since I can't change the model's structure (must keep inputs/outputs same), I have to implement it as is. However, if that's the case, the LogSumExp can be optimized away, but the user requires that outputs are the same. So maybe the LogSumExp is intended to be over a different dimension? Let me re-examine the code:
+
+Looking at the code again:
+
+After GlobalAvgPool (dim=1), the next step is LogSumExp over dim=1 again. The user might have intended the LogSumExp to be over a different dimension, maybe after the GlobalAvgPool? Alternatively, perhaps the GlobalAvgPool is over dim=0? Let me check the code again:
+
+The original code:
+
+x = torch.mean(x, dim=1, keepdim=True)
+
+Yes, dim=1. So, proceeding, the LogSumExp over dim=1 would indeed compute log(exp(x_i)) = x_i. So the operation is redundant. Therefore, this is a problem in the model. However, the user might have intended something else, but since I must keep the code's behavior the same, I have to include the LogSumExp even though it's redundant. Therefore, in the custom kernels, I must still perform it, even if it's a no-op. Alternatively, maybe the LogSumExp is over a different dimension. Let me see if the code allows that. Suppose the user made a typo and intended dim=0? But the problem states that the code is given, so I must follow it as written.
+
+This is a critical point because if the LogSumExp is redundant, perhaps I can optimize that away, but since the user requires outputs to be the same, I must ensure that the same result is produced. If the LogSumExp is indeed redundant (does nothing), then replacing it with an identity operation would be better. But perhaps the LogSumExp is applied before the GlobalAvgPool? Let me check the code sequence again:
+
+The sequence is:
+
+1. Gemm → (batch_size, out_features)
+
+2. Subtract → same shape
+
+3. GlobalAvgPool → (batch_size, 1)
+
+4. LogSumExp → over dim=1 (size 1), so output still (batch_size,1)
+
+5. GELU → same shape
+
+6. ResidualAdd (with original_x (batch_size, in_features=8192))
+
+Wait, the residual add is adding the (batch_size,1) x to the original_x (batch_size, 8192). The result is (batch_size,8192). So the final output's shape is correct. But the LogSumExp here is redundant, so maybe the model has an error, but I have to replicate it as is.
+
+Therefore, in terms of optimization:
+
+- The Gemm (linear) + Subtract can be fused into a single kernel to eliminate a separate subtraction step.
+
+- The GlobalAvgPool can be implemented with a custom kernel for better performance, especially over a large dimension (8192 features).
+
+- The LogSumExp, while redundant here, needs to be handled. Since it's over a single element, perhaps it can be optimized to just return x, but only if we can confirm that. However, since the user might have intended it, maybe it's better to implement it properly. Wait, let's compute:
+
+logsumexp(x, dim=1, keepdim=True) when x is (batch_size,1):
+
+Each element in dim=1 is just one element. So for each batch, the logsumexp over dim=1 would be log(exp(x_i)) = x_i. So the result is the same as the input. So indeed, it's a no-op. Therefore, perhaps the LogSumExp can be removed without changing the output. But the user's code includes it, so must be preserved. Therefore, the code must include the LogSumExp step, but since it does nothing, it can be replaced with a pass-through, but need to confirm. Alternatively, maybe there's a mistake, but since the problem requires the same outputs, perhaps it's better to code it as is, but in a way that's efficient.
+
+Alternatively, maybe the LogSumExp is intended to be applied over the original dimension before GlobalAvgPool. Let me see if that's possible. Suppose the code had a mistake and the LogSumExp should be over the features before the GlobalAvgPool, but the user wrote it after. However, since the problem requires keeping the architecture the same, I can't change the order.
+
+Therefore, moving on, perhaps the key optimizations are:
+
+1. Fuse the linear layer (Gemm) with the subtract into a single kernel, reducing memory traffic.
+
+2. Implement a custom kernel for the GlobalAvgPool over the features.
+
+3. The LogSumExp can be handled with a no-op kernel if possible, but since it's redundant, perhaps it can be removed, but the problem states to keep the inputs/outputs the same, so if it's redundant, then it can be omitted without changing the result. However, need to be careful.
+
+4. The GELU can be implemented with a custom kernel, possibly fused with the previous steps if possible.
+
+5. The ResidualAdd is an element-wise addition with broadcasting. This can be done with a custom kernel that adds a (batch_size,1) tensor to a (batch_size,8192) tensor efficiently.
+
+Now, considering the order of operations:
+
+Let me map out the data flow:
+
+Original input x (B, F_in) → linear (Wx + b) → subtract (self.subtract) → GlobalAvgPool (mean over F_out) → LogSumExp over F_out (now 1) → GELU → ResidualAdd with original_x (B, F_in).
+
+Since F_in and F_out are both 8192, after the linear layer, the shape is (B, 8192). Then GlobalAvgPool reduces to (B,1). Then LogSumExp over dim=1 (size 1) gives same (B,1). GELU same. Then residual add with original_x (B,8192) → broadcast (B,1) to (B,8192) and add. So the residual add is an element-wise addition where each element in the second dimension of the small tensor is added to all elements in the corresponding batch's second dimension of the large tensor. So this is a broadcasted addition.
+
+To implement this efficiently, perhaps the residual add can be optimized by a custom kernel that directly handles the broadcasting.
+
+So, the plan is to:
+
+1. Implement a fused kernel for the linear layer plus subtract.
+
+2. Implement a custom GlobalAvgPool kernel.
+
+3. Since LogSumExp is a no-op here, perhaps replace it with a pass-through (but ensure that the code still does the same thing, even if redundant).
+
+4. Implement a custom GELU kernel.
+
+5. Implement a custom residual add kernel that handles the broadcasting.
+
+Alternatively, some steps can be fused. For instance, after the linear and subtract, the GlobalAvgPool can be fused into the kernel, but the GlobalAvgPool requires a reduction, which complicates things. Alternatively, after the linear and subtract, the GlobalAvgPool can be handled in a separate kernel, then the LogSumExp (which is redundant) can be skipped, but the problem requires keeping the same outputs. Alternatively, if the LogSumExp is redundant, we can skip it but must confirm.
+
+Wait, let's think again about LogSumExp:
+
+logsumexp(x, dim=1) when x is (B,1):
+
+Each sample's logsumexp is log( exp(x_i) ) = x_i, so the output is the same as x. Therefore, the LogSumExp does nothing here. Therefore, we can omit it without changing the output. The problem states that the outputs must be the same as the original code. Since the original code's LogSumExp is redundant, omitting it would produce the same result, so it's acceptable. Therefore, we can remove the LogSumExp step in the optimized code. That's a useful optimization.
+
+Therefore, the steps become:
+
+After GlobalAvgPool (B,1), then GELU, then residual add.
+
+That reduces the steps. So that's a good optimization.
+
+Now, let's outline the optimized steps:
+
+1. Combine the linear (Gemm) and Subtract into a single kernel.
+
+2. Compute the GlobalAvgPool with a custom kernel.
+
+3. Apply GELU (perhaps with a custom kernel).
+
+4. Perform the residual add with a custom kernel handling broadcasting.
+
+Now, implementing these:
+
+First, the fused linear + subtract:
+
+The standard linear layer is x = W*x + b. Then subtract the self.subtract parameter. So total is W*x + (b - self.subtract). Since both b and self.subtract are parameters, perhaps we can precompute (b - subtract) and store it, but during training, the parameters are learnable, so they change. Therefore, we can't precompute it, but in the kernel, we can compute it on the fly.
+
+Alternatively, in the fused kernel, for each element:
+
+output[i] = (W * input).sum() + b - subtract_param
+
+Wait, more precisely, for each element in the output (assuming linear layer is applied):
+
+The linear layer's computation is:
+
+for each batch, each output feature f:
+
+x[f] = sum_{i} W[f][i] * input[i] + b[f]
+
+Then subtract self.subtract[f].
+
+So the total is x[f] = (W*input + b)[f] - subtract[f]
+
+Thus, combining the bias and subtract, it can be written as:
+
+x[f] = (W*input)[f] + (b - subtract)[f]
+
+Therefore, in the kernel, we can precompute (b - subtract) once, but since both b and subtract are parameters, perhaps in the forward pass, we can compute this on the fly. Alternatively, during the kernel execution, we can access both tensors and compute the term.
+
+Therefore, the fused kernel would handle the linear multiplication with the weight, add the (bias - subtract) term, and output the result.
+
+Wait, but the linear layer's bias and the subtract are both parameters. So the fused kernel can take the weight, bias, and subtract as parameters, and compute for each element:
+
+output = matmul(input, weight.T) + (bias - subtract)
+
+Therefore, the fused kernel can perform the matrix multiplication and then add the combined bias and subtract terms.
+
+However, implementing a custom matrix multiplication with CUDA is more complex. The standard PyTorch linear layer is already using optimized kernels (cuBLAS), so maybe the benefit of fusing with the subtract is minimal. However, perhaps on small matrices, the overhead of multiple kernel launches is worth avoiding.
+
+Alternatively, given that in_features and out_features are 8192, which is large, the matrix multiplication is a significant computation, and fusing with the subtract might not give much gain. So perhaps the main optimizations are in the later steps.
+
+Next, the GlobalAvgPool: this is a reduction over the features (dim=1), so for each batch, compute the mean of the 8192 features. This is a good candidate for a custom kernel because the standard PyTorch implementation might have some overhead. A custom kernel can parallelize this efficiently: each block can handle a batch, and threads within the block can compute partial sums for each feature, then reduce to the final mean.
+
+Then, the GELU activation. PyTorch's implementation of GELU is already optimized, but maybe a custom kernel can be faster, especially if fused with other operations. However, GELU is an element-wise function, so it's relatively straightforward. Alternatively, if we can fuse it with the GlobalAvgPool and subsequent steps, that would be better. But since the GlobalAvgPool reduces the dimension, it's difficult to fuse beyond that.
+
+The residual add is the key point here. The residual add requires adding a (B,1) tensor to a (B,8192) tensor. The broadcasted addition would be more efficient if implemented in a custom kernel, avoiding the overhead of PyTorch's broadcasting mechanism. The custom kernel can take the (B,1) tensor and add its single element to each of the 8192 elements in the same batch.
+
+So, the plan is:
+
+1. Keep the linear layer as is, but maybe replace the subtract with a fused operation. Wait, but the linear layer is a nn.Linear, which is already efficient. However, the subtract is an element-wise subtraction. So fusing the linear (matrix multiplication and bias addition) with the subtraction might save an element-wise operation. But implementing a custom matmul with fused bias and subtraction may not be worth it unless there's a significant speedup. Alternatively, leave the linear layer as is and just replace the subtract with a custom kernel? Probably not. The matrix multiplication is the main cost here, so perhaps it's better to leave it as is, unless we can find a way to fuse with subsequent steps.
+
+Alternatively, perhaps the GlobalAvgPool can be fused with the linear layer's output. Let's think: after the linear layer (output (B,8192)), the next step is subtract, then GlobalAvgPool.
+
+Wait, the subtract is an element-wise subtraction, so after the linear layer, the subtract is a simple tensor subtraction. Then the GlobalAvgPool is a reduction. So the flow is:
+
+linear_out = linear(x) → (B, F)
+
+then subtract: linear_out -= subtract_param → (B, F)
+
+then GlobalAvgPool: mean over F → (B,1)
+
+Then GELU and residual add.
+
+So, if we can combine the subtract and the GlobalAvgPool into a single kernel, that would be better. Let me see:
+
+The subtract is just element-wise, so for each element in the linear_out, subtract the subtract_param[f] for feature f. Then compute the mean over F for each batch.
+
+Thus, the kernel can take the linear_out, subtract the subtract_param element-wise, then compute the mean over F.
+
+Alternatively, compute the linear_out * (1/subtract_param) or something? No, the subtract is a per-element subtraction.
+
+Wait, the GlobalAvgPool is (sum over F ( (linear_out - subtract)[f] ) ) / F.
+
+So the combined operation is:
+
+result[f] = (linear_out - subtract_param) → compute for each batch, the sum over F of (linear_out[f] - subtract_param[f]), then divide by F.
+
+Thus, we can write a custom kernel that takes the linear output, subtracts the subtract_param, then computes the sum over features and divides by F. This way, the two steps (subtract and GlobalAvgPool) are fused into one kernel.
+
+That's a good optimization, eliminating the intermediate tensor and saving memory bandwidth.
+
+So the steps after the linear layer become:
+
+- Compute (linear_out - subtract_param) and then GlobalAvgPool in a single kernel.
+
+Thus, the kernel would do:
+
+for each batch:
+
+    sum = 0.0
+
+    for each feature in F:
+
+        val = linear_out[batch][feature] - subtract_param[feature]
+
+        sum += val
+
+    mean = sum / F
+
+    output[batch] = mean
+
+Then, after that, apply GELU (if needed) and residual add.
+
+Wait, but the GELU is applied after the LogSumExp, which we determined is redundant. So actually, after GlobalAvgPool and the fused subtract/GlobalAvgPool kernel, the next step is GELU, then residual add.
+
+Wait, after the fused kernel (subtract and GlobalAvgPool), the next step is the LogSumExp, which is redundant, so we can skip it. Then GELU is applied, then residual add.
+
+Thus, the flow becomes:
+
+linear_out = linear(x)
+
+subtract_and_avg = custom_kernel(linear_out, subtract_param)
+
+gelu_out = gelu(subtract_and_avg)
+
+residual_add = custom_residual_add(gelu_out, original_x)
+
+Therefore, by fusing subtract and GlobalAvgPool into a single kernel, we can save two operations.
+
+Next, the GELU: since it's an element-wise function, a custom kernel can handle it. Alternatively, PyTorch's implementation is already fast. But if we can fuse it into the previous kernel, that would be better. However, after the GlobalAvgPool, the tensor is (B,1), so applying GELU is trivial. So maybe just use PyTorch's GELU here.
+
+Then the residual add: adding the (B,1) tensor to the original_x (B, F_in=8192) with broadcasting. This can be done with a custom kernel that for each element in the original_x's second dimension, adds the single value from the (B,1) tensor.
+
+So, the residual add is a broadcasted addition. Implementing a custom kernel for this can avoid the overhead of PyTorch's broadcasting mechanism.
+
+Putting this all together, the main custom kernels needed are:
+
+1. Fused Subtract and GlobalAvgPool.
+
+2. Custom residual add with broadcasting.
+
+Additionally, perhaps the linear layer's subtraction can be part of the first kernel, as outlined above.
+
+Now, let's proceed to code.
+
+First, the fused kernel for subtract and GlobalAvgPool:
+
+The inputs are:
+
+- The output of the linear layer (input to this kernel is a tensor of shape (B, F)), where F is out_features (8192).
+
+- The subtract parameter (shape (F,)).
+
+The kernel needs to:
+
+For each batch in B:
+
+   Compute the sum over F features of (input[f] - subtract[f])
+
+   Divide by F to get the mean (GlobalAvgPool).
+
+Thus, this can be implemented with each thread handling a batch. Since B is 2048, which is manageable.
+
+Wait, for 2048 batches, each thread can handle a batch. The F is 8192 elements per batch. To compute the sum over F elements, each thread (per batch) can loop over the features.
+
+However, for F=8192, this could be time-consuming if done sequentially per thread. Alternatively, use a parallel reduction.
+
+Alternatively, use a block per batch, with threads in the block each handling a chunk of features, and performing a reduction.
+
+Here's a possible approach:
+
+Each block corresponds to a batch. The block has 256 threads (for example). The total features (8192) divided by 256 threads gives ~32 elements per thread. Each thread loads its chunk of features, subtracts the corresponding subtract_param, sums them, then writes their partial sum to shared memory. Then perform a reduction in shared memory to get the total sum per batch. Finally, divide by F and write to the output.
+
+This would be more efficient.
+
+So, the CUDA kernel could be structured as follows:
+
+__global__ void subtract_and_avg(
+    const float* input, // shape (B, F)
+    const float* subtract, // shape (F)
+    float* output, // shape (B, 1)
+    int B,
+    int F
+) {
+    extern __shared__ float shared[];
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= B) return;
+
+    // Each thread in the block handles a chunk of features
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float sum = 0.0f;
+
+    for (int f = tid; f < F; f += stride) {
+        float val = input[batch_idx * F + f] - subtract[f];
+        sum += val;
+    }
+
+    // Write partial sum to shared memory
+    shared[tid] = sum;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float mean = shared[0] / F;
+        output[batch_idx] = mean;
+    }
+}
+
+The shared memory size needs to be blockDim.x floats. So when launching:
+
+int block_size = 256;
+dim3 grid(B);
+dim3 block(block_size);
+subtract_and_avg<<<grid, block, block_size * sizeof(float)>>>(
+    input, subtract, output, B, F
+);
+
+But in the model's case, B is 2048, which is manageable.
+
+Next, the residual add kernel:
+
+The input is:
+
+- The GELU output (shape (B, 1))
+
+- The original_x (shape (B, F_in=8192))
+
+The output is (B, F_in) = original_x + (gelu_output expanded to (B,F_in))
+
+The kernel needs to add the single value per batch to all elements of the original_x's second dimension.
+
+A possible kernel:
+
+__global__ void residual_add(
+    const float* a, // original_x, shape (B, F)
+    const float* b, // gelu_output, shape (B, 1)
+    float* out, // shape (B, F)
+    int B,
+    int F
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * F) return;
+
+    int batch = idx / F;
+    int f = idx % F;
+
+    out[idx] = a[idx] + b[batch];
+}
+
+This way, each element of a is added the corresponding batch's single value from b.
+
+This should be efficient.
+
+Now, putting all together:
+
+The ModelNew will:
+
+- Use the existing linear layer (nn.Linear) for the Gemm step.
+
+- The subtract and GlobalAvgPool are handled by the custom kernel.
+
+- The GELU is handled by PyTorch's functional.gelu, since it's element-wise and small.
+
+- The residual add is handled by the custom kernel.
+
+Wait, but the GELU is applied after the LogSumExp, which we've determined is redundant. Since we are skipping the LogSumExp (as it's a no-op), the GELU is applied to the output of the GlobalAvgPool.
+
+But since the GlobalAvgPool is now part of the custom kernel (subtract_and_avg), the output is (B,1). Applying GELU to that is straightforward, so we can use PyTorch's implementation here.
+
+Now, the code structure:
+
+First, define the custom kernels.
+
+The fused kernel subtract_and_avg:
+
+We'll need to include the kernel code in a string.
+
+Similarly for the residual_add kernel.
+
+Then, compile them using load_inline.
+
+The ModelNew will:
+
+- Have the linear layer and the subtract parameter.
+
+- The forward function will:
+
+   1. Compute linear(x) → same as original.
+
+   2. Call the custom kernel subtract_and_avg on the linear output and subtract parameter.
+
+   3. Apply GELU.
+
+   4. Call the residual_add kernel on the GELU output and original_x.
+
+Wait, but the original_x is the input's clone. So in the forward:
+
+original_x = x.clone().detach()
+
+Then:
+
+linear_out = self.gemm(x)
+
+then the custom kernel is applied to linear_out and self.subtract.
+
+The output of the custom kernel is (B,1).
+
+Then, apply GELU to that (still B,1).
+
+Then, the residual_add kernel takes the GELU result (B,1) and original_x (B, F), and outputs (B, F).
+
+Thus, the code outline:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features, bias=bias)
+        self.subtract = nn.Parameter(torch.randn(out_features))
+
+        # Define and load the custom kernels
+        self.subtract_and_avg = ... # compiled function
+        self.residual_add = ... # compiled function
+
+    def forward(self, x):
+        original_x = x.clone().detach()
+        linear_out = self.gemm(x)
+        # Call subtract_and_avg kernel
+        # The kernel needs input tensor, subtract parameter, and output tensor
+        # Need to handle shapes and parameters
+        # ...
+
+However, the custom kernels are compiled as external functions, so need to call them correctly.
+
+First, implement the subtract_and_avg kernel:
+
+The kernel code in CUDA:
+
+First, the CUDA code for subtract_and_avg:
+
+subtract_and_avg_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void subtract_and_avg(
+    const float* input,
+    const float* subtract,
+    float* output,
+    int B,
+    int F
+) {
+    extern __shared__ float shared[];
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= B) return;
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float sum = 0.0f;
+
+    for (int f = tid; f < F; f += stride) {
+        float val = input[batch_idx * F + f] - subtract[f];
+        sum += val;
+    }
+
+    shared[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float mean = shared[0] / F;
+        output[batch_idx] = mean;
+    }
+}
+
+torch::Tensor subtract_and_avg_cuda(
+    torch::Tensor input,
+    torch::Tensor subtract,
+    int B,
+    int F
+) {
+    auto output = torch::empty({B, 1}, device(input.device()));
+
+    const int block_size = 256;
+    dim3 grid(B);
+    dim3 block(block_size);
+
+    subtract_and_avg<<<grid, block, block_size * sizeof(float)>>>(
+        input.data_ptr<float>(),
+        subtract.data_ptr<float>(),
+        output.data_ptr<float>(),
+        B,
+        F
+    );
+
+    return output;
+}
+"""
+
+Then, the residual_add kernel:
+
+residual_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void residual_add(
+    const float* a,
+    const float* b,
+    float* out,
+    int B,
+    int F
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * F) return;
+
+    int batch = idx / F;
+    int f = idx % F;
+
+    out[idx] = a[idx] + b[batch];
+}
+
+torch::Tensor residual_add_cuda(
+    torch::Tensor a,
+    torch::Tensor b,
+    int B,
+    int F
+) {
+    auto out = torch::empty_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (B * F + block_size - 1) / block_size;
+
+    residual_add<<<num_blocks, block_size>>>(
+        a.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        B,
+        F
+    );
+
+    return out;
+}
+"""
+
+Now, compiling these kernels.
+
+We can load them inline using torch.utils.cpp_extension.load_inline.
+
+However, the functions need to be properly defined.
+
+For the subtract_and_avg kernel:
+
+elementwise_add was an example, so similarly, we can define:
+
+subtract_and_avg = load_inline(
+    name="subtract_and_avg",
+    cuda_sources=subtract_and_avg_source,
+    functions=["subtract_and_avg_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+Similarly for residual_add.
+
+But since these are separate kernels, they need to be loaded separately.
+
+Putting all together in the code:
+
+The complete code would have:
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True

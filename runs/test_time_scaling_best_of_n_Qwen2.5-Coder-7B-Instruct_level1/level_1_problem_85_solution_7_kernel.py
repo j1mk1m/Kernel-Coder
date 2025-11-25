@@ -1,0 +1,1 @@
+assert torch.allclose(model_new(x).grad, model_old(x).grad)

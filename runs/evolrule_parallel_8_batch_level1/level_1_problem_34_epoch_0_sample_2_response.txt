@@ -1,0 +1,1147 @@
+Make sure the new code uses inline CUDA operators. The code should be in the same style as the example given. The code should be written in Python and CUDA C++ for the kernel. The code must be compatible with PyTorch 2.1.0. You can choose to replace any operators in the original architecture. 
+
+Your optimization must include at least one fused kernel (combining multiple operations into a single CUDA kernel) to demonstrate advanced optimization techniques. 
+
+You must also include comments in your code to explain the reasoning behind your optimization choices.
+
+
+
+
+Okay, let's tackle optimizing the InstanceNorm2d layer in PyTorch using a custom CUDA kernel. The goal is to replace the existing nn.InstanceNorm2d with a fused kernel to improve performance. First, I need to understand how Instance Normalization works. It normalizes each feature channel within an instance (sample) separately. The computation involves calculating the mean and variance per channel and instance, then applying affine transformations. 
+
+The standard implementation might have some overhead, especially in terms of memory access and kernel launches. By fusing the operations into a single kernel, we can reduce the number of kernel launches and optimize memory transactions. The key steps are: compute mean, compute variance, subtract mean, divide by sqrt(variance + eps), then apply gamma and beta if present. Since the user mentioned fusing, combining these steps into one kernel makes sense.
+
+Wait, but InstanceNorm's computation involves per-channel statistics. The mean and variance are calculated per channel and per sample. So for each sample and each channel, compute mean and variance, then normalize. The problem is that these calculations are usually done in separate steps. To fuse them, I need to handle all steps in a single kernel, which requires careful memory management and per-element operations.
+
+Let me outline the steps:
+
+1. For each element in the input tensor, compute the mean and variance per channel and sample. Since the input is (N, C, H, W), for each (n, c) pair, compute the mean of H*W elements. Then variance. 
+
+But calculating mean and variance for each (n,c) across spatial dimensions (H,W) requires reducing over those dimensions. This is a reduction operation, which is a bit tricky in a fused kernel. Alternatively, perhaps we can compute the mean and variance first in a separate kernel, then perform normalization in another kernel, but the user wants a fused one.
+
+Hmm, maybe it's possible to first compute the means and variances in a kernel, then apply the normalization in the same kernel pass. Let me think. Let's structure it as follows:
+
+- Each thread is responsible for a single element (n, c, h, w).
+- To compute mean and variance, we need to accumulate across H and W for each (n,c). So for the mean, each thread contributes its value, summed over H and W. Similarly for variance.
+
+But to compute mean and variance, we need to have a reduction across the spatial dimensions for each (n,c) group. This requires atomic operations or some form of parallel reduction. That complicates things because atomicAdd can be slow, especially if there's contention.
+
+Alternatively, using shared memory for partial sums might be better. For example, each block handles a specific (n,c) group. The block's threads compute their contributions to the mean and variance, store partial sums in shared memory, then each thread in the block can compute the final mean and variance for their (n,c) group. Once those are known, they can proceed to normalize each element.
+
+Let me outline the steps in the kernel:
+
+1. Each block is responsible for a (n, c) group. The grid is arranged such that each block corresponds to a (n,c) group. The number of blocks is N * C.
+
+Wait, but N and C can be large. For example, N=112, C=64, so 112*64=7168 blocks. Each block would process H*W elements (512x512=262,144 elements per block). That might not be efficient because each block has a lot of threads. Alternatively, maybe arrange the grid differently. Hmm, perhaps it's better to have each block handle a (c, n) group, but not sure. Let's think in terms of thread organization.
+
+Alternatively, the kernel can be structured as follows:
+
+- Each thread processes a spatial element (h, w) within a (n,c) group. The block is responsible for a (n,c) group. The block size is chosen such that all threads in the block can process the spatial elements (H*W) efficiently. But H and W are 512 each, which is 262k elements. That's way too big for a block (max threads per block is 1024). So this approach isn't feasible.
+
+Hmm, perhaps a better approach is to use a parallel reduction for the mean and variance. For each (n,c), compute the sum and sum of squares over all H and W, then compute mean and variance from those. To do this in parallel, each thread can process a chunk of the HxW elements. 
+
+Let me think of the following approach:
+
+Each block is responsible for a (n,c) group. The number of blocks is N*C. Each block has a number of threads equal to, say, 256. The total threads per block can process H*W elements in chunks. Each thread computes its portion of the sum and sum of squares. These are stored in shared memory. Then, the block performs a reduction in shared memory to get the total sum and sum_squares for the (n,c) group. 
+
+Once those are known, the block can compute the mean (sum / (H*W)) and variance (sum_squares/(H*W) - mean^2). Then, each thread can process its chunk of elements, applying the normalization (x - mean)/sqrt(var + eps). 
+
+This seems feasible. Let's outline the steps in code:
+
+In the CUDA kernel:
+
+- Determine the block's (n,c) index.
+- Each thread in the block loads a chunk of the input tensor's elements for their (n,c) group.
+- Compute partial sums and sum of squares, store in shared memory.
+- Perform reduction in shared memory to get total sum and sum_squares.
+- Compute mean and variance.
+- Each thread then applies the normalization to their elements.
+- Write the results back to output.
+
+This requires careful handling of shared memory for the reductions. Also, the input and output tensors are contiguous, so accessing them requires proper indexing.
+
+Now, implementing this in code. The input is of shape (N, C, H, W). The kernel will have to read elements for the current (n,c) group. 
+
+First, the grid and block dimensions. The grid is N * C blocks. Each block has, say, 256 threads. But H*W could be larger than the number of threads, so each thread needs to process multiple elements. 
+
+Wait, for H=512 and W=512, the total elements per (n,c) group are 262,144. With 256 threads per block, each thread would process about 1024 elements (262k / 256 ≈ 1024). Each thread can loop over their assigned elements to accumulate sum and sum_squares.
+
+Let me structure the kernel steps:
+
+1. Compute the block's (n,c) index using blockIdx.x. Since blockIdx.x ranges from 0 to N*C-1, we can compute n = blockIdx.x // C, c = blockIdx.x % C.
+
+2. Each thread in the block is assigned an index tid = threadIdx.x. The total number of elements per block is H*W. The number of elements per thread is (H*W + blockDim.x -1)/blockDim.x. Each thread handles a subset of elements.
+
+3. The threads read their elements from the input tensor. The input tensor's layout is (N, C, H, W). The offset for (n,c,h,w) would be n * C*H*W + c*H*W + h*W + w. But this may need to be adjusted based on the storage order (row-major). Alternatively, the input can be viewed as a 1D array. So for a given (n,c), the starting index is n*C*H*W + c*H*W. The thread's elements are spread over this block's data.
+
+Wait, perhaps better to compute the starting index for the block's (n,c) group as:
+
+base_idx = n * C * H * W + c * H * W
+
+Then each element in the block's (n,c) group is at base_idx + h * W + w.
+
+The thread processes elements starting at their offset. For example:
+
+start = tid;
+stride = blockDim.x;
+for (int i = start; i < H*W; i += stride) {
+    h = i / W;
+    w = i % W;
+    val = input[base_idx + h*W + w];
+    sum += val;
+    sum_squares += val * val;
+}
+
+Then, accumulate these partial sums into shared memory. 
+
+Once all threads have written their partial sums to shared memory, the block performs a reduction to compute total sum and sum_squares. 
+
+After that, compute mean = sum / (H*W), variance = (sum_squares / (H*W)) - mean*mean.
+
+Then, each thread again processes their elements to compute (val - mean) / sqrt(variance + eps), and writes to the output tensor.
+
+This approach should be more efficient than separate kernel launches for mean, variance, etc., because it fuses all steps into a single kernel. 
+
+Now, implementing this in code. Let's proceed step by step.
+
+First, the CUDA kernel code:
+
+We'll need to define the kernel function, and handle all these steps. Let me draft the code.
+
+The kernel function will take pointers to input and output tensors, along with parameters like N, C, H, W, and eps. 
+
+First, the kernel signature:
+
+__global__ void instance_norm_kernel(
+    const float* input, float* output, int N, int C, int H, int W, float eps) {
+
+Then, inside the kernel:
+
+First, get the block's (n,c):
+
+int block_idx = blockIdx.x;
+int n = block_idx / C;
+int c = block_idx % C;
+
+Then, each thread in the block processes their elements. 
+
+The total number of elements in the block's group is H * W. The thread's ID is threadIdx.x.
+
+We can compute the starting index for each thread's elements:
+
+int tid = threadIdx.x;
+int elements = H * W;
+int start = tid;
+int stride = blockDim.x;
+float local_sum = 0.0f;
+float local_squares = 0.0f;
+
+for (int i = start; i < elements; i += stride) {
+    int h = i / W;
+    int w = i % W;
+    int pos = n * C * H * W + c * H * W + h * W + w;
+    float val = input[pos];
+    local_sum += val;
+    local_squares += val * val;
+}
+
+Then, we need to accumulate these into shared memory.
+
+We can use shared memory arrays to store the partial sums. The shared memory needs to be per-block and per-reduction step.
+
+Wait, but for a block, all threads are working on the same (n,c). So for reduction, we can first store each thread's local_sum and local_squares into shared memory. Then perform a parallel reduction.
+
+Let me define shared memory arrays:
+
+__shared__ float s_sum[256]; // assuming block size <= 256
+__shared__ float s_squares[256];
+
+Wait, but the block size may be up to 256, so the arrays need to be at least that size. Alternatively, use a single shared array for both:
+
+Alternatively, maybe better to use a single shared memory array for the two values. But perhaps better to do two separate reductions. 
+
+Wait, let's proceed with two separate arrays. 
+
+Wait, but the block's threads need to write their local_sum and local_squares to shared memory first. Then, perform a reduction to get the total sum and sum_squares.
+
+First, write to shared memory:
+
+int tx = threadIdx.x;
+s_sum[tx] = local_sum;
+s_squares[tx] = local_squares;
+
+__syncthreads();
+
+Then perform a parallel reduction on each array. 
+
+For example, using a loop:
+
+for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tx < s) {
+        s_sum[tx] += s_sum[tx + s];
+        s_squares[tx] += s_squares[tx + s];
+    }
+    __syncthreads();
+}
+
+After this, the total sum is in s_sum[0], and total_squares in s_squares[0].
+
+Then compute mean and variance:
+
+float total_sum = s_sum[0];
+float total_squares = s_squares[0];
+float count = H * W;
+float mean = total_sum / count;
+float variance = (total_squares / count) - mean * mean;
+float inv_std = 1.0f / sqrt(variance + eps);
+
+Then, each thread processes their elements again to apply the normalization.
+
+Wait, but how to compute the normalized value for each element. Each thread needs to read their elements again, compute (x - mean) * inv_std, and write to the output.
+
+So we can loop over the elements again.
+
+Wait, but that's redundant. Maybe we can do this in a single loop, but then we need to have the mean and variance known before processing the elements. So the two-step approach is better: first compute the stats, then process each element.
+
+So after the reduction, the thread can process their assigned elements again:
+
+for (int i = start; i < elements; i += stride) {
+    int h = i / W;
+    int w = i % W;
+    int pos = n * C * H * W + c * H * W + h * W + w;
+    float val = input[pos];
+    float normalized = (val - mean) * inv_std;
+    output[pos] = normalized;
+}
+
+Wait, but for this, the mean and variance must be computed before processing the elements again. 
+
+This approach requires two passes over the elements: first for accumulating sum and squares, then for applying the normalization. However, in the first pass, the threads compute their local sums, then the block reduces to get totals. Once that's done, they can proceed to the normalization pass.
+
+This is manageable. 
+
+Now, considering the shared memory usage. Let's see:
+
+The shared memory arrays need to be of size blockDim.x for each. For a block size of 256, that's 256 * 4 bytes (float) * 2 arrays = 2KB, which is acceptable.
+
+Now, what about the block size? Let's choose a block size of 256 threads. Since the elements per group (H*W=512*512=262,144) divided by 256 gives about 1024 elements per thread. Each thread's loop over 1024 elements is manageable, but could that be slow? Maybe, but it's better than multiple kernel launches.
+
+Alternatively, perhaps using a larger block size, but that may exceed the maximum threads per block (which is 1024 in most devices). Let's stick with 256 for now.
+
+Now, the kernel code:
+
+Wait, in the first loop, when calculating the local_sum and local_squares, each thread is looping over their assigned elements. The loop is:
+
+for (int i = start; i < elements; i += stride) {
+    ... compute val, add to local_sum and local_squares
+}
+
+This is straightforward.
+
+Now, after reduction, the second loop applies the normalization.
+
+Now, the kernel code is structured.
+
+Next, in the Python code, we need to call this kernel.
+
+First, define the CUDA source code as a string, along with the host function that will be called from Python.
+
+The host function will handle the kernel launch parameters.
+
+Wait, in PyTorch, tensors are stored in contiguous memory, so the kernel can access them as pointers. 
+
+The host function:
+
+torch::Tensor instance_norm_cuda(torch::Tensor input, int64_t N, int64_t C, int64_t H, int64_t W, float eps) {
+    auto output = torch::empty_like(input);
+    
+    const int threads_per_block = 256;
+    const dim3 blocks(N * C); // Each block handles one (n,c)
+    const dim3 threads(threads_per_block);
+    
+    instance_norm_kernel<<<blocks, threads>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, C, H, W, eps);
+    
+    return output;
+}
+
+Wait, but the kernel is launched with N*C blocks, each processing a (n,c) group. The number of blocks must be <= the maximum allowed (like 65535 per dimension, but total can be up to 2^31). For N=112, C=64, blocks=7168 which is acceptable.
+
+Now, the kernel must be compiled with the correct parameters. 
+
+In the Python code, we need to pass the parameters N, C, H, W, and eps to the kernel function. However, in the current setup, these parameters are part of the model's architecture. 
+
+Wait, in the original Model class, the instance norm is initialized with num_features=features (64). The input dimensions are given as (batch_size, features, dim1, dim2), which are 112, 64, 512, 512.
+
+But when using the custom kernel, these dimensions must be known at kernel launch time. So in the forward pass, the kernel can get the input tensor's shape, but in the example given in the problem, the user expects the code to handle the input via parameters. Alternatively, the kernel can read the tensor's shape dynamically. 
+
+Wait, in the provided example, the element-wise addition didn't require shape parameters because it just added two tensors of same size. Here, the instance norm requires knowing the tensor's dimensions (N, C, H, W). However, in the forward function, when we call the custom kernel, we can extract these from the input tensor.
+
+In the Python code, the forward function would be:
+
+def forward(self, x):
+    return instance_norm_cuda(x, x.size(0), x.size(1), x.size(2), x.size(3), 1e-5)
+
+But how does the kernel handle dynamic dimensions? The CUDA kernel must take these as parameters. The host function (instance_norm_cuda) will pass them as arguments. 
+
+Thus, the kernel function is as above, and the host function takes N, C, H, W as parameters.
+
+Now, putting this all together.
+
+Wait, in the original code, the InstanceNorm2d layer has learnable parameters (gamma and beta), but in the provided Model class, the inorm is initialized with num_features, but the forward function doesn't apply affine transformation unless the layer has affine=True (which by default is True in PyTorch's InstanceNorm2d). However, the original code's Model uses nn.InstanceNorm2d with default parameters (affine=True?), so the kernel must also handle the affine parameters.
+
+Wait, the original code's instance norm is initialized as nn.InstanceNorm2d(num_features=features). The default parameters for InstanceNorm2d are affine=True, so it has gamma and beta parameters. 
+
+Oh wait, looking at the problem's code:
+
+class Model(nn.Module):
+    def __init__(self, num_features: int):
+        self.inorm = nn.InstanceNorm2d(num_features=num_features)
+
+The default parameters for InstanceNorm2d include affine=True, so the layer has gamma and beta. Therefore, the custom kernel must also apply the gamma and beta parameters. 
+
+Oops, I missed that! So the kernel must also multiply by gamma and add beta.
+
+So in the normalization step, after computing (x - mean)/sqrt(var + eps), we need to multiply by gamma[c] and add beta[c]. 
+
+Thus, the kernel must have access to gamma and beta tensors. 
+
+Therefore, the kernel needs to take gamma and beta as parameters. 
+
+Wait, but the original code's instance norm is an nn.InstanceNorm2d layer, which has parameters (gamma and beta). So in the new ModelNew class, we need to have those parameters as part of the model. 
+
+Therefore, the ModelNew will have to include parameters for gamma and beta. 
+
+Wait, the original code's Model has the instance norm layer, which includes those parameters. To replicate that in the custom kernel, we need to pass gamma and beta as inputs to the kernel. 
+
+Therefore, the kernel function must take pointers to gamma and beta tensors, along with their parameters. 
+
+This complicates things because now the kernel must read gamma[c] and beta[c] for each (n,c) group. 
+
+So, adjusting the kernel:
+
+__global__ void instance_norm_kernel(
+    const float* input, float* output, 
+    const float* gamma, const float* beta,
+    int N, int C, int H, int W, float eps) {
+
+Then, in the normalization step, the code would be:
+
+float normalized = (val - mean) * inv_std * gamma[c] + beta[c];
+
+But gamma and beta are per-channel parameters (size C). Therefore, for each (n,c) group, the same gamma[c] and beta[c] are used. 
+
+Thus, in the kernel, after computing mean and variance, the thread can compute gamma and beta values once per block (since each block is per (n,c), so c is fixed for the entire block). 
+
+So, in the kernel, after determining c, the block can compute:
+
+float gamma_val = gamma[c];
+float beta_val = beta[c];
+
+Then, in the normalization loop:
+
+output[pos] = (val - mean) * inv_std * gamma_val + beta_val;
+
+This way, each block only needs to access gamma and beta once per channel, which is efficient.
+
+Therefore, the kernel must take gamma and beta as inputs. 
+
+Therefore, the host function in the CUDA code must also take gamma and beta as inputs. 
+
+Thus, the host function signature:
+
+torch::Tensor instance_norm_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, int64_t N, int64_t C, int64_t H, int64_t W, float eps) {
+
+Then, in the Python code's ModelNew class, we need to have gamma and beta parameters. 
+
+Wait, in the original Model class, the gamma and beta are part of the InstanceNorm2d layer. Therefore, in the new ModelNew class, we need to replicate that. 
+
+So, the ModelNew class will need to have parameters for gamma and beta. 
+
+Wait, the original code's instance norm is an nn.InstanceNorm2d instance, which has parameters gamma and beta. Therefore, the ModelNew class's forward function must receive these parameters as part of the model's state. 
+
+Therefore, in the ModelNew class, we need to store the gamma and beta parameters. 
+
+Wait, in the original Model class, the parameters are encapsulated in the inorm layer. So, in the new model, perhaps we can do the same? Or, since we're replacing the layer with a custom function, we need to replicate the parameters. 
+
+Hmm, to make it compatible, the ModelNew should have the same parameters as the original model. So, when creating the ModelNew instance, it should initialize gamma and beta parameters. 
+
+Alternatively, we can create a custom module that includes these parameters. 
+
+Let me think: the original Model has the inorm layer, which has parameters. So in ModelNew, instead of using the nn.InstanceNorm2d, we'll have parameters for gamma and beta, and use the custom kernel. 
+
+So the ModelNew's __init__ will need to initialize these parameters. 
+
+Wait, but how to get the parameters from the original model? Alternatively, we can just define them in the new model. 
+
+Wait, the original instance norm has learnable parameters, so the new model must have those parameters. 
+
+Thus, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.instance_norm_cuda = ... 
+
+    def forward(self, x):
+        return instance_norm_cuda(x, self.gamma, self.beta, ... )
+
+Wait, but the instance_norm_cuda function is a compiled CUDA function that takes tensors. 
+
+Alternatively, the compiled CUDA function (elementwise_add in the example) is loaded as a module, and the forward function calls it with the necessary parameters. 
+
+In the example given, the custom kernel was called as self.elementwise_add.elementwise_add_cuda(a, b). 
+
+Thus, in our case, the compiled CUDA function (instance_norm_cuda) would be a function that takes input, gamma, beta, N, C, H, W, eps. 
+
+Therefore, in the Python code, the ModelNew's forward function must pass the gamma, beta tensors along with the input's shape parameters. 
+
+But how do we get N, C, H, W from the input tensor?
+
+In the forward function, when the input x is provided, we can get its shape. 
+
+Thus, the forward function would be:
+
+def forward(self, x):
+    N, C, H, W = x.size()
+    return self.instance_norm_cuda(x, self.gamma, self.beta, N, C, H, W, 1e-5)
+
+Wait, but the compiled CUDA function's signature would require all these parameters. 
+
+The host function in CUDA is written to take these as parameters. 
+
+Now, putting this all together. 
+
+First, the CUDA source code:
+
+The kernel must take input, output, gamma, beta, N, C, H, W, eps. 
+
+Wait, the kernel's parameters:
+
+__global__ void instance_norm_kernel(
+    const float* input, float* output, 
+    const float* gamma, const float* beta,
+    int N, int C, int H, int W, float eps) {
+
+The host function in C++:
+
+torch::Tensor instance_norm_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    int64_t N, int64_t C, int64_t H, int64_t W, 
+    float eps) 
+{
+    auto output = torch::empty_like(input);
+    
+    const int threads_per_block = 256;
+    const dim3 blocks(N * C); // Each block per (n,c)
+    const dim3 threads(threads_per_block);
+    
+    instance_norm_kernel<<<blocks, threads>>>(input.data_ptr<float>(),
+                                             output.data_ptr<float>(),
+                                             gamma.data_ptr<float>(),
+                                             beta.data_ptr<float>(),
+                                             N, C, H, W, eps);
+    
+    return output;
+}
+
+Now, in the Python code, we need to compile this CUDA code. 
+
+Putting all this into the code:
+
+First, the CUDA source code as a string:
+
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename T>
+__global__ void instance_norm_kernel(
+    const T* input, T* output, 
+    const T* gamma, const T* beta,
+    int N, int C, int H, int W, T eps) {
+
+    int block_idx = blockIdx.x;
+    int n = block_idx / C;
+    int c = block_idx % C;
+
+    // Each thread processes a portion of the spatial elements (H*W)
+    int tid = threadIdx.x;
+    int elements = H * W;
+    int start = tid;
+    int stride = blockDim.x;
+
+    T local_sum = 0.0;
+    T local_squares = 0.0;
+
+    for (int i = start; i < elements; i += stride) {
+        int h = i / W;
+        int w = i % W;
+        int pos = n * C * H * W + c * H * W + h * W + w;
+        T val = input[pos];
+        local_sum += val;
+        local_squares += val * val;
+    }
+
+    __shared__ T s_sum[256];
+    __shared__ T s_squares[256];
+
+    s_sum[tid] = local_sum;
+    s_squares[tid] = local_squares;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_squares[tid] += s_squares[tid + s];
+        }
+        __syncthreads();
+    }
+
+    T total_sum = s_sum[0];
+    T total_squares = s_squares[0];
+    T count = H * W;
+    T mean = total_sum / count;
+    T variance = total_squares / count - mean * mean;
+    T inv_std = 1.0 / sqrt(variance + eps);
+
+    // Apply gamma and beta
+    T gamma_val = gamma[c];
+    T beta_val = beta[c];
+
+    for (int i = start; i < elements; i += stride) {
+        int h = i / W;
+        int w = i % W;
+        int pos = n * C * H * W + c * H * W + h * W + w;
+        T val = input[pos];
+        output[pos] = (val - mean) * inv_std * gamma_val + beta_val;
+    }
+}
+
+// Define the host function
+torch::Tensor instance_norm_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    int64_t N, int64_t C, int64_t H, int64_t W, 
+    float eps) {
+
+    // Check input dimensions
+    TORCH_CHECK(input.dim() == 4, "Input must be 4D tensor (NCHW)");
+    // ... other checks if needed
+
+    auto output = torch::empty_like(input);
+    
+    const int threads_per_block = 256;
+    const dim3 blocks(N * C);
+    const dim3 threads(threads_per_block);
+
+    // Launch kernel
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "instance_norm_cuda", ([&] {
+        instance_norm_kernel<scalar_t><<<blocks, threads>>>(input.data_ptr<scalar_t>(),
+                                                          output.data_ptr<scalar_t>(),
+                                                          gamma.data_ptr<scalar_t>(),
+                                                          beta.data_ptr<scalar_t>(),
+                                                          N, C, H, W, eps);
+    }));
+
+    return output;
+}
+"""
+
+Wait, here I used AT_DISPATCH_FLOATING_TYPES to handle different data types (float, double), but in the problem, the original code uses torch.randn which is float. But to be safe, maybe stick to float. Alternatively, the example uses float. Let's see.
+
+Alternatively, to simplify, assume the input is float, so we can hardcode the type. But using AT_DISPATCH_FLOATING_TYPES is better for generality.
+
+But in the example provided in the problem, the elementwise_add_cuda function uses torch::Tensor and assumes float. So perhaps the same approach here.
+
+Wait, in the example's CUDA code:
+
+elementwise_add_kernel<<<...>>>(a.data_ptr<float>(), ...)
+
+So they used float. So maybe we can assume the input is float. 
+
+Alternatively, in the CUDA code, use templates. 
+
+The above code uses templates and AT_DISPATCH_FLOATING_TYPES. 
+
+Now, the CPP source (header):
+
+instance_norm_cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor instance_norm_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    int64_t N, int64_t C, int64_t H, int64_t W, 
+    float eps);
+
+TORCH_LIBRARY(my_ops, m) {
+  m.def("instance_norm", TORCH_FN(instance_norm_cuda));
+}
+"""
+
+Wait, but the example used load_inline with functions specified. Alternatively, the example in the problem used:
+
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=elementwise_add_cpp_source,
+    cuda_sources=elementwise_add_source,
+    functions=["elementwise_add_cuda"],
+    verbose=True,
+    ...
+)
+
+So perhaps the functions parameter lists the functions to be exposed. 
+
+In our case, the function is instance_norm_cuda, so:
+
+functions=["instance_norm_cuda"]
+
+Therefore, the CPP source must have a declaration for instance_norm_cuda, which is done in the code above.
+
+Now, putting all this into the Python code:
+
+First, import necessary modules.
+
+Then define the CUDA sources as strings.
+
+Then compile using load_inline.
+
+Wait, but the CUDA code above has a kernel for float, but uses templates. Let me make sure that the code is correctly structured.
+
+Wait, the kernel is a template, and the dispatch uses AT_DISPATCH_FLOATING_TYPES. 
+
+Wait, in the kernel's declaration:
+
+template <typename T> __global__ void instance_norm_kernel(...)
+
+Then, in the host function, when dispatching:
+
+AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "instance_norm_cuda", ([&] {
+    instance_norm_kernel<scalar_t><<<...>>>(...)
+}));
+
+This is correct.
+
+Thus, the code should work for any floating type, but the problem's example uses float, so it's okay.
+
+Now, the Python code:
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA sources as strings
+instance_norm_source = """
+// CUDA kernel code here (as written earlier)
+"""
+
+instance_norm_cpp_source = """
+#include <torch/extension.h>
+
+// Function declaration
+torch::Tensor instance_norm_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    int64_t N, int64_t C, int64_t H, int64_t W, 
+    float eps);
+
+// The rest of the CPP code for the function definition
+"""
+
+Wait, actually, the instance_norm_cuda function is defined in the CUDA source, so the CPP source only needs the declaration. 
+
+Wait, the code I wrote earlier includes both the kernel and the host function in the CUDA source. The CPP source only needs to have the function declaration. 
+
+Wait, perhaps I should restructure:
+
+The CUDA source contains both the kernel and the host function. The CPP source is just the header with the function declarations. 
+
+Wait, in the example given:
+
+The CUDA sources have both the kernel and the host function (elementwise_add_cuda), and the CPP sources have the declaration of that function.
+
+Thus, in our case, the instance_norm_cuda function is defined in the CUDA source. 
+
+Therefore, the CPP source is just the declaration:
+
+instance_norm_cpp_source = "torch::Tensor instance_norm_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, int64_t N, int64_t C, int64_t H, int64_t W, float eps);"
+
+But actually, the CUDA source includes the definition of the instance_norm_cuda function. So the CPP source only needs the declaration.
+
+Thus, the code for CPP is just that line.
+
+Now, compiling:
+
+instance_norm = load_inline(
+    name="instance_norm",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_cuda_cflags=["-arch=sm_70"],  # or appropriate arch
+)
+
+Wait, but the exact flags might depend on the CUDA version. The user can adjust as needed. The example used empty strings, so perhaps we can follow that.
+
+Now, the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.instance_norm_cuda = instance_norm  # the loaded module
+
+    def forward(self, x):
+        N, C, H, W = x.size()
+        return self.instance_norm_cuda.instance_norm_cuda(
+            x, self.gamma, self.beta, N, C, H, W, 1e-5
+        )
+
+Wait, but in PyTorch, when you load via load_inline with functions=["instance_norm_cuda"], the function is accessible via the module's instance_norm_cuda method. 
+
+Wait, in the example, the elementwise_add_cuda function is called as self.elementwise_add.elementwise_add_cuda(a, b). 
+
+So in our case, the compiled module is called instance_norm, so:
+
+return instance_norm.instance_norm_cuda(x, gamma, beta, N, C, H, W, 1e-5)
+
+But in the forward function, we have to access it via self.instance_norm_cuda (assuming we stored the module in self).
+
+Thus, in __init__:
+
+self.instance_norm_cuda = instance_norm 
+
+Then in forward:
+
+return self.instance_norm_cuda.instance_norm_cuda(x, self.gamma, self.beta, N, C, H, W, 1e-5)
+
+This should work.
+
+Now, checking the parameters:
+
+The original Model has an instance norm layer with learnable parameters (gamma and beta). The new ModelNew has the gamma and beta as parameters, so they will be trained similarly. 
+
+Now, for the get_inputs and get_init_inputs functions:
+
+The original get_init_inputs returns [features], but in the new model, the parameters are initialized in __init__, so perhaps get_init_inputs is not needed, but the problem says to keep the same function. Since the original get_init_inputs returns the features (the num_features), perhaps the new model doesn't need it, but the user might still require it. 
+
+Thus, the new code should replicate the same get_init_inputs function, but in the new code, it's not used. However, the problem says to include the functions as in the original. 
+
+Wait, the original ModelNew does not need any initialization inputs beyond the __init__ parameters. But the original get_init_inputs returns [features], which is passed to the model's __init__. 
+
+Thus, the new ModelNew's __init__ must take num_features as an argument, which it does. 
+
+Therefore, the get_init_inputs can stay the same.
+
+Now, putting all together in code blocks.
+
+Wait, also note that in the CUDA kernel code, the input tensor is assumed to be contiguous. The PyTorch tensor's data_ptr is used, which requires the tensor to be contiguous. So in the Python code, when calling the kernel, the input must be contiguous. The empty_like(input) should be contiguous as well.
+
+Thus, in the code, the input is passed directly, but need to ensure it's contiguous. 
+
+The code should be:
+
+In the kernel's host function:
+
+auto output = torch::empty_like(input).contiguous();
+
+Wait, perhaps add a check:
+
+input = input.contiguous();
+
+But in the code, perhaps the user ensures that inputs are contiguous.
+
+Alternatively, in the Python code, when passing x, ensure it's contiguous.
+
+The original get_inputs returns x as a tensor from torch.rand(...), which is contiguous, so it should be okay.
+
+Now, the final code:
+
+The complete code in Python and CUDA:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA sources
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename T>
+__global__ void instance_norm_kernel(
+    const T* input, T* output, 
+    const T* gamma, const T* beta,
+    int N, int C, int H, int W, T eps) {
+
+    int block_idx = blockIdx.x;
+    int n = block_idx / C;
+    int c = block_idx % C;
+
+    int tid = threadIdx.x;
+    int elements = H * W;
+    int start = tid;
+    int stride = blockDim.x;
+
+    T local_sum = 0.0;
+    T local_squares = 0.0;
+
+    for (int i = start; i < elements; i += stride) {
+        int h = i / W;
+        int w = i % W;
+        int pos = n * C * H * W + c * H * W + h * W + w;
+        T val = input[pos];
+        local_sum += val;
+        local_squares += val * val;
+    }
+
+    __shared__ T s_sum[256];
+    __shared__ T s_squares[256];
+
+    s_sum[tid] = local_sum;
+    s_squares[tid] = local_squares;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_squares[tid] += s_squares[tid + s];
+        }
+        __syncthreads();
+    }
+
+    T total_sum = s_sum[0];
+    T total_squares = s_squares[0];
+    T count = H * W;
+    T mean = total_sum / count;
+    T variance = total_squares / count - mean * mean;
+    T inv_std = 1.0 / sqrt(variance + eps);
+
+    T gamma_val = gamma[c];
+    T beta_val = beta[c];
+
+    for (int i = start; i < elements; i += stride) {
+        int h = i / W;
+        int w = i % W;
+        int pos = n * C * H * W + c * H * W + h * W + w;
+        T val = input[pos];
+        output[pos] = (val - mean) * inv_std * gamma_val + beta_val;
+    }
+}
+
+// Host function
+torch::Tensor instance_norm_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    int64_t N, int64_t C, int64_t H, int64_t W, 
+    float eps) {
+
+    // Ensure input is 4D
+    TORCH_CHECK(input.dim() == 4, "Input must be a 4D tensor (N, C, H, W)");
+
+    auto output = torch::empty_like(input);
+    
+    const int threads_per_block = 256;
+    const dim3 blocks(N * C);
+    const dim3 threads(threads_per_block);
+
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "instance_norm_cuda", ([&] {
+        instance_norm_kernel<scalar_t><<<blocks, threads>>>(input.data_ptr<scalar_t>(),
+                                                          output.data_ptr<scalar_t>(),
+                                                          gamma.data_ptr<scalar_t>(),
+                                                          beta.data_ptr<scalar_t>(),
+                                                          N, C, H, W, eps);
+    }));
+
+    return output;
+}
+"""
+
+instance_norm_cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor instance_norm_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    int64_t N, int64_t C, int64_t H, int64_t W, 
+    float eps);
+"""
+
+# Compile the CUDA code
+instance_norm = load_inline(
+    name="instance_norm",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_cuda_cflags=["-arch=sm_86"],  # adjust based on CUDA compute capability
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.instance_norm_cuda = instance_norm  # Store the loaded module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        N, C, H, W = x.size()
+        return self.instance_norm_cuda.instance_norm_cuda(
+            x, self.gamma, self.beta, N, C, H, W, 1e-5
+        )
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2).cuda()
+    return [x]
+
+def get_init_inputs():
+    return [features]
+
+# Constants from the original code
+batch_size = 112  # heavier workload
+features = 64
+dim1 = 512
+dim2 = 512
+```
+
+Wait, but in the original code, the get_inputs function returns tensors on the CPU (since the example had a+ b on CPU, but the problem's original code for get_inputs had a.cuda()). Looking at the original problem's given code:
+
+The original get_inputs:
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2)
+    return [x]
+
+But in the problem's original code, the model's forward is given with inputs, and since the model uses CUDA (because in the example, a and b were on CUDA), perhaps the inputs should be on CUDA. 
+
+The user's original code for get_inputs may not be on CUDA. But in the example, the inputs were moved to CUDA. 
+
+The problem's original code's get_inputs may have inputs on CPU. However, in the new code, since we are using CUDA kernels, the inputs should be on CUDA. 
+
+Thus, in the get_inputs function, we should move x to CUDA:
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2).cuda()
+    return [x]
+
+Hence, adding .cuda() in get_inputs.
+
+Also, in the ModelNew's forward function, the input x is assumed to be on CUDA, as the kernel is CUDA.
+
+Thus, the final code includes this adjustment.
+
+Now, checking for possible errors:
+
+- The kernel's blockDim.x is 256, which must be less than or equal to the maximum threads per block. 256 is acceptable.
+
+- The shared memory arrays s_sum and s_squares are of size 256. Since blockDim.x is 256, this is correct.
+
+- The reduction loop uses tid (thread index) for writing to shared memory, which is correct.
+
+- The mean and variance calculations are correct.
+
+- The gamma and beta are accessed once per block (since c is fixed for the block), which is efficient.
+
+- The kernel is launched with N*C blocks, which may be large but manageable (for N=112, C=64, 7168 blocks).
+
+Potential issues:
+
+- If the input tensor is not contiguous, the data pointers may not work. So in the forward function, ensure that the input is contiguous. The code uses empty_like(input), which is contiguous if input is contiguous. The get_inputs() function uses .cuda(), which returns a contiguous tensor.
+
+- The kernel uses threadIdx.x which is up to 255. The shared memory arrays are size 256, which is correct.
+
+- The loop over elements may have start and stride correctly calculated.
+
+- The reduction loop may have synchronization points correctly placed.
+
+- The calculation of pos: n * C * H * W + c * H * W + h * W + w. Let's verify:
+
+The tensor is stored in row-major order, so for a tensor of shape (N, C, H, W), the element at (n, c, h, w) has index:
+
+n * (C * H * W) + c * (H * W) + h * W + w. 
+
+Yes, that's correct.
+
+Thus, the code should work.
+
+The optimization includes fusing the mean/variance computation and normalization into a single kernel, reducing kernel launches and memory transactions. This should provide a speedup over the default PyTorch implementation, especially for large tensors.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA kernel for fused Instance Normalization
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename T>
+__global__ void instance_norm_kernel(
+    const T* input, T* output, 
+    const T* gamma, const T* beta,
+    int N, int C, int H, int W, T eps) {
+
+    int block_idx = blockIdx.x;
+    int n = block_idx / C;
+    int c = block_idx % C;
+
+    int tid = threadIdx.x;
+    int elements = H * W;
+    int start = tid;
+    int stride = blockDim.x;
+
+    T local_sum = 0.0;
+    T local_squares = 0.0;
+
+    // Phase 1: Accumulate sum and squares for mean/variance
+    for (int i = start; i < elements; i += stride) {
+        int h = i / W;
+        int w = i % W;
+        int pos = n * C * H * W + c * H * W + h * W + w;
+        T val = input[pos];
+        local_sum += val;
+        local_squares += val * val;
+    }
+
+    __shared__ T s_sum[256];
+    __shared__ T s_squares[256];
+
+    s_sum[tid] = local_sum;
+    s_squares[tid] = local_squares;
+    __syncthreads();
+
+    // Reduction step for sum and squares
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_squares[tid] += s_squares[tid + s];
+        }
+        __syncthreads();
+    }
+
+    T total_sum = s_sum[0];
+    T total_squares = s_squares[0];
+    T count = H * W;
+    T mean = total_sum / count;
+    T variance = total_squares / count - mean * mean;
+    T inv_std = 1.0 / sqrt(variance + eps);
+
+    T gamma_val = gamma[c];
+    T beta_val = beta[c];
+
+    // Phase 2: Apply normalization
+    for (int i = start; i < elements; i += stride) {
+        int h = i / W;
+        int w = i % W;
+        int pos = n * C * H * W + c * H * W + h * W + w;
+        T val = input[pos];
+        output[pos] = (val - mean) * inv_std * gamma_val + beta_val;
+    }
+}
+
+// Host function to launch the kernel
+torch::Tensor instance_norm_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    int64_t N, int64_t C, int64_t H, int64_t W, 
+    float eps) {
+
+    // Ensure input is 4D and contiguous
+    TORCH_CHECK(input.dim() == 4, "Input must be a 4D tensor (N, C, H, W)");
+    input = input.contiguous();
+
+    auto output = torch::empty_like(input);
+    
+    const int threads_per_block = 256;
+    const dim3 blocks(N * C);  // Each block handles a (n,c) group
+    const dim3 threads(threads_per_block);
+
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "instance_norm_cuda", ([&] {
+        instance_norm_kernel<scalar_t><<<blocks, threads>>>(input.data_ptr<scalar_t>(),
+                                                          output.data_ptr<scalar_t>(),
+                                                          gamma.data_ptr<scalar_t>(),
+                                                          beta.data_ptr<scalar_t>(),
+                                                          N, C, H, W, eps);
+    }));
+
+    return output;
+}
+"""
+
+instance_norm_cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor instance_norm_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    int64_t N, int64_t C, int64_t H, int64_t W, 
+    float eps);
+"""
+
+# Compile the CUDA extension
+instance_norm = load_inline(
+    name="instance_norm",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "-arch=compute_75"]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        # Initialize learnable parameters gamma and beta
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.instance_norm_cuda = instance_norm  # Load the compiled CUDA module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Extract tensor dimensions
+        N, C, H, W = x.size()
+        # Launch fused CUDA kernel
+        return self.instance_norm_cuda.instance_norm_cuda(
+            x, self.gamma, self.beta, N, C, H, W, 1e-5
+        )
+
+def get_inputs():
+    # Generate input tensor on CUDA
+    x = torch.rand(batch_size, features, dim1, dim2).cuda()
+    return [x]
+
+def get_init_inputs():
+    return [features]
+
+# Configuration parameters from original problem
+batch_size = 112
+features = 64
+dim1 = 512
+dim2 = 512
+```
+
+### Key Optimization Choices:
+1. **Fused Kernel Implementation**: Combined mean/variance computation and normalization into a single kernel to reduce kernel launch overhead and memory transactions.
+2. **Shared Memory Reduction**: Used shared memory for intermediate sums and squares to minimize global memory access latency during reduction steps.
+3. **Block-wise Processing**: Each CUDA block handles an (N,C) group, allowing parallel computation of statistics and normalization across spatial dimensions (H,W).
+4. **Parameter Handling**: Directly incorporated learnable parameters (gamma and beta) into the kernel to eliminate separate affine transformation steps.
+5. **Vectorized Operations**: Utilized thread-level parallelism to process spatial elements in chunks, maximizing memory access coalescing and arithmetic intensity.
+6. **Dynamic Shape Handling**: Automatically adapts to input tensor dimensions using shape information passed during forward propagation.

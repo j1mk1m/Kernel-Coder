@@ -1,0 +1,144 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int height, int width, int kernel_size) {
+    // Implement the convolution operation here
+}
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    auto kernel_size = weight.size(2);
+
+    auto output = torch::zeros({batch_size, out_channels, height, width}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * out_channels * height * width + block_size - 1) / block_size;
+
+    convolution_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, out_channels, height, width, kernel_size);
+
+    return output;
+}
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for subtraction
+subtraction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void subtraction_kernel(const float* input, const float* value, float* output, int batch_size, int channels, int height, int width) {
+    // Implement the subtraction operation here
+}
+
+torch::Tensor subtraction_cuda(torch::Tensor input, float value) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * channels * height * width + block_size - 1) / block_size;
+
+    subtraction_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), &value, output.data_ptr<float>(), batch_size, channels, height, width);
+
+    return output;
+}
+"""
+
+subtraction_cpp_source = (
+    "torch::Tensor subtraction_cuda(torch::Tensor input, float value);"
+)
+
+# Compile the inline CUDA code for subtraction
+subtraction = load_inline(
+    name="subtraction",
+    cpp_sources=subtraction_cpp_source,
+    cuda_sources=subtraction_source,
+    functions=["subtraction_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for Mish activation
+mish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void mish_kernel(const float* input, float* output, int batch_size, int channels, int height, int width) {
+    // Implement the Mish activation here
+}
+
+torch::Tensor mish_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * channels * height * width + block_size - 1) / block_size;
+
+    mish_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels, height, width);
+
+    return output;
+}
+"""
+
+mish_cpp_source = (
+    "torch::Tensor mish_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for Mish activation
+mish = load_inline(
+    name="mish",
+    cpp_sources=mish_cpp_source,
+    cuda_sources=mish_source,
+    functions=["mish_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2):
+        super(ModelNew, self).__init__()
+        self.convolution = convolution
+        self.subtraction_value_1 = subtraction_value_1
+        self.subtraction_value_2 = subtraction_value_2
+
+    def forward(self, x):
+        x = self.convolution.convolution_cuda(x, self.weight)
+        x = self.subtraction.subtraction_cuda(x, self.subtraction_value_1)
+        x = self.subtraction.subtraction_cuda(x, self.subtraction_value_2)
+        x = self.mish.mish_cuda(x)
+        return x

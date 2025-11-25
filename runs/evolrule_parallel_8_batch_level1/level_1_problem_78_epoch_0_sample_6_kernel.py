@@ -1,0 +1,1 @@
+Optimize the architecture named Model with custom CUDA operators! Name your optimized output architecture ModelNew. Output the new code in codeblocks in markdown format (i.e.

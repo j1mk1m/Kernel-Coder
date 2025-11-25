@@ -1,0 +1,36 @@
+from torch.utils.cpp_extension import load_inline
+
+custom_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void custom_convolution_3d_forward_kernel(...) {
+    // Custom convolution implementation here
+}
+
+torch::Tensor custom_convolution_3d_forward_cuda(...) {
+    // Launch kernel here
+}
+"""
+
+custom_conv_cpp_source = (
+    "torch::Tensor custom_convolution_3d_forward_cuda(...);"
+)
+
+custom_conv = load_inline(
+    name="custom_convolution_3d",
+    cpp_sources=custom_conv_cpp_source,
+    cuda_sources=custom_conv_source,
+    functions=["custom_convolution_3d_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=(1, 1, 1), padding=(0, 0, 0), dilation=(1, 1, 1), groups=1, bias=False):
+        super(ModelNew, self).__init__()
+        self.custom_conv = custom_conv
+
+    def forward(self, x):
+        return self.custom_conv.custom_convolution_3d_forward_cuda(x, ...)

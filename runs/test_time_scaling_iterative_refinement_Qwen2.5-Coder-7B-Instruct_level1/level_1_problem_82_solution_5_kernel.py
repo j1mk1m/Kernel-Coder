@@ -1,0 +1,95 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for depthwise 2D convolution
+depthwise_convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void depthwise_convolution_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int height, int width, int kernel_size, int stride, int padding) {
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+    int h = blockIdx.z;
+    int w = blockIdx.w;
+
+    int input_h_start = h * stride - padding;
+    int input_w_start = w * stride - padding;
+
+    for (int kh = 0; kh < kernel_size; ++kh) {
+        for (int kw = 0; kw < kernel_size; ++kw) {
+            int input_h_idx = input_h_start + kh;
+            int input_w_idx = input_w_start + kw;
+
+            if (input_h_idx >= 0 && input_h_idx < height && input_w_idx >= 0 && input_w_idx < width) {
+                int input_idx = b * in_channels * height * width + c * height * width + input_h_idx * width + input_w_idx;
+                int weight_idx = c * kernel_size * kernel_size + kh * kernel_size + kw;
+                int output_idx = b * in_channels * height * width + c * height * width + h * width + w;
+
+                atomicAdd(&output[output_idx], input[input_idx] * weight[weight_idx]);
+            }
+        }
+    }
+}
+
+torch::Tensor depthwise_convolution_cuda(torch::Tensor input, torch::Tensor weight, int stride, int padding) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    auto kernel_size = weight.size(2);
+
+    auto output = torch::zeros({batch_size, in_channels, height, width}, input.options());
+
+    dim3 grid(batch_size, in_channels, (height + 2 * padding - kernel_size + 1) / stride, (width + 2 * padding - kernel_size + 1) / stride);
+    dim3 block(1, 1, 1);
+
+    depthwise_convolution_kernel<<<grid, block>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, height, width, kernel_size, stride, padding);
+
+    return output;
+}
+"""
+
+depthwise_convolution_cpp_source = (
+    "torch::Tensor depthwise_convolution_cuda(torch::Tensor input, torch::Tensor weight, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for depthwise 2D convolution
+depthwise_convolution = load_inline(
+    name="depthwise_convolution",
+    cpp_sources=depthwise_convolution_cpp_source,
+    cuda_sources=depthwise_convolution_source,
+    functions=["depthwise_convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(in_channels, kernel_size, kernel_size))
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return depthwise_convolution.depthwise_convolution_cuda(x, self.weight, self.stride, self.padding)
+
+
+# Test code
+batch_size = 16
+in_channels = 64
+kernel_size = 3
+width = 512
+height = 512
+stride = 1
+padding = 0
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, height, width).cuda()
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, kernel_size, stride, padding]

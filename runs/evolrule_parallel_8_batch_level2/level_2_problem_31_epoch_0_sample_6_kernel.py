@@ -1,0 +1,91 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, constant_value, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.constant_value = constant_value
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scaling_factor = scaling_factor
+
+        # Define and compile the fused CUDA kernel
+        fused_kernel_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        template <typename scalar_t>
+        __global__ void fused_operations_kernel(
+            const torch::PackedTensorAccessor<scalar_t,4> input,
+            const torch::PackedTensorAccessor<scalar_t,4> bias,
+            scalar_t constant,
+            scalar_t scale,
+            torch::PackedTensorAccessor<scalar_t,4> output) {
+            
+            int b = blockIdx.x;
+            int c = blockIdx.y;
+            int h = threadIdx.x;
+            int w = threadIdx.y;
+
+            scalar_t val = input[b][c][h][w];
+            val = min(val, constant);
+            val += bias[c][0][0];
+            val *= scale;
+            output[b][c][h][w] = val;
+        }
+
+        torch::Tensor fused_operations_cuda(torch::Tensor input, torch::Tensor bias, float constant, float scale) {
+            auto output = torch::empty_like(input);
+            int batch = input.size(0);
+            int channels = input.size(1);
+            int height = input.size(2);
+            int width = input.size(3);
+
+            dim3 threads(32, 8); // Threads per block (handle spatial dimensions)
+            dim3 blocks(batch, channels); // Blocks per grid (handle batch and channels)
+
+            AT_DISPATCH_FLOATING_TYPES(input.type(), "fused_operations_cuda", ([&] {
+                fused_operations_kernel<scalar_t><<<blocks, threads>>>(
+                    input.packed_accessor<scalar_t,4>(),
+                    bias.packed_accessor<scalar_t,4>(),
+                    constant,
+                    scale,
+                    output.packed_accessor<scalar_t,4>());
+            }));
+
+            cudaDeviceSynchronize();
+            return output;
+        }
+        """
+
+        fused_kernel_cpp = "torch::Tensor fused_operations_cuda(torch::Tensor input, torch::Tensor bias, float constant, float scale);"
+
+        # Compile the fused kernel
+        self.fused_ops = load_inline(
+            name="fused_ops",
+            cpp_sources=fused_kernel_cpp,
+            cuda_sources=fused_kernel_source,
+            functions=["fused_operations_cuda"],
+            verbose=False
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Apply fused operations using custom kernel
+        return self.fused_ops.fused_operations_cuda(
+            x, 
+            self.bias.unsqueeze(1).unsqueeze(2),  # Expand bias to 4D
+            self.constant_value,
+            self.scaling_factor
+        )
+
+def get_inputs():
+    batch_size = 128
+    in_channels = 64
+    height = width = 128
+    return [torch.rand(batch_size, in_channels, height, width).cuda()]
+
+def get_init_inputs():
+    # Parameters for ModelNew constructor
+    return [128, 64, 128, 3, 0.5, (128,1,1), 2.0]

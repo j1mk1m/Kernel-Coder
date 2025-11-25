@@ -1,0 +1,65 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_gelu_divide_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_gelu_divide_kernel(const float* a, const float* b, float* c, int m, int n, int k, float divisor) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+
+        float gelu_val = 0.5 * sum * (1.0 + tanh(sqrt(2.0 / M_PI) * (sum + 0.044715 * sum * sum * sum)));
+        c[row * n + col] = gelu_val / divisor;
+    }
+}
+
+torch::Tensor matmul_gelu_divide_cuda(torch::Tensor a, torch::Tensor b, float divisor) {
+    int m = a.size(0);
+    int n = b.size(1);
+    int k = a.size(1);
+    auto out = torch::zeros({m, n}, a.options());
+
+    const int block_size = 32;
+    const int grid_x = (n + block_size - 1) / block_size;
+    const int grid_y = (m + block_size - 1) / block_size;
+
+    matmul_gelu_divide_kernel<<<grid_y, grid_x>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), m, n, k, divisor);
+
+    return out;
+}
+"""
+
+matmul_gelu_divide_cpp_source = (
+    "torch::Tensor matmul_gelu_divide_cuda(torch::Tensor a, torch::Tensor b, float divisor);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul_gelu_divide = load_inline(
+    name="matmul_gelu_divide",
+    cpp_sources=matmul_gelu_divide_cpp_source,
+    cuda_sources=matmul_gelu_divide_source,
+    functions=["matmul_gelu_divide_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, output_size, divisor):
+        super(ModelNew, self).__init__()
+        self.divisor = divisor
+
+    def forward(self, x):
+        x = matmul_gelu_divide.matmul_gelu_divide_cuda(x, x.t(), self.divisor)
+        return x

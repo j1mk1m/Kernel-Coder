@@ -1,0 +1,96 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Layer Normalization
+layer_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void layer_norm_kernel(const float* x, float* mean, float* var, float* y, int batch_size, int features, int dim1, int dim2) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * features) {
+        float sum = 0.0f;
+        float square_sum = 0.0f;
+        for (int i = 0; i < dim1 * dim2; ++i) {
+            sum += x[idx * dim1 * dim2 + i];
+            square_sum += x[idx * dim1 * dim2 + i] * x[idx * dim1 * dim2 + i];
+        }
+        mean[idx] = sum / (dim1 * dim2);
+        var[idx] = square_sum / (dim1 * dim2) - mean[idx] * mean[idx];
+        y[idx] = (x[idx * dim1 * dim2] - mean[idx]) / std::sqrt(var[idx] + 1e-5);
+    }
+}
+
+void layer_norm_forward_cuda(const float* x, float* mean, float* var, float* y, int batch_size, int features, int dim1, int dim2) {
+    const int block_size = 256;
+    const int num_blocks = (batch_size * features + block_size - 1) / block_size;
+
+    layer_norm_kernel<<<num_blocks, block_size>>>(x, mean, var, y, batch_size, features, dim1, dim2);
+}
+"""
+
+layer_norm_cpp_source = (
+    "void layer_norm_forward_cuda(const float* x, float* mean, float* var, float* y, int batch_size, int features, int dim1, int dim2);"
+)
+
+# Compile the inline CUDA code for Layer Normalization
+layer_norm = load_inline(
+    name="layer_norm",
+    cpp_sources=layer_norm_cpp_source,
+    cuda_sources=layer_norm_source,
+    functions=["layer_norm_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs Layer Normalization using a custom CUDA kernel.
+    """
+    def __init__(self, normalized_shape: tuple):
+        """
+        Initializes the LayerNorm layer.
+
+        Args:
+            normalized_shape (tuple): Shape of the input tensor to be normalized.
+        """
+        super(ModelNew, self).__init__()
+        self.normalized_shape = normalized_shape
+        self.batch_size = normalized_shape[0]
+        self.features = normalized_shape[1]
+        self.dim1 = normalized_shape[2]
+        self.dim2 = normalized_shape[3]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Layer Normalization to the input tensor using a custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (*, normalized_shape).
+
+        Returns:
+            torch.Tensor: Output tensor with Layer Normalization applied, same shape as input.
+        """
+        mean = torch.zeros((self.batch_size, self.features)).cuda()
+        var = torch.zeros((self.batch_size, self.features)).cuda()
+        y = torch.zeros_like(x).cuda()
+
+        layer_norm_forward_cuda(x.data_ptr(), mean.data_ptr(), var.data_ptr(), y.data_ptr(), self.batch_size, self.features, self.dim1, self.dim2)
+
+        return y
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 16
+    features = 64
+    dim1 = 256
+    dim2 = 256
+
+    x = torch.rand(batch_size, features, dim1, dim2).cuda()
+    model = ModelNew(normalized_shape=(batch_size, features, dim1, dim2))
+    output = model(x)
+    print(output.shape)

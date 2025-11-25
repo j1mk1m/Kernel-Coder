@@ -1,0 +1,438 @@
+You must use the same architecture as the given code. For example, the instance norm is still in the model. You may combine multiple operators into a single kernel for better performance. For example, combine the addition and multiplication into a single fused kernel. You may also replace individual operators with faster CUDA implementations.
+
+When you write CUDA kernels, use PyTorch's custom operator framework with load_inline. You can replace all the operators except the Linear layer (nn.Linear) and the instance normalization (nn.InstanceNorm2d). The rest of the operators (add, multiply, unsqueeze, squeeze) can be replaced with custom CUDA kernels. 
+
+The goal is to make the forward pass as fast as possible. The code must be correct and handle the batch size and tensor shapes as given in the architecture.
+Alright, let's tackle this optimization. The user wants to replace certain PyTorch operators in their Model with custom CUDA kernels to speed up the forward pass. The allowed operators to replace are the unsqueeze, squeeze, addition, and multiplication. The instance norm and linear layer must stay as they are.
+
+First, I need to look at the forward pass steps:
+
+1. x = self.bmm(x) → this is the linear layer, which can't be replaced.
+2. x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1) → here, two unsqueeze operations are applied, followed by instance norm, then two squeeze operations.
+3. x = x + y → element-wise addition.
+4. x = x * y → element-wise multiplication.
+
+The plan is to combine the unsqueeze and squeeze operations into a single kernel, since those are just dimension adjustments, and also fuse the addition and multiplication into another kernel. That way, we reduce the number of CUDA kernel launches, which is a significant overhead.
+
+Starting with the unsqueeze and squeeze. The original code adds two singleton dimensions (unsqueeze(1) twice) to make the input compatible with InstanceNorm2d, which expects 4D tensors. After applying the norm, those dimensions are squeezed back. But doing this in Python with multiple function calls might be slow, so a custom kernel can handle the reshaping in a single step. However, reshaping itself doesn't involve computation, so perhaps this isn't the best place to optimize. Wait, but the actual instance norm might handle the dimensions internally, so maybe those unsqueeze/squeeze are necessary and can't be optimized away. Hmm, maybe not the best target. Alternatively, since the instance norm is a PyTorch operator that already handles the 4D tensor, perhaps those unsqueeze and squeeze can be left as is, since they're just tensor shape adjustments without computation. Maybe they aren't the bottleneck. Let me think again.
+
+Alternatively, the main candidates for optimization are the addition and multiplication. Combining those into a fused kernel would save a kernel launch and memory accesses. The steps after the instance norm are x = x + y followed by x = x * y. So, instead of two separate element-wise operations, a single kernel can compute (x + y) * y, but wait that's not the same. Wait the code is x = x + y then x = x * y, so the result is (x_prev + y) * y. Alternatively, it's (x_prev + y) * y. To combine into a single kernel, we can compute (x + y) * y in one step. That would be more efficient than two separate passes.
+
+So, first, let's create a fused kernel for the addition and multiplication. The input tensors here are x (output of instance norm) and y (the input tensor). The shapes: x after instance norm is (batch_size, out_features), because after instance norm, the two squeezes remove the singleton dimensions. y has shape (batch_size, out_features). So both are 2D tensors of the same shape, so the element-wise operations are straightforward.
+
+Now, the fused kernel would take x and y, and compute (x + y) * y. Wait, actually the two operations are sequential: first add y, then multiply by y. So the result is (x + y) * y. So the fused kernel can do both in a single loop.
+
+Next, the unsqueeze and squeeze. Since they're just adding and removing dimensions, perhaps the fastest way is to leave them as they are, because PyTorch's unsqueeze and squeeze are just metadata changes and don't involve data copies. However, if the instance norm is the slow part, maybe those can be ignored. Let me check: unsqueeze(1).unsqueeze(1) would turn a (B, F) tensor into (B, 1, 1, F). Then after instance norm, squeezing removes the two 1 dimensions, so it's back to (B, F). So these operations are necessary for the instance norm, but perhaps their execution time is negligible compared to the norm itself. Therefore, maybe focusing on the element-wise operations is better.
+
+Therefore, the main optimization would be to fuse the addition and multiplication into a single kernel. Let's proceed.
+
+First, the fused kernel:
+
+The kernel would take three tensors: the x from the instance norm (shape B, F), and y (B, F). The output is (x + y) * y.
+
+Wait, actually, let me confirm the operations:
+
+The code after instance norm:
+
+x = x + y → so x is updated to x + y
+
+Then x = x * y → so the final result is (x_initial + y) * y.
+
+Alternatively, the final output is (x_initial + y) * y, which can be written as x_initial*y + y^2. But to compute this in a single kernel, for each element:
+
+out[i] = (x[i] + y[i]) * y[i]
+
+Which is equivalent to x[i] * y[i] + y[i]^2. However, doing this in a single step per element is better.
+
+So the fused kernel can handle this.
+
+Now, the kernel code would look like:
+
+__global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = (x[idx] + y[idx]) * y[idx];
+    }
+}
+
+Then, the CUDA function would take x and y, create an output tensor, launch the kernel, etc.
+
+Now, the next step is to replace the addition and multiplication with this kernel.
+
+Now, in the original code's forward:
+
+After instance norm, x is squeezed back to (B, F). Then the addition and multiplication are done.
+
+In the optimized code, after the instance norm, we can call the fused kernel directly, passing x and y, getting the result in one step.
+
+So that's one optimization point.
+
+Additionally, the unsqueeze and squeeze steps: since they are just changing the tensor shape without data movement (since the data is contiguous?), perhaps they are already efficient. However, if the instance norm requires the 4D tensor, but the input is 2D, then unsqueezing adds dimensions, but since the data is contiguous, the kernel can handle it, but maybe there's a way to avoid that? Probably not, because the instance norm is expecting 4D input, so the unsqueeze is necessary.
+
+Alternatively, perhaps the instance norm can be applied on the 2D input, but no, the documentation says InstanceNorm2d expects 4D tensors (N,C,H,W). So we need the unsqueeze steps.
+
+Therefore, those steps can't be optimized away, but perhaps their execution time is negligible, so we can leave them as is.
+
+Therefore, the main optimization is the fused kernel for the addition and multiplication.
+
+Now, let's code that.
+
+First, the CUDA source for the fused kernel.
+
+Also, note that in the original code, after the instance norm, the squeezing is done twice. Let me check the code again:
+
+x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+
+So after instance norm, the output is (B, 1, 1, F), then squeeze(1) removes the second dimension (which is 1), resulting in (B, 1, F), then squeeze(1) again removes the second dimension (now 1), resulting in (B, F). So that's correct.
+
+The instance norm is applied to each channel (since it's InstanceNorm2d), so the channels are the second dimension (C=1 here, since after first unsqueeze, it's (B, 1, 1, F). Wait, no. Wait, the original x after bmm is (B, out_features). Then x.unsqueeze(1).unsqueeze(1) becomes (B, 1, 1, out_features). The instance norm is applied over the C dimension, which here is the second dimension (size 1). That's okay, but perhaps the instance norm is expecting the channel dimension to be the second, which it is. So that's correct.
+
+Therefore, the unsqueeze and squeeze are necessary and correct.
+
+Now, moving to the code structure.
+
+The original Model's forward is:
+
+def forward(self, x, y):
+    x = self.bmm(x)
+    x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+    x = x + y
+    x = x * y
+    return x
+
+The new ModelNew should replace the '+' and '*' with the fused kernel.
+
+Therefore, in the new class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super().__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        # load the fused kernel here
+        # also, perhaps replace the unsqueeze/squeeze with something? Probably not needed
+
+        # define the fused add and multiply kernel
+        # using load_inline as in the example
+
+    def forward(self, x, y):
+        x = self.bmm(x)
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        # instead of x + y then * y, call the fused kernel
+        x = fused_add_mul_cuda(x, y)
+        return x
+
+Now, the CUDA code for the fused kernel.
+
+The CUDA code would be similar to the example provided. Let me write that.
+
+First, the CUDA source code for the fused_add_mul kernel:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = (x[idx] + y[idx]) * y[idx];
+    }
+}
+
+torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y) {
+    auto size = x.numel();
+    auto out = torch::empty_like(x); // or zeros_like, but empty is better as we write all elements
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+    fused_add_mul_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), size);
+    return out;
+}
+
+Then, the corresponding C++ header:
+
+"torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y);"
+
+Then, in the Python code, we need to load this kernel using load_inline.
+
+Putting this into the code:
+
+First, define the CUDA source strings.
+
+fused_add_mul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = (x[idx] + y[idx]) * y[idx];
+    }
+}
+
+torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y) {
+    auto size = x.numel();
+    auto out = torch::empty_like(x);
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+    fused_add_mul_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), size);
+    return out;
+}
+"""
+
+fused_add_mul_cpp_source = (
+    "torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y);"
+)
+
+Then, load the kernel:
+
+fused_add_mul = load_inline(
+    name="fused_add_mul",
+    cpp_sources=fused_add_mul_cpp_source,
+    cuda_sources=fused_add_mul_source,
+    functions=["fused_add_mul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+In the ModelNew class, we can then use this kernel in the forward.
+
+Now, the full code:
+
+The original Model has parameters in_features and out_features in __init__, so the new ModelNew must also accept those parameters, and initialize the Linear layer and InstanceNorm2d.
+
+Putting it all together:
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        
+        # Define the fused add and multiply kernel
+        fused_add_mul_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        __global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx < size) {
+                out[idx] = (x[idx] + y[idx]) * y[idx];
+            }
+        }
+
+        torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y) {
+            auto size = x.numel();
+            auto out = torch::empty_like(x);
+            const int block_size = 256;
+            const int num_blocks = (size + block_size - 1) / block_size;
+            fused_add_mul_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), size);
+            return out;
+        }
+        """
+
+        fused_add_mul_cpp_source = (
+            "torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y);"
+        )
+
+        # Load the fused kernel
+        self.fused_add_mul = load_inline(
+            name="fused_add_mul",
+            cpp_sources=fused_add_mul_cpp_source,
+            cuda_sources=fused_add_mul_source,
+            functions=["fused_add_mul_cuda"],
+            verbose=True,
+            extra_cflags=[""],
+            extra_ldflags=[""],
+        )
+
+    def forward(self, x, y):
+        x = self.bmm(x)
+        # Apply instance norm with unsqueeze/squeeze
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        # Use fused kernel for add and multiply
+        x = self.fused_add_mul.fused_add_mul_cuda(x, y)
+        return x
+
+Wait, but in Python, we can't have the load_inline inside the __init__ function for each instance, because that would recompile the kernel every time a new instance is created, which is inefficient. Instead, the kernel should be loaded once, perhaps as a class variable or outside.
+
+Hmm, this is a problem. The current code defines the fused_add_mul_source and loads the kernel inside the __init__ of ModelNew. That would lead to recompiling the kernel every time a new ModelNew is instantiated, which is not efficient. Instead, we should define the kernel outside the class, similar to the example provided.
+
+Let me reorganize the code structure to follow the example:
+
+First, define the CUDA kernel outside the class, then have the class reference it.
+
+So the corrected code would be:
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused add and multiply CUDA kernel
+fused_add_mul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = (x[idx] + y[idx]) * y[idx];
+    }
+}
+
+torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y) {
+    auto size = x.numel();
+    auto out = torch::empty_like(x);
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+    fused_add_mul_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), size);
+    return out;
+}
+"""
+
+fused_add_mul_cpp_source = (
+    "torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y);"
+)
+
+# Compile the fused kernel once
+fused_add_mul = load_inline(
+    name="fused_add_mul",
+    cpp_sources=fused_add_mul_cpp_source,
+    cuda_sources=fused_add_mul_source,
+    functions=["fused_add_mul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        self.fused_add_mul = fused_add_mul  # reference the pre-compiled kernel
+
+    def forward(self, x, y):
+        x = self.bmm(x)
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        x = self.fused_add_mul.fused_add_mul_cuda(x, y)
+        return x
+
+This way, the kernel is compiled once when the module is imported, not every time the model is instantiated.
+
+That's better.
+
+Now, checking if the code is correct:
+
+The input x after the instance norm is a (B, F) tensor. The y is (B, F). The fused kernel takes both tensors and returns (x + y) * y. The output is also (B, F). So that's correct.
+
+The other operations (unsqueeze and squeeze) remain as before, but they are necessary for the instance norm.
+
+Are there any other optimizations possible?
+
+The unsqueeze and squeeze steps: perhaps they can be replaced with a custom kernel that does the reshaping and computation in a single step with the instance norm? But since the instance norm is a PyTorch operator that we can't replace, it's better to leave the unsqueeze/squeeze as they are. Since they are just metadata changes, their execution time is negligible.
+
+Another possible optimization is to combine the instance norm with the previous step, but that's not possible as the instance norm is a separate module and we cannot replace it.
+
+Alternatively, the instance norm's own implementation might be optimized, but that's beyond our control here.
+
+Therefore, the main optimization is the fused kernel for addition and multiplication.
+
+Another thing to consider: the output of the instance norm is a 4D tensor, which is then squeezed twice. Perhaps the squeeze operations can be fused with the subsequent computation? Since the instance norm's output is (B, 1, 1, F), then after squeeze, it's (B, F). But the next step requires a 2D tensor. If we can process the 4D tensor directly in the fused kernel, we might avoid the squeeze steps. However, the fused kernel's input x must be the result of the instance norm, which is 4D, and y is 2D (B, F). That would require broadcasting, which might complicate things. Alternatively, the squeeze is necessary to make x and y have the same shape.
+
+Alternatively, perhaps in the fused kernel, we can accept a 4D x tensor and y as 2D, but handle the dimensions inside the kernel. But that would add complexity, and the squeeze steps are already O(1) operations (just changing the shape metadata), so probably not worth the effort. The current approach is better.
+
+Another point: in the fused kernel, the output is allocated with empty_like, which is correct because we're writing all elements. Using empty is more efficient than zeros_like.
+
+So, the code as written should work.
+
+Testing:
+
+The forward function's steps:
+
+1. x is passed through the linear layer (no change).
+2. x is unsqueezed twice, then instance norm is applied, then squeezed twice → the same as before.
+3. The fused kernel computes (x + y) * y.
+
+Therefore, the output is correct.
+
+Now, compiling this code should work, as it follows the structure of the example provided.
+
+Another possible optimization: combining the unsqueeze/squeeze with the instance norm into a single kernel, but that would require reimplementing instance norm, which is not allowed per the problem constraints.
+
+Thus, the final code should be as above.
+
+**Final Answer**
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused add and multiply CUDA kernel
+fused_add_mul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = (x[idx] + y[idx]) * y[idx];
+    }
+}
+
+torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y) {
+    auto size = x.numel();
+    auto out = torch::empty_like(x);
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+    fused_add_mul_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), size);
+    return out;
+}
+"""
+
+fused_add_mul_cpp_source = (
+    "torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y);"
+)
+
+# Compile the fused kernel once
+fused_add_mul = load_inline(
+    name="fused_add_mul",
+    cpp_sources=fused_add_mul_cpp_source,
+    cuda_sources=fused_add_mul_source,
+    functions=["fused_add_mul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        self.fused_add_mul = fused_add_mul
+
+    def forward(self, x, y):
+        x = self.bmm(x)
+        # Apply instance norm with unsqueeze/squeeze
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        # Use fused kernel for add and multiply
+        x = self.fused_add_mul.fused_add_mul_cuda(x, y)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda(), torch.rand(batch_size, out_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+```
+
+Please determine whether the given text is related to computer science, if yes please return "YES", else return "NO".

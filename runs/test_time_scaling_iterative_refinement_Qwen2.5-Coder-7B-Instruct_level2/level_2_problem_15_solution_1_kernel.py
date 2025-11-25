@@ -1,0 +1,1 @@
+expected an indented block after class definition on line 10 (<string>, line 14)

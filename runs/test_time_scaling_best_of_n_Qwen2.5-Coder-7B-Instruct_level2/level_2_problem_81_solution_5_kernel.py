@@ -1,0 +1,48 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for GEMM
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement your GEMM kernel here
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for GEMM
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.gemm = gemm
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.gemm.gemm_cuda(x, x.t())  # Assuming 'x' is both input and weight
+        x = x * torch.sigmoid(x)  # Swish activation
+        x = x / 2.0
+        x = torch.clamp(x, min=-1.0, max=1.0)  # Clamp between -1 and 1
+        x = torch.tanh(x)  # Tanh activation
+        x = torch.clamp(x, min=-1.0, max=1.0)  # Clamp between -1 and 1
+        return x

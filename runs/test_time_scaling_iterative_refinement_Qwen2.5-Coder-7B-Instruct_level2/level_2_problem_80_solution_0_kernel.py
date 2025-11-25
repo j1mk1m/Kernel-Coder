@@ -1,0 +1,209 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for GEMM
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 32;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    gemm_kernel<<<num_blocks_y, num_blocks_x, 0, at::cuda::getCurrentCUDAStream()>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for GEMM
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for maximum reduction
+max_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void max_reduction_kernel(const float* input, float* output, int size) {
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    sdata[tid] = (i < size) ? input[i] : -std::numeric_limits<float>::infinity();
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmax(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[blockIdx.x] = sdata[0];
+    }
+}
+
+torch::Tensor max_reduction_cuda(torch::Tensor input) {
+    auto size = input.size(0);
+    auto num_blocks = (size + 255) / 256;
+
+    auto output = torch::zeros({num_blocks}, input.options());
+
+    max_reduction_kernel<<<num_blocks, 256, 256 * sizeof(float)>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+max_reduction_cpp_source = (
+    "torch::Tensor max_reduction_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for maximum reduction
+max_reduction = load_inline(
+    name="max_reduction",
+    cpp_sources=max_reduction_cpp_source,
+    cuda_sources=max_reduction_source,
+    functions=["max_reduction_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for mean subtraction
+mean_subtraction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void mean_subtraction_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        float sum = 0.0f;
+        for (int i = 0; i < size; ++i) {
+            sum += input[i];
+        }
+        output[idx] = input[idx] - sum / size;
+    }
+}
+
+torch::Tensor mean_subtraction_cuda(torch::Tensor input) {
+    auto size = input.size(0);
+
+    auto output = torch::zeros_like(input);
+
+    mean_subtraction_kernel<<<(size + 255) / 256, 256>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+mean_subtraction_cpp_source = (
+    "torch::Tensor mean_subtraction_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for mean subtraction
+mean_subtraction = load_inline(
+    name="mean_subtraction",
+    cpp_sources=mean_subtraction_cpp_source,
+    cuda_sources=mean_subtraction_source,
+    functions=["mean_subtraction_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for GELU activation
+gelu_activation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_activation_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        float x = input[idx];
+        float gelu_value = 0.5 * x * (1 + tanh(sqrt(2 / M_PI) * (x + 0.044715 * x * x * x)));
+        output[idx] = gelu_value;
+    }
+}
+
+torch::Tensor gelu_activation_cuda(torch::Tensor input) {
+    auto size = input.size(0);
+
+    auto output = torch::zeros_like(input);
+
+    gelu_activation_kernel<<<(size + 255) / 256, 256>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+gelu_activation_cpp_source = (
+    "torch::Tensor gelu_activation_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for GELU activation
+gelu_activation = load_inline(
+    name="gelu_activation",
+    cpp_sources=gelu_activation_cpp_source,
+    cuda_sources=gelu_activation_source,
+    functions=["gelu_activation_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, max_dim):
+        super(ModelNew, self).__init__()
+        self.gemm = gemm
+        self.max_reduction = max_reduction
+        self.mean_subtraction = mean_subtraction
+        self.gelu_activation = gelu_activation
+
+    def forward(self, x):
+        x = self.gemm.gemm_cuda(x, self.weight)
+        x = self.max_reduction.max_reduction_cuda(x)
+        x = self.mean_subtraction.mean_subtraction_cuda(x)
+        x = self.gelu_activation.gelu_activation_cuda(x)
+        return x

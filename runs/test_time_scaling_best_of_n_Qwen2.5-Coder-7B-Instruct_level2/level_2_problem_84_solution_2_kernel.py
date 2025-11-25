@@ -1,0 +1,167 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+void gemm_cuda(const torch::Tensor& a, const torch::Tensor& b, torch::Tensor& c) {
+    int m = a.size(0);
+    int n = b.size(1);
+    int k = a.size(1);
+
+    const int block_size = 16;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    gemm_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+}
+"""
+
+gemm_cpp_source = (
+    "void gemm_cuda(const torch::Tensor& a, const torch::Tensor& b, torch::Tensor& c);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for batch normalization
+batch_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void batch_norm_kernel(const float* x, const float* mean, const float* var, const float* gamma, const float* beta, float* y, int size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        y[idx] = gamma[idx] * ((x[idx] - mean[0]) / sqrt(var[0] + eps)) + beta[idx];
+    }
+}
+
+void batch_norm_cuda(const torch::Tensor& x, const torch::Tensor& mean, const torch::Tensor& var, const torch::Tensor& gamma, const torch::Tensor& beta, torch::Tensor& y, float eps) {
+    int size = x.numel();
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    batch_norm_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(), y.data_ptr<float>(), size, eps);
+}
+"""
+
+batch_norm_cpp_source = (
+    "void batch_norm_cuda(const torch::Tensor& x, const torch::Tensor& mean, const torch::Tensor& var, const torch::Tensor& gamma, const torch::Tensor& beta, torch::Tensor& y, float eps);"
+)
+
+# Compile the inline CUDA code for batch normalization
+batch_norm = load_inline(
+    name="batch_norm",
+    cpp_sources=batch_norm_cpp_source,
+    cuda_sources=batch_norm_source,
+    functions=["batch_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void softmax_kernel(const float* x, float* y, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float max_val = x[0];
+        for (int i = 1; i < size; ++i) {
+            if (x[i] > max_val) {
+                max_val = x[i];
+            }
+        }
+
+        float sum_exp = 0.0f;
+        for (int i = 0; i < size; ++i) {
+            sum_exp += exp(x[i] - max_val);
+        }
+
+        y[idx] = exp(x[idx] - max_val) / sum_exp;
+    }
+}
+
+void softmax_cuda(const torch::Tensor& x, torch::Tensor& y) {
+    int size = x.numel();
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    softmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+}
+"""
+
+softmax_cpp_source = (
+    "void softmax_cuda(const torch::Tensor& x, torch::Tensor& y);"
+)
+
+# Compile the inline CUDA code for softmax
+softmax = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, scale_shape=(1,)):
+        super(ModelNew, self).__init__()
+        self.gemm = gemm
+        self.bn = batch_norm
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        self.softmax = softmax
+
+    def forward(self, x):
+        x = self.gemm.gemm_cuda(x, self.gemm.weight, self.gemm.bias)
+        x = self.bn.batch_norm_cuda(x, self.bn.running_mean, self.bn.running_var, self.bn.weight, self.bn.bias, self.bn.eps)
+        x = self.scale * x
+        x = self.softmax.softmax_cuda(x)
+        return x
+
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 1024
+    in_features = 8192
+    out_features = 8192
+    bn_eps = 1e-5
+    bn_momentum = 0.1
+    scale_shape = (1,)
+
+    model_new = ModelNew(in_features, out_features, bn_eps, bn_momentum, scale_shape)
+    inputs = get_inputs()[0].cuda()
+    outputs = model_new(inputs)
+    print(outputs.shape)

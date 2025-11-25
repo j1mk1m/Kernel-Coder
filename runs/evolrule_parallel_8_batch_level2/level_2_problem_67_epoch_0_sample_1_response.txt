@@ -1,0 +1,730 @@
+Note that the original model has three operators: convolution, GELU activation, and adaptive average pooling. The original code also includes squeezing after the pooling. Your custom CUDA kernels can be used to replace some or all of these operators. You can also fuse operators (e.g., combine convolution and GELU into a single kernel, etc.). You can also choose to replace some operators individually or combine them. 
+
+The goal is to make the new architecture as fast as possible, even if it requires writing multiple CUDA kernels. 
+
+First, think step by step which operators to replace and how. Then, write the corresponding CUDA kernels. Finally, present the complete ModelNew class with the custom operators. 
+
+First, I need to figure out which operators to replace in the given Model architecture. The original model has three main operations: convolution, GELU activation, and adaptive average pooling followed by squeezing. 
+
+The goal is to optimize for speed. Let's analyze each operation:
+
+1. **Convolution (nn.Conv2d):**
+   - This is a compute-heavy operation. Implementing a custom CUDA kernel for convolution might be challenging because PyTorch's implementation is already highly optimized. However, if we can fuse this with the subsequent GELU activation, it might save some memory transfers and time.
+
+2. **GELU Activation (F.gelu):**
+   - GELU is an activation function. The computation is element-wise (x * 0.5 * (1 + torch.erf(x / sqrt(2)))). Implementing this in a CUDA kernel fused with the convolution might help, especially if we can do the computation in-place or reduce memory movement.
+
+3. **Adaptive Avg Pooling (F.adaptive_avg_pool2d) and Squeeze:**
+   - The adaptive average pooling reduces the spatial dimensions to 1x1. Since the output is already being squeezed, this is essentially a global average pooling. The pooling itself is a reduction operation. Implementing this as a custom kernel might be beneficial, especially if combined with the GELU or even the convolution.
+
+Possible fusion strategies:
+- **Fusing Convolution + GELU:** Perform the convolution computation followed by GELU in a single kernel. This reduces memory writes/reads and synchronization overhead.
+- **Fusing GELU + Global Avg Pooling:** After applying GELU, compute the average over the spatial dimensions directly in the kernel, avoiding intermediate storage.
+- **Fusing all three operations:** Convolution, GELU, and Global Avg Pooling into one kernel. This would be the most efficient but might be complex due to different computation types (convolution is a 2D filter, GELU is element-wise, pooling is reduction).
+
+Let's consider the feasibility:
+
+- **Convolution + GELU:** The convolution outputs a tensor, which is then passed to GELU. The GELU computation is element-wise. Since the convolution's output can be immediately processed by the GELU kernel, fusing these two into a single kernel might save time by avoiding an extra kernel launch and data transfer. However, convolution is a more complex operation (requires applying filters with weight parameters), so the fused kernel would need to handle both the convolution math and the GELU activation.
+
+- **GELU + Global Avg Pooling:** The GELU output is passed to the pooling. The pooling can be done by summing over the spatial dimensions and dividing by the count. Since pooling is a reduction, combining it with GELU could be efficient. However, the GELU still requires element-wise computation, and the pooling is a reduction step. The two steps could be combined in a single kernel where each thread processes a spatial region and accumulates the sum, then applies GELU before or after? Wait, actually, GELU has to be applied before the pooling because the pooling is a reduction of the post-GELU values. So the order is important. So first compute GELU on the convolution output, then perform the global average pooling. Therefore, the GELU and pooling can be fused into one kernel by first computing GELU, then accumulating the sum for each channel.
+
+- **All three:** This would mean a kernel that computes the convolution, applies GELU, then does the global average pooling. However, this would require storing the intermediate results for GELU in shared memory or registers, which might complicate things, especially for large feature maps. Since the input is 256x256, the spatial dimensions are quite large. For convolution, even with kernel size 3, the computation is significant. Fusing all three might be possible but might not be straightforward.
+
+Given the complexity, perhaps the best approach is to first try fusing convolution and GELU, then handle the pooling separately. Alternatively, separate kernels for each step but optimized individually. Alternatively, fusing GELU and pooling.
+
+Let me think of possible approaches:
+
+Option 1: Separate kernels for each operator but optimized.
+
+- Convolution: PyTorch's implementation is already fast. Maybe not worth replacing unless we can fuse with next step.
+
+- GELU: Implement a custom element-wise GELU kernel. Since GELU is element-wise, a CUDA kernel could be straightforward. But PyTorch's implementation is also optimized. However, maybe combining with pooling could help.
+
+- Pooling and squeeze: The adaptive_avg_pool2d(1) is equivalent to global average pooling. Implementing a custom kernel for global average pooling might help, as it can avoid the intermediate tensor creation. For example, instead of creating a tensor of shape (B, C, 1, 1), we can compute the average directly and store it in a (B, C) tensor, avoiding the squeeze steps.
+
+Option 2: Fusing GELU and Global Avg Pooling.
+
+This could be done in a single kernel. The steps would be:
+
+1. For each output channel, each thread processes a spatial element (like a thread per element), computes GELU on it, then accumulates the sum into a per-channel accumulator. After all elements are processed, divide by the total number of elements (height * width) to get the average. This approach would require a reduction across spatial dimensions per channel.
+
+This could be efficient because the GELU is part of the accumulation step. Let me think of how to structure this:
+
+- Each thread could process a spatial element for a particular channel. But since there are many channels, perhaps a 2D thread block where each thread handles a (channel, spatial) element? Not sure.
+
+Alternatively, for each channel, compute the sum over all spatial positions. So for each channel, you need to sum over H*W elements. To do this in parallel, you can have a kernel where each thread processes a spatial position for a particular channel. Then, reduce the sums across threads.
+
+Wait, but the problem is that the GELU must be applied first. So the steps are:
+
+For each element in the input tensor (after convolution):
+
+Compute gelu_val = gelu(input_val)
+
+Accumulate gelu_val into the per-channel sum.
+
+Then, divide the sum by (H*W) to get the average per channel.
+
+This could be done in a single kernel. The challenge is managing the reduction for each channel. Let me think of a possible kernel structure:
+
+The input to the GELU and pooling fused kernel is the output of the convolution (which is already computed). So first, the convolution must be done by PyTorch or a custom kernel. But if we can't fuse convolution with GELU/pooling, then the first part must be handled by PyTorch's Conv2d.
+
+Alternatively, if we can do convolution + gelu + pooling in a single kernel, that's the most optimal, but it would be complicated.
+
+Alternatively, let's consider the following steps:
+
+- The original model's forward is:
+
+x = self.conv(x) --> convolution (compute intensive)
+
+x = F.gelu(x) --> element-wise activation
+
+x = F.adaptive_avg_pool2d(x, 1) --> pooling to 1x1
+
+x = x.squeeze(-1).squeeze(-1) --> remove last two dimensions.
+
+The most compute-heavy parts are convolution and the pooling (though pooling is a reduction). GELU is element-wise.
+
+Perhaps the biggest gain would come from fusing the GELU and the pooling. Because then, instead of having to store the intermediate tensor after GELU, you can compute the activation and the pooling in a single pass, thus saving memory and avoiding an extra kernel launch.
+
+Let me think of how to implement that.
+
+The fused kernel would take as input the convolution output (already computed), and perform GELU followed by global average pooling.
+
+The input to the kernel is a tensor of shape (N, C, H, W). The output is (N, C).
+
+The computation for each element (n, c, h, w):
+
+gelu_val = gelu( input[n,c,h,w] )
+
+sum over all h and w for each (n,c) --> sum += gelu_val
+
+then, output[n,c] = sum / (H*W)
+
+But how to parallelize this efficiently?
+
+Approach:
+
+Each threadblock can be assigned to a particular (n, c) channel. Each thread in the block processes a spatial element (h, w). Since H and W are 256, that's 256x256=65536 elements per channel. That's too much for a single block (since threads per block is usually up to 1024). So need to partition the work.
+
+Alternatively, for each output channel (per n,c), the sum over h,w is a reduction. To do this efficiently, each thread can compute a partial sum over a subset of the spatial elements and then combine the partial sums.
+
+The steps in the kernel:
+
+1. For each output channel (n,c):
+
+   a. Initialize sum to zero.
+
+   b. Each thread processes a chunk of the spatial elements, computes GELU and adds to the sum.
+
+   c. After all threads in the block process their chunks, perform a block reduction to get the total sum.
+
+   d. Divide by (H*W) and write to output[n,c].
+
+But this would require handling all (n,c) pairs.
+
+To structure this:
+
+- The grid can be dimensioned as (N, C), so each block handles one (n,c) pair.
+
+- Each block has, say, 256 threads. The spatial dimensions are 256x256 = 65536 elements.
+
+   Each thread in the block processes 65536 / 256 = 256 elements (since 256 threads per block).
+
+Wait, 256 threads can each handle 256 elements, totaling 256 * 256 = 65536.
+
+But each thread would need to loop over 256 elements? Not sure.
+
+Alternatively, each thread in the block processes a single element. Since 256 threads can't cover all 65536 elements, this is not feasible. So need a different approach.
+
+Alternative approach:
+
+Use a 2D grid where each block is responsible for a (n,c) pair. Each block has a 2D thread arrangement, say 16x16 threads, and they process tiles of the spatial dimensions.
+
+Alternatively, maybe it's better to process all channels in parallel for a single batch. But batch size is 128, which is also a challenge.
+
+Alternatively, use a tiled approach. Let's think:
+
+The kernel could be structured as follows:
+
+Each thread block handles a portion of the spatial grid for a given channel.
+
+Wait, perhaps the problem is too large for a single kernel, but maybe manageable with shared memory and tiling.
+
+Alternatively, let's think of the following:
+
+The input tensor has shape (128, 64, 256, 256). The output is (128, 64).
+
+The GELU+pooling kernel needs to compute for each of the 128 batches and 64 channels, the sum over all spatial elements of GELU(input[n,c,h,w]) divided by (256*256).
+
+To parallelize this, we can launch a kernel where each thread handles a unique (n,c) pair. The total number of threads needed would be 128 * 64 = 8192 threads. Since each thread can process the entire spatial grid for their (n,c), but that requires each thread to loop over 256x256 elements, which is 65536 iterations per thread. That could be slow because of the high number of iterations per thread.
+
+Alternatively, use a grid of (128, 64) blocks, each block processing a single (n,c). Each block's threads can process chunks of the spatial elements.
+
+For example, each block has 256 threads. Each thread processes 65536 / 256 = 256 elements. But each thread would have to loop over 256 elements, which might be manageable. Here's how:
+
+Within the block for (n,c):
+
+Initialize a shared memory array for partial sums.
+
+Each thread is assigned a spatial index from 0 to 65535 (since 256x256=65536). The thread's index can be mapped to h and w via h = idx / 256, w = idx % 256.
+
+Then, compute the value at (n,c,h,w):
+
+value = input[n][c][h][w]
+
+gelu_val = gelu(value)
+
+Add this to the partial sum.
+
+Wait, but each thread would need to compute their own gelu_val and accumulate it into a shared memory or something.
+
+Wait, perhaps each thread processes 256 elements (since there are 256 threads in a block), so each thread handles 256 elements. Let's see:
+
+Total elements per (n,c): 256 * 256 = 65536.
+
+Number of threads: 256.
+
+Each thread processes 256 elements: 65536 / 256 = 256 per thread.
+
+So for each thread in the block:
+
+for (int i = 0; i < 256; i++) {
+
+   int global_idx = threadIdx.x * 256 + i;
+
+   int h = global_idx / 256;
+
+   int w = global_idx % 256;
+
+   float val = input[n][c][h][w];
+
+   float gelu_val = ...;
+
+   sum += gelu_val;
+
+}
+
+Then, after all threads have done their loops, perform a block-wide reduction to get the total sum for (n,c). Then divide by 65536 and write to output[n][c].
+
+This could work. The number of iterations per thread is 256, which might be acceptable, but the latency could be high. Alternatively, using more threads per block (like 512 or 1024) could reduce the per-thread work.
+
+Alternatively, use a 1D grid where each block handles a (n,c) pair, and use a large number of threads per block. Let me think in code:
+
+The CUDA kernel signature might look like this:
+
+__global__ void fused_gelu_avgpool(
+    const float* input, float* output,
+    int batch_size, int channels, int height, int width) {
+
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+
+    if (n >= batch_size || c >= channels) return;
+
+    const int spatial_size = height * width;
+    const int input_offset = (n * channels + c) * spatial_size;
+
+    float sum = 0.0f;
+
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        int h = idx / width;
+        int w = idx % width;
+        float val = input[input_offset + idx];
+        // Compute GELU here
+        float gelu_val = val * 0.5f * (1.0f + erf(val / sqrt(2.0f)));
+        sum += gelu_val;
+    }
+
+    // Block reduction to sum all the partial sums
+    __shared__ float shared_sum[256]; // Assuming block size <= 256?
+    int tid = threadIdx.x;
+    shared_sum[tid] = sum;
+    __syncthreads();
+
+    // Perform reduction here
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float avg = shared_sum[0] / (height * width);
+        output[n * channels + c] = avg;
+    }
+}
+
+Wait, but in this case, the grid is (batch_size, channels), so the block dimensions would be (blockDim.x, 1). The block size can be, say, 256.
+
+The blockDim.x must be chosen such that blockDim.x divides spatial_size (256*256=65536). For example, using 256 threads, each thread handles 65536 / 256 = 256 elements. The loop over idx would iterate 256 times (since idx starts at threadIdx.x and increments by blockDim.x).
+
+Wait, in the loop:
+
+for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+
+Each thread processes elements spaced by blockDim.x. So with blockDim.x=256, each thread processes 65536 / 256 = 256 elements. Each thread does 256 iterations. That's 256 * 256 = 65536 total elements.
+
+This approach is feasible, but the block reduction step must be handled properly. The shared memory array size needs to be at least blockDim.x. So if we have 256 threads, shared_sum needs to be of size 256. The reduction loop would then work.
+
+However, the problem is that the grid dimensions can't exceed CUDA limits. For example, the maximum grid dimensions depend on the device, but typically the maximum grid size is 65535 in each dimension. Since the batch size is 128 and channels 64, the grid is 128 x 64, which is well within the limits.
+
+Now, considering the GELU computation:
+
+The GELU function can be approximated or computed exactly. The standard formula is:
+
+gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+
+However, erf is a special function which may be slow on GPU. Alternatively, we can use an approximation. PyTorch uses an approximation for GELU by default (the 'approximate' mode). But the user's code uses F.gelu, which by default uses the exact formula. However, for speed, maybe using the approximation is better.
+
+Alternatively, implement the approximation:
+
+gelu_approx = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+
+This is faster to compute. Since the user's code uses F.gelu without specifying the approximate, but for the sake of speed, using the approximation would be better in the kernel.
+
+So in the kernel, we can compute the approximate version.
+
+Alternatively, use the exact formula but rely on the GPU's math functions. The erf function is available in CUDA's math library (erf is part of the device functions). Let's see:
+
+CUDA's math functions include erf(), which is available in device code. So the exact GELU can be computed as:
+
+float gelu_val = x * 0.5f * (1.0f + __erff(x / sqrt(2.0f)));
+
+Wait, but __erff is the CUDA function for erf of a float. However, sqrt(2.0f) is a constant.
+
+So the code would be:
+
+float scaled_x = x / (float)M_SQRT1_2; // since sqrt(2) is M_SQRT2, so 1/sqrt(2) is M_SQRT1_2.
+
+float gelu_val = x * 0.5f * (1.0f + __erff(scaled_x));
+
+Alternatively, precompute the constant 1/sqrt(2) as a constant.
+
+This would be the exact computation, but erf is a transcendental function and might be slow. The approximation might be faster.
+
+Assuming we go with the exact version, but in the kernel.
+
+Now, for the fused kernel, we need to:
+
+- Have the input tensor from the convolution, which is done via PyTorch's Conv2d (since we don't want to replace that yet unless we can fuse more steps).
+
+So the steps in the new model would be:
+
+1. Use PyTorch's Conv2d for the convolution.
+
+2. Apply the fused GELU and Global Average Pooling via the custom kernel.
+
+This reduces the number of operators from three (conv, gelu, pool) to two (conv, fused_gelu_pool). The squeeze is handled by the kernel's output shape.
+
+Alternatively, perhaps the convolution can also be fused with the fused gelu/pool. But that might be too complex.
+
+So first, let's proceed with fusing GELU and pooling.
+
+Now, writing the kernel.
+
+First, we need to define the CUDA code for this fused kernel.
+
+Next, we need to handle the input and output tensors.
+
+The input to the kernel is the output of the convolution, which is a 4D tensor (N, C, H, W).
+
+The output is a 2D tensor (N, C).
+
+Now, let's code the kernel.
+
+First, the CUDA kernel code:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float gelu_exact(float x) {
+    const float inv_sqrt2 = 0.70710678118654752440f; // 1/sqrt(2)
+    float scaled_x = x * inv_sqrt2;
+    float erf_val = __erff(scaled_x);
+    return x * 0.5f * (1.0f + erf_val);
+}
+
+__global__ void fused_gelu_avgpool(
+    const float* input, float* output,
+    int batch_size, int channels, int height, int width) {
+    // Each block handles one (n, c) pair
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+
+    if (n >= batch_size || c >= channels) {
+        return;
+    }
+
+    const int spatial_size = height * width;
+    const int input_offset = (n * channels + c) * spatial_size;
+
+    float sum = 0.0f;
+
+    // Each thread processes a chunk of the spatial elements
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        int h = idx / width;
+        int w = idx % width;
+        float val = input[input_offset + idx];
+        float gelu_val = gelu_exact(val);
+        sum += gelu_val;
+    }
+
+    // Block reduction to compute the total sum
+    __shared__ float shared_sum[256]; // Assuming max block size of 256
+    int tid = threadIdx.x;
+    shared_sum[tid] = sum;
+    __syncthreads();
+
+    // Reduction steps
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float avg = shared_sum[0] / (height * width);
+        output[n * channels + c] = avg;
+    }
+}
+
+// Wrapper function
+torch::Tensor fused_gelu_avgpool_cuda(torch::Tensor input) {
+    const auto batch_size = input.size(0);
+    const auto channels = input.size(1);
+    const auto height = input.size(2);
+    const auto width = input.size(3);
+
+    auto output = torch::empty({batch_size, channels}, input.options());
+
+    const int threads_per_block = 256;
+    const dim3 blocks(batch_size, channels);
+    const dim3 threads(threads_per_block);
+
+    fused_gelu_avgpool<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size, channels, height, width);
+
+    return output;
+}
+
+Then, we need to compile this kernel using torch.utils.cpp_extension.load_inline.
+
+Now, in the ModelNew class:
+
+The forward function would first perform the convolution with PyTorch's Conv2d, then apply the fused kernel.
+
+Wait, but the convolution is part of the original Model's parameters (self.conv). So in ModelNew, we need to keep the convolution layer, and then use the custom kernel for GELU and pooling.
+
+Thus, the code for ModelNew would be:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.fused_gelu_pool = fused_gelu_avgpool  # The loaded CUDA function
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.fused_gelu_pool(x)
+        return x
+
+Wait, but the fused kernel is called via the loaded module. Let's see how the loading works.
+
+The code would look like this:
+
+First, define the CUDA source:
+
+fused_gelu_pool_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float gelu_exact(float x) {
+    const float inv_sqrt2 = 0.70710678118654752440f; // 1/sqrt(2)
+    float scaled_x = x * inv_sqrt2;
+    float erf_val = __erff(scaled_x);
+    return x * 0.5f * (1.0f + erf_val);
+}
+
+__global__ void fused_gelu_avgpool(
+    const float* input, float* output,
+    int batch_size, int channels, int height, int width) {
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+
+    if (n >= batch_size || c >= channels) return;
+
+    const int spatial_size = height * width;
+    const int input_offset = (n * channels + c) * spatial_size;
+
+    float sum = 0.0f;
+
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        int h = idx / width;
+        int w = idx % width;
+        float val = input[input_offset + idx];
+        float gelu_val = gelu_exact(val);
+        sum += gelu_val;
+    }
+
+    __shared__ float shared_sum[256];
+    int tid = threadIdx.x;
+    shared_sum[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float avg = shared_sum[0] / (height * width);
+        output[n * channels + c] = avg;
+    }
+}
+
+torch::Tensor fused_gelu_avgpool_cuda(torch::Tensor input) {
+    const auto batch_size = input.size(0);
+    const auto channels = input.size(1);
+    const auto height = input.size(2);
+    const auto width = input.size(3);
+
+    auto output = torch::empty({batch_size, channels}, input.options());
+
+    const int threads_per_block = 256;
+    const dim3 blocks(batch_size, channels);
+    const dim3 threads(threads_per_block);
+
+    fused_gelu_avgpool<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size, channels, height, width);
+
+    return output;
+}
+"""
+
+Then, the CPP sources:
+
+fused_gelu_pool_cpp = (
+    "torch::Tensor fused_gelu_avgpool_cuda(torch::Tensor input);"
+)
+
+Then, load the kernel:
+
+fused_gelu_pool = load_inline(
+    name="fused_gelu_pool",
+    cpp_sources=fused_gelu_pool_cpp,
+    cuda_sources=fused_gelu_pool_source,
+    functions=["fused_gelu_avgpool_cuda"],
+    verbose=True,
+)
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.fused_gelu_pool = fused_gelu_pool
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.fused_gelu_pool.fused_gelu_avgpool_cuda(x)
+        return x
+
+This should work, but need to ensure that the kernel is correctly launched and that the parameters are passed correctly.
+
+Potential issues:
+
+- The block dimensions: The kernel uses a grid of (batch_size, channels). For batch_size=128 and channels=64, the grid is 128x64. CUDA allows grids up to 65535 in each dimension, so that's okay.
+
+- The thread block size is 256. The maximum block size allowed is 1024, so 256 is acceptable.
+
+- The shared memory array size is 256, which should be okay as long as the block size doesn't exceed 256. Since we set threads_per_block=256, that's okay.
+
+- The input and output tensors must be contiguous and on the same device (GPU). Since the input comes from a PyTorch convolution, which is on the GPU, and the kernel is launched on the GPU, this should be fine.
+
+Another consideration: The GELU computation is using the exact formula with erf, which might be slow. If we switch to the approximation, it could be faster. Let's see:
+
+The approximate GELU can be implemented as:
+
+__device__ __forceinline__ float gelu_approx(float x) {
+    return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (x + 0.044715f * x * x * x)));
+}
+
+Which avoids the erf function and uses tanh, which is faster. Let's substitute that.
+
+Modify the kernel to use the approximate version:
+
+Replace the gelu_exact function with:
+
+__device__ __forceinline__ float gelu_approx(float x) {
+    const float sqrt_2_over_pi = sqrt(2.0f / M_PI);
+    const float coeff = 0.044715f;
+    float inner = x + coeff * x * x * x;
+    float tanh_val = tanhf(sqrt_2_over_pi * inner);
+    return 0.5f * x * (1.0f + tanh_val);
+}
+
+Then, in the kernel:
+
+float gelu_val = gelu_approx(val);
+
+This should be faster. Let me adjust the code accordingly.
+
+Also, M_PI is a constant from math.h, so sqrt(2.0f / M_PI) can be precomputed as a constant.
+
+Thus, the kernel would be better with the approximation.
+
+Now, the final code.
+
+Another thing to note: The fused kernel's output is already of shape (N, C), so the squeeze operations in the original code are no longer needed. Hence, the forward function is correct.
+
+Now, for the convolution, we are keeping it as PyTorch's implementation, which is optimized, so that's fine.
+
+Is there any other optimization possible? Perhaps fusing the convolution with the fused GELU and pooling, but that would require a more complex kernel.
+
+However, writing a convolution kernel that also computes GELU and the pooling is non-trivial. The convolution itself involves sliding windows and applying filters, which is more complex than element-wise operations. It might not be worth the effort unless significant speedup is expected.
+
+Alternatively, perhaps fusing convolution and GELU, then doing the pooling separately. But the pooling is already fused with GELU.
+
+Alternatively, let's consider the convolution's output storage. The output of the convolution is (N, C, H, W). Storing this tensor requires N*C*H*W elements. If we can process the convolution and GELU in a single kernel, then immediately compute the pooling, we could avoid storing the intermediate tensor. That would save memory and bandwidth.
+
+However, implementing a fused convolution + GELU + pooling kernel is challenging.
+
+The convolution requires applying filters over the input, which involves many multiply-accumulate operations. The GELU is element-wise, and pooling is a reduction.
+
+The challenge is to compute the convolution's output on the fly and apply GELU while accumulating the sum for pooling, all in one kernel.
+
+This would require a kernel that for each output element of the convolution applies the filter, computes the activation, and accumulates into the sum.
+
+But this requires access to the input's spatial neighbors for the convolution, so it's a more complex memory access pattern.
+
+Given time constraints, perhaps it's better to proceed with the fused GELU and pooling kernel as initially planned, since that's manageable and provides a reduction in memory usage and kernel launches.
+
+Therefore, the final code would be as above.
+
+Another note: The fused kernel must be compatible with the input tensor's strides. Since the input comes from a convolution, it's likely contiguous. To ensure the input is contiguous, in the forward function, we can add a .contiguous() after the convolution, but PyTorch's Conv2d should output a contiguous tensor.
+
+Testing the kernel:
+
+The fused kernel takes a 4D tensor and returns 2D. The dimensions must match.
+
+Now, compiling the kernel:
+
+The code should be written in Python with the inline CUDA code.
+
+Putting it all together.
+
+Also, note that in the __global__ function, the input_offset is calculated as (n * channels + c) * spatial_size. Since input is (N, C, H, W), the offset for n,c is n * C * H * W + c * H * W. Which is the same as (n * channels + c) * spatial_size, since spatial_size is H*W. So the calculation is correct.
+
+Potential error points:
+
+- The output tensor is initialized with the correct options (same device, dtype as input).
+
+- The kernel launch parameters are correctly set.
+
+Now, let's write the complete code for ModelNew.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused GELU and Global Average Pooling CUDA kernel
+fused_gelu_pool_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float gelu_approx(float x) {
+    const float sqrt_2_over_pi = sqrt(2.0f / M_PI);
+    const float coeff = 0.044715f;
+    float inner = x + coeff * x * x * x;
+    float tanh_val = tanhf(sqrt_2_over_pi * inner);
+    return 0.5f * x * (1.0f + tanh_val);
+}
+
+__global__ void fused_gelu_avgpool(
+    const float* input, float* output,
+    int batch_size, int channels, int height, int width) {
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+
+    if (n >= batch_size || c >= channels) return;
+
+    const int spatial_size = height * width;
+    const int input_offset = (n * channels + c) * spatial_size;
+
+    float sum = 0.0f;
+
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        int h = idx / width;
+        int w = idx % width;
+        float val = input[input_offset + idx];
+        float gelu_val = gelu_approx(val);
+        sum += gelu_val;
+    }
+
+    __shared__ float shared_sum[256];
+    int tid = threadIdx.x;
+    shared_sum[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float avg = shared_sum[0] / (height * width);
+        output[n * channels + c] = avg;
+    }
+}
+
+torch::Tensor fused_gelu_avgpool_cuda(torch::Tensor input) {
+    const auto batch_size = input.size(0);
+    const auto channels = input.size(1);
+    const auto height = input.size(2);
+    const auto width = input.size(3);
+
+    auto output = torch::empty({batch_size, channels}, input.options());
+
+    const int threads_per_block = 256;
+    const dim3 blocks(batch_size, channels);
+    const dim3 threads(threads_per_block);
+
+    fused_gelu_avgpool<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size, channels, height, width);
+
+    return output;
+}
+"""
+
+fused_gelu_pool_cpp = (
+    "torch::Tensor fused_gelu_avgpool_cuda(torch::Tensor input);"
+)
+
+# Compile the fused GELU and Pooling kernel
+fused_gelu_pool = load_inline(
+    name="fused_gelu_pool",
+    cpp_sources=fused_gelu_pool_cpp,
+    cuda_sources=fused_gelu_pool_source,
+    functions=["fused_gelu_avgpool_cuda"],
+    verbose=True,
+    extra_cflags=["-DDEBUG"],
+    extra_cuda_cflags=["-lineinfo"],
+    with_cuda=True

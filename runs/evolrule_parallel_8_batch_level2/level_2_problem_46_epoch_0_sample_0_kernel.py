@@ -1,0 +1,131 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract1_value, subtract2_value, kernel_size_pool):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract1_value = subtract1_value
+        self.subtract2_value = subtract2_value
+        self.kernel_size_pool = kernel_size_pool
+
+        # Define custom CUDA kernels
+        # Kernel for fused operations: conv is separate, but subtract, tanh, subtract can be fused
+        fused_operations_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        __global__ void fused_operations_kernel(const float* input, float* output, 
+                                                float sub1, float sub2, int size) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx < size) {
+                float val = input[idx] - sub1;
+                val = tanh(val);
+                val = val - sub2;
+                output[idx] = val;
+            }
+        }
+
+        torch::Tensor fused_operations_cuda(torch::Tensor input, 
+                                           float sub1, float sub2) {
+            auto output = torch::empty_like(input);
+            int size = input.numel();
+            
+            const int block_size = 256;
+            const int num_blocks = (size + block_size - 1) / block_size;
+
+            fused_operations_kernel<<<num_blocks, block_size>>>(
+                input.data_ptr<float>(), output.data_ptr<float>(), 
+                sub1, sub2, size
+            );
+
+            return output;
+        }
+        """
+
+        fused_operations_cpp_source = "torch::Tensor fused_operations_cuda(torch::Tensor input, float sub1, float sub2);"
+
+        # Compile the fused operations kernel
+        self.fused_operations = load_inline(
+            name="fused_operations",
+            cpp_sources=fused_operations_cpp_source,
+            cuda_sources=fused_operations_source,
+            functions=["fused_operations_cuda"],
+            verbose=True
+        )
+
+        # Custom average pooling kernel
+        avg_pool_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        __global__ void avg_pool2d_kernel(const float* input, float* output,
+                                          int batch, int channels, int height, int width,
+                                          int kernel_h, int kernel_w,
+                                          int out_height, int out_width) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= batch * channels * out_height * out_width) return;
+
+            int w = idx % out_width;
+            int h = (idx / out_width) % out_height;
+            int c = (idx / (out_height * out_width)) % channels;
+            int n = idx / (channels * out_height * out_width);
+
+            int h_start = h * kernel_h;
+            int w_start = w * kernel_w;
+            float sum = 0.0;
+            for (int kh = 0; kh < kernel_h; ++kh) {
+                for (int kw = 0; kw < kernel_w; ++kw) {
+                    int h_in = h_start + kh;
+                    int w_in = w_start + kw;
+                    sum += input[(
+                        n * channels + c) * height * width +
+                        h_in * width + w_in];
+                }
+            }
+            output[idx] = sum / (kernel_h * kernel_w);
+        }
+
+        torch::Tensor avg_pool2d_cuda(torch::Tensor input, int kernel_size) {
+            auto [batch, channels, height, width] = input.sizes().vec();
+            int kernel_h = kernel_size;
+            int kernel_w = kernel_size;
+            int out_height = height / kernel_h;
+            int out_width = width / kernel_w;
+
+            auto output = torch::empty({batch, channels, out_height, out_width}, 
+                                      input.options());
+
+            const int block_size = 256;
+            int num_elements = batch * channels * out_height * out_width;
+            int num_blocks = (num_elements + block_size - 1) / block_size;
+
+            avg_pool2d_kernel<<<num_blocks, block_size>>>(
+                input.data_ptr<float>(), output.data_ptr<float>(),
+                batch, channels, height, width,
+                kernel_h, kernel_w, out_height, out_width
+            );
+
+            return output;
+        }
+        """
+
+        avg_pool_cpp_source = "torch::Tensor avg_pool2d_cuda(torch::Tensor input, int kernel_size);"
+
+        # Compile average pooling kernel
+        self.avg_pool_cuda = load_inline(
+            name="avg_pool_cuda",
+            cpp_sources=avg_pool_cpp_source,
+            cuda_sources=avg_pool_source,
+            functions=["avg_pool2d_cuda"],
+            verbose=True
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Apply fused operations: subtract1, tanh, subtract2
+        x = self.fused_operations.fused_operations_cuda(x, self.subtract1_value, self.subtract2_value)
+        # Apply custom average pooling
+        x = self.avg_pool_cuda.avg_pool2d_cuda(x, self.kernel_size_pool)
+        return x

@@ -1,0 +1,60 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA source code for 3D convolution
+conv3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Function to perform 3D convolution
+__global__ void conv3d_forward_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int depth, int height, int width, int kernel_depth, int kernel_height, int kernel_width, int stride_d, int stride_h, int stride_w, int padding_d, int padding_h, int padding_w, int dilation_d, int dilation_h, int dilation_w) {
+    // Implementation goes here...
+}
+
+torch::Tensor conv3d_forward_cuda(torch::Tensor input, torch::Tensor weight, int stride_d, int stride_h, int stride_w, int padding_d, int padding_h, int padding_w, int dilation_d, int dilation_h, int dilation_w) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto depth = input.size(2);
+    auto height = input.size(3);
+    auto width = input.size(4);
+    auto kernel_depth = weight.size(2);
+    auto kernel_height = weight.size(3);
+    auto kernel_width = weight.size(4);
+
+    auto output = torch::zeros({batch_size, out_channels, (depth + 2 * padding_d - dilation_d * (kernel_depth - 1) - 1) / stride_d + 1, (height + 2 * padding_h - dilation_h * (kernel_height - 1) - 1) / stride_h + 1, (width + 2 * padding_w - dilation_w * (kernel_width - 1) - 1) / stride_w + 1}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (output.numel() + block_size - 1) / block_size;
+
+    conv3d_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, out_channels, depth, height, width, kernel_depth, kernel_height, kernel_width, stride_d, stride_h, stride_w, padding_d, padding_h, padding_w, dilation_d, dilation_h, dilation_w);
+
+    return output;
+}
+"""
+
+conv3d_cpp_source = (
+    "torch::Tensor conv3d_forward_cuda(torch::Tensor input, torch::Tensor weight, int stride_d, int stride_h, int stride_w, int padding_d, int padding_h, int padding_w, int dilation_d, int dilation_h, int dilation_w);"
+)
+
+# Compile the inline CUDA code for 3D convolution
+conv3d = load_inline(
+    name="conv3d",
+    cpp_sources=conv3d_cpp_source,
+    cuda_sources=conv3d_source,
+    functions=["conv3d_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1, 1), padding: tuple = (0, 0, 0), dilation: tuple = (1, 1, 1), groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.conv3d = conv3d
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv3d.conv3d_forward_cuda(x, self.weight, stride[0], stride[1], stride[2], padding[0], padding[1], padding[2], dilation[0], dilation[1], dilation[2])

@@ -1,0 +1,12 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x):
+        # TODO: Implement the forward pass using custom CUDA operators
+        pass

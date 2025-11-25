@@ -1,0 +1,887 @@
+    Now, think step by step. Which operators are in the Model's forward function? Let me list them:
+
+    1. ConvTranspose3d
+    2. torch.logsumexp
+    3. torch.sigmoid (inside the HardSwish computation)
+    4. Subtraction with self.bias
+    5. torch.clamp
+
+    Now, which of these operators can be replaced with custom CUDA kernels for speedup? Let's analyze each operator.
+
+    ConvTranspose3d: This is a large operation and implementing a custom ConvTranspose3d in CUDA would be complex. It's probably better to keep using PyTorch's implementation, unless there's a specific optimization that can be done here. However, since this is a transposed convolution, maybe there are some optimizations that can be made, but for a first pass, perhaps it's better to leave it as is unless we have a good reason.
+
+    torch.logsumexp: This is a combination of log(sum(exp(x))). Implementing this in a custom kernel might be beneficial, especially if we can combine it with subsequent operations. For instance, since the next step is multiplying by sigmoid(x + 3)/6, maybe we can combine some of these operations into a single kernel.
+
+    torch.sigmoid: Part of the HardSwish computation (x * sigmoid(x + 3) / 6). Implementing a fused kernel that combines sigmoid and the multiplication could be beneficial. Additionally, since sigmoid is an element-wise operation, combining it with other element-wise operations might be efficient.
+
+    Subtraction with self.bias: This is a simple element-wise operation. However, if we can fuse it with previous or subsequent operations, it might be better to do so. Otherwise, implementing a custom kernel for subtraction might not provide a significant speedup compared to PyTorch's optimized implementation.
+
+    torch.clamp: Another element-wise operation. Similar to subtraction, but again, fusing with other operations might be better.
+
+    Considering that the operations after the ConvTranspose3d are all element-wise or can be expressed in terms of element-wise operations, it might be beneficial to combine them into a single kernel to reduce kernel launch overhead and memory accesses. Let's look at the sequence:
+
+    After ConvTranspose3d, the steps are:
+
+    1. LogSumExp: This reduces the tensor along a dimension. The result is a tensor with the specified dimension reduced to 1 (since keepdim=True). For example, if the input is (batch, channels, depth, height, width), after logsumexp over dim=1, it becomes (batch, 1, depth, height, width).
+
+    2. Multiply by sigmoid(x + 3)/6, where x is the result of the logsumexp.
+
+    3. Subtract self.bias (which is a scalar broadcasted across the tensor dimensions except the first two, since it's shape (1,1,1,1)).
+
+    4. Clamp between -1 and 1.
+
+    Wait a second, looking at the forward function again:
+
+    x = torch.logsumexp(x, dim=1, keepdim=True)
+    x = x * torch.sigmoid(x + 3) / 6
+    x = x - self.bias
+    x = torch.clamp(x, min=-1, max=1)
+
+    Wait, the second line: the x inside the sigmoid is the same as the x after logsumexp? Because the previous line is x = logsumexp(x, dim=1, keepdim=True). So the next line uses the same x (the logsumexp result) in both the left-hand side and inside the sigmoid. So that would be:
+
+    x = logsumexp(x, dim=1, keepdim=True)
+
+    Then, compute sigmoid(x + 3) (where x is now the logsumexp result), multiply x by that, then divide by 6. So the second line is:
+
+    x = x * (torch.sigmoid(x + 3)) / 6
+
+    Then subtract the bias, then clamp.
+
+    So the entire computation after the ConvTranspose3d can be considered as a sequence of operations that can be fused into a single kernel.
+
+    Let's see:
+
+    Let me break down the steps:
+
+    Let me denote:
+
+    After conv_transpose, the input is of shape (batch, out_channels, depth', height', width'), where the dimensions after convolution are computed via the transposed convolution parameters.
+
+    Then:
+
+    Step 1: logsumexp over dim=1 (the channels dimension). This reduces the channels dimension to 1. So the result is (batch, 1, depth', height', width').
+
+    Step 2: Multiply by sigmoid(x + 3) /6. Here, x is the logsumexp result. So:
+
+    Let me denote the logsumexp result as y = logsumexp(x, dim=1, keepdim=True).
+
+    Then, compute y * sigmoid(y + 3) / 6. Wait, no, actually, the code is:
+
+    x = torch.logsumexp(x, dim=1, keepdim=True) → x is now the logsumexp result (y).
+
+    Then, x = x * torch.sigmoid(x + 3) /6 → So yes, the x inside the sigmoid is the same as the current x (y).
+
+    So the second step is: y * sigmoid(y + 3) /6.
+
+    Then subtract self.bias, then clamp.
+
+    So after logsumexp, all operations are element-wise on the resulting tensor (since the logsumexp reduces the channels to 1, making all subsequent operations element-wise across the remaining dimensions).
+
+    Therefore, the sequence after the conv_transpose is:
+
+    1. LogSumExp over dimension 1 (element-wise along the channels, then reduction).
+
+    2. Element-wise computation: multiply by sigmoid(x + 3)/6.
+
+    3. Subtract a bias (element-wise).
+
+    4. Clamp (element-wise).
+
+    So the key operations after conv_transpose can be fused into a single kernel, which would be more efficient than multiple separate operations.
+
+    The logsumexp is the only non-element-wise operation (due to the reduction), but since it is followed by element-wise operations, perhaps we can compute logsumexp in a way that is part of a fused kernel.
+
+    Alternatively, we can first compute the logsumexp, then fuse the subsequent steps.
+
+    However, the logsumexp itself is a reduction and may be challenging to fuse with subsequent element-wise operations unless we can compute the logsumexp as part of the same kernel.
+
+    Wait, let's think:
+
+    The logsumexp operation is computed over dimension 1 (the channels dimension). Let's say the input to logsumexp has shape (batch_size, C, D, H, W). The output is (batch_size, 1, D, H, W). So the logsumexp is performed along the channels, reducing it to 1.
+
+    The subsequent steps are element-wise on the result of logsumexp.
+
+    So, perhaps the logsumexp can be computed first, then the subsequent steps are all element-wise and can be fused into a single kernel. However, the logsumexp itself is a reduction, so it can't be part of the same kernel as the element-wise steps unless we can compute it in a way that doesn't require a reduction step first.
+
+    Alternatively, maybe we can combine the logsumexp with the subsequent element-wise operations in a single kernel. However, since logsumexp requires a reduction, it's more complex.
+
+    Let me consider the steps again:
+
+    The logsumexp is computed over dim=1. Let's denote the input as X (shape (B, C, D, H, W)). The output Y is (B, 1, D, H, W).
+
+    The subsequent steps are:
+
+    Y = Y * sigmoid(Y + 3) /6 → element-wise.
+
+    Y = Y - bias → element-wise (the bias is shape (1,1,1,1)).
+
+    Y = clamp(Y, -1, 1) → element-wise.
+
+    So all steps after logsumexp can be combined into a single kernel.
+
+    The logsumexp is the only non-element-wise step. So perhaps we can compute logsumexp in a separate kernel (but optimized), and then the rest in a fused kernel.
+
+    Alternatively, perhaps we can find a way to compute the logsumexp efficiently in a custom kernel, which may be faster than the PyTorch implementation.
+
+    Let me think about each operator's potential for optimization:
+
+    1. LogSumExp (over dim=1):
+
+    The standard approach to compute logsumexp is:
+
+    max_val = max along dim, then exp(x - max_val), sum those, take log, add max_val.
+
+    This is to prevent underflow/overflow.
+
+    Implementing this in a custom kernel for a 3D tensor (but along the channel dimension) could be done with a reduction kernel. However, PyTorch's implementation might already be optimized. Maybe for large tensors, a custom kernel can be faster, especially if the dimension over which we reduce is small (the channel dimension might be manageable).
+
+    Alternatively, for the given parameters in the problem, let's see:
+
+    The input to logsumexp after conv_transpose is a tensor of shape (batch_size, out_channels, depth', height', width').
+
+    The parameters given are:
+
+    in_channels = 3
+
+    out_channels = 16
+
+    kernel_size = 3, stride=2, padding=1.
+
+    The input depth, height, width are 16, 32, 32.
+
+    After ConvTranspose3d with stride=2, the output dimensions can be calculated as follows:
+
+    For each spatial dimension, output_dim = (input_dim - 1)*stride - 2*padding + kernel_size.
+
+    Since padding is 1, stride 2, kernel size 3:
+
+    For example, for depth: (16 -1)*2 -2*1 +3 = 15*2 -2 +3 = 30 -2 +3=31.
+
+    Similarly for height and width: (32-1)*2 -2*1 +3 = 62 -2 +3 =63.
+
+    So the output shape after ConvTranspose3d would be (128, 16, 31, 63, 63).
+
+    Then, logsumexp over dim=1 (channels, which has size 16). So for each spatial position, we're taking the logsumexp over the 16 channels.
+
+    So the reduction dimension has size 16, which is manageable.
+
+    So the logsumexp reduction is over dimension of size 16. Implementing this with a custom kernel could be efficient, but perhaps PyTorch's implementation is already optimized. However, the subsequent steps can be fused with logsumexp.
+
+    Alternatively, the logsumexp is followed by element-wise operations. If we can compute the logsumexp and then perform the element-wise operations in a single kernel, that would save memory transfers and reduce kernel launch overhead.
+
+    However, the logsumexp requires a reduction step which is not element-wise, so the computation can't be done in a straightforward element-wise kernel. Therefore, it might be better to first compute logsumexp with a custom kernel and then fuse the subsequent steps into another kernel.
+
+    Let me outline possible approaches:
+
+    Option 1: Keep ConvTranspose3d as is (since it's a complex op), replace logsumexp with custom kernel, then fuse the remaining element-wise steps into a single custom kernel.
+
+    Option 2: Try to fuse logsumexp and the subsequent element-wise steps into a single kernel, which would require handling the reduction in the same kernel as the element-wise operations. However, this complicates the kernel design.
+
+    Let me think about the element-wise steps after logsumexp:
+
+    The steps after logsumexp are:
+
+    y = logsumexp_result
+
+    y = y * sigmoid(y + 3) /6
+
+    y = y - bias
+
+    y = clamp(y, -1, 1)
+
+    The sigmoid is an element-wise function, so combining these into a single kernel is straightforward.
+
+    So the fused kernel after logsumexp would take the logsumexp result (already reduced over channels) and apply the rest.
+
+    So the main candidates for optimization are:
+
+    1. LogSumExp: Possibly replace with a custom kernel for better performance.
+
+    2. The combination of the subsequent element-wise operations (sigmoid multiplication, subtraction, clamp) into a single fused kernel.
+
+    Let's first consider the logsumexp.
+
+    Implementing logsumexp in CUDA:
+
+    The steps for logsumexp along dim=1:
+
+    For each spatial position (D, H, W), and batch element:
+
+    Compute over the channels (dim=1) of size 16:
+
+    max_val = max(x[:, c, d, h, w] for c in 0..15)
+
+    sum_exp = sum(exp(x[:, c, d, h, w] - max_val))
+
+    logsumexp = max_val + log(sum_exp)
+
+    This needs to be computed for each (batch, d, h, w).
+
+    To implement this in CUDA, we can use a kernel that, for each spatial position, computes the max and sum.
+
+    Since the channel dimension is 16, which is small, we can process each spatial position in a thread block, and handle the 16 elements in shared memory.
+
+    For example:
+
+    Each thread in a block can handle a spatial position (d, h, w), and the block processes a batch element.
+
+    Alternatively, the kernel can be structured as follows:
+
+    The grid is divided over the batch elements and spatial dimensions, with each block handling a small set of channels.
+
+    However, given the small channel size (16), perhaps a more straightforward approach is to have each thread handle a single spatial position, and compute the max and sum across the channels.
+
+    Let me think of the dimensions:
+
+    The input tensor after ConvTranspose3d is (B=128, C=16, D=31, H=63, W=63).
+
+    The output tensor after logsumexp is (B, 1, D, H, W).
+
+    For a single spatial position (d, h, w), and batch element b, we have 16 elements (along the C dimension). We need to compute the logsumexp over these 16 elements.
+
+    So for each output element (b, 1, d, h, w), we need to process the 16 elements in (b, c, d, h, w).
+
+    The approach for the logsumexp kernel:
+
+    Launch a kernel where each thread handles one output element (b, d, h, w). Since the batch size is 128, and the spatial dimensions are 31x63x63, the total number of output elements is 128 * 31 * 63 * 63. This is a very large number (128*31≈3968; 63x63≈3969 → total ≈ 3968 * 3969 ≈ ~15,850,000 elements). So each thread would need to process one element, which may require a lot of threads, but manageable on a GPU.
+
+    The kernel would process each (b, d, h, w), loop over the C dimension (16 elements), compute max and sum_exp.
+
+    However, with 16 elements, a loop over 16 is acceptable.
+
+    Alternatively, unroll the loop for better performance.
+
+    The steps for each thread:
+
+    1. For a given (b, d, h, w):
+
+        a. Initialize max_val to -infinity.
+
+        b. Initialize sum_exp to 0.
+
+        c. For c from 0 to 15:
+
+            i. val = x[b][c][d][h][w]
+
+            ii. if val > max_val, update max_val.
+
+            iii. sum_exp += exp(val - max_val)
+
+        d. Compute log(sum_exp) + max_val.
+
+    This would be done in a CUDA kernel.
+
+    The problem is that the input tensor is 5-dimensional (batch, channels, depth, height, width). Accessing the elements in a way that coalesces memory accesses is important for performance.
+
+    The order of the dimensions in memory (row-major) is batch, channels, depth, height, width. So for a given batch element, the channels are contiguous in memory, followed by depth, then height, then width.
+
+    However, when looping over the C dimension, the elements are contiguous, so for each (b, d, h, w), the C dimension can be accessed sequentially.
+
+    The kernel could be structured as follows:
+
+    Each thread is responsible for one (b, d, h, w) position. The kernel is launched with a grid of blocks covering all these positions.
+
+    The thread index can be calculated to cover all four dimensions (batch, depth, height, width).
+
+    To handle the large spatial dimensions, we can use a 3D grid or map the indices appropriately.
+
+    Once the logsumexp kernel is written, we can then proceed to the next steps.
+
+    Then, the next steps are the element-wise operations, which can be fused into a single kernel.
+
+    Let's consider the fused kernel for the element-wise steps:
+
+    The steps after logsumexp are:
+
+    y = y * (sigmoid(y + 3) /6)
+
+    y = y - bias
+
+    y = clamp(y, min=-1, max=1)
+
+    Let's write this as:
+
+    y = y * (sigmoid(y + 3) /6) - bias
+
+    y = clamp(y, -1, 1)
+
+    The fused kernel can take the logsumexp result (shape B,1,D,H,W), subtract the bias (which is a scalar), and apply the other operations.
+
+    Since the bias is a scalar (shape (1,1,1,1)), it's broadcasted to the same shape as y.
+
+    So the kernel can process each element of y as follows:
+
+    for each element in y:
+
+        temp = y_val
+
+        temp += 3
+
+        temp = 1.0 / (1.0 + exp(-temp))   // sigmoid(temp)
+
+        temp = y_val * temp /6
+
+        temp -= bias_val
+
+        if temp < -1: temp = -1
+
+        elif temp >1: temp =1
+
+        return temp
+
+    This is straightforward to implement in a CUDA kernel.
+
+    So the plan is:
+
+    1. Keep ConvTranspose3d as is (since it's a complex op, and PyTorch's implementation is likely optimized).
+
+    2. Implement a custom logsumexp kernel over dim=1 (channels) to replace PyTorch's torch.logsumexp.
+
+    3. Implement a custom kernel that fuses the remaining element-wise operations (sigmoid, multiply, divide, subtract bias, clamp).
+
+    Now, let's proceed to code.
+
+    First, the logsumexp custom kernel.
+
+    The logsumexp kernel:
+
+    We need to compute for each (b, d, h, w) the logsumexp over the channels.
+
+    The input is a tensor of shape (B, C, D, H, W), output is (B,1,D,H,W).
+
+    The CUDA kernel code:
+
+    Let's think about the dimensions and indexing.
+
+    The input tensor is stored in row-major order, so the stride for batch is C*D*H*W, etc.
+
+    However, to compute for each (b, d, h, w), we can loop over the channels.
+
+    The kernel code could be structured as follows:
+
+    __global__ void logsumexp_kernel(float* input, float* output, int B, int C, int D, int H, int W) {
+
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if (idx >= B * D * H * W) return;
+
+        // Compute indices for batch, d, h, w
+
+        int w = idx % W;
+
+        int h = (idx / W) % H;
+
+        int d = (idx / (W * H)) % D;
+
+        int b = idx / (W * H * D);
+
+        float max_val = -INFINITY;
+
+        float sum_exp = 0;
+
+        for (int c = 0; c < C; c++) {
+
+            float val = input[b * C * D * H * W + c * D * H * W + d * H * W + h * W + w];
+
+            if (val > max_val) max_val = val;
+
+        }
+
+        // compute sum of exp(val - max_val)
+
+        for (int c = 0; c < C; c++) {
+
+            float val = input[b * C * D * H * W + c * D * H * W + d * H * W + h * W + w];
+
+            sum_exp += expf(val - max_val);
+
+        }
+
+        float res = max_val + logf(sum_exp);
+
+        // write to output
+
+        output[b * D * H * W + d * H * W + h * W + w] = res;
+
+    }
+
+    Wait, the output has shape (B, 1, D, H, W), so the output is stored as B * 1 * D * H * W. The output's stride would be similar to the input, but with the C dimension collapsed.
+
+    The indexing for the output is straightforward since the second dimension is 1. So the output is stored as:
+
+    output[b * D * H * W + d * H * W + h * W + w] 
+
+    However, the above kernel's first loop over C to find the max_val could be optimized by using shared memory to reduce the number of global memory accesses, especially for larger C. But since C is 16, it's manageable with registers.
+
+    Alternatively, unroll the loops for C=16.
+
+    However, for the purposes of code simplicity, a loop is acceptable.
+
+    However, this code has two loops over C (first to find max, second to compute sum_exp). To optimize, we can combine them into a single loop:
+
+    float max_val = -INFINITY;
+
+    float sum_exp = 0;
+
+    for (int c = 0; c < C; c++) {
+
+        float val = ...;
+
+        if (val > max_val) max_val = val;
+
+    }
+
+    Then loop again to compute sum_exp.
+
+    Alternatively, in a single pass:
+
+    float max_val = -INFINITY;
+
+    for (int c = 0; c < C; c++) {
+
+        float val = ...;
+
+        if (val > max_val) max_val = val;
+
+    }
+
+    Then, compute the sum:
+
+    sum_exp = 0;
+
+    for (int c = 0; c < C; c++) {
+
+        float val = ...;
+
+        sum_exp += expf(val - max_val);
+
+    }
+
+    This is two passes over the C dimension. Since C is small (16), it's acceptable, but perhaps can be done in one loop:
+
+    float max_val = -INFINITY;
+
+    float sum_exp = 0;
+
+    for (int c = 0; c < C; c++) {
+
+        float val = ...;
+
+        if (val > max_val) max_val = val;
+
+    }
+
+    Then:
+
+    sum_exp = 0;
+
+    for (int c = 0; c < C; c++) {
+
+        float val = ...;
+
+        sum_exp += expf(val - max_val);
+
+    }
+
+    Alternatively, combine into one loop:
+
+    float max_val = -INFINITY;
+
+    for (int c = 0; c < C; c++) {
+
+        float val = ...;
+
+        if (val > max_val) max_val = val;
+
+    }
+
+    sum_exp = 0;
+
+    for (int c = 0; c < C; c++) {
+
+        float val = ...;
+
+        sum_exp += expf(val - max_val);
+
+    }
+
+    Alternatively, first compute max_val in a loop, then compute sum_exp in another loop. Since C is small, this is manageable.
+
+    Now, the problem is that the input access pattern may not be coalesced. Let me think about the memory access for the input:
+
+    For a given (b, d, h, w), we loop over c from 0 to C-1, and for each c, we access the element at position (b, c, d, h, w).
+
+    The memory layout is row-major: the first dimension is batch, then channels, then depth, height, width.
+
+    So the input is stored as:
+
+    input[b * C*D*H*W + c * D*H*W + d * H*W + h * W + w]
+
+    The strides for the channels are contiguous, so for a given (d, h, w), accessing all c's for a fixed b, d, h, w will have contiguous memory accesses along the channel dimension. So the first loop (finding the max_val) will access contiguous memory, which is good for cache.
+
+    Therefore, this should be efficient.
+
+    However, when looping over all c's for each (b, d, h, w), the kernel will have to process each c sequentially. For C=16, this is acceptable.
+
+    Next, the kernel for the fused element-wise operations.
+
+    The input to this kernel is the output of logsumexp (shape B,1,D,H,W), and the bias (a scalar stored in a tensor).
+
+    The fused operations are:
+
+    y = y * (sigmoid(y + 3) /6) 
+
+    y = y - bias 
+
+    y = clamp(y, -1, 1)
+
+    The kernel can be written as:
+
+    __global__ void fused_operations_kernel(float* input, float* bias_data, float* output, int size, float min_val, float max_val) {
+
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if (idx >= size) return;
+
+        float y = input[idx];
+
+        y += 3.0f;
+
+        y = 1.0f / (1.0f + expf(-y));
+
+        y = input[idx] * y / 6.0f;  // Wait, original computation is y = input * sigmoid(input + 3) /6
+
+        // Wait, original code is:
+
+        // x = x * torch.sigmoid(x + 3) /6
+
+        // So the input to this kernel is the logsumexp result, which is x here.
+
+        // So the formula is:
+
+        // temp = x + 3
+
+        // temp = sigmoid(temp)
+
+        // result = x * temp /6
+
+        // Then subtract bias, then clamp.
+
+        // So in code:
+
+        // compute sigmoid(temp):
+
+        // temp = x +3
+
+        // sigmoid(temp) = 1/(1 + exp(-temp))
+
+        // then multiply x by that, divide by 6.
+
+        // Then subtract bias.
+
+        // Then clamp.
+
+        So in code:
+
+        float temp = y + 3.0f;
+
+        float sig = 1.0f / (1.0f + expf(-temp));
+
+        float val = input[idx] * sig /6.0f;
+
+        val -= bias_data[0];  // since bias is a scalar stored in a 1-element tensor.
+
+        if (val < min_val) val = min_val;
+
+        else if (val > max_val) val = max_val;
+
+        output[idx] = val;
+
+    }
+
+    Note that the input to this kernel is the logsumexp result, so the 'input' here is the logsumexp output. The bias is a scalar (the 'self.bias' in the original code), which is stored as a tensor of shape (1,1,1,1), so we can access bias_data[0].
+
+    The kernel loops over all elements of the input tensor (size is B*D*H*W, since the channels are reduced to 1).
+
+    Now, putting this together.
+
+    The ModelNew class would:
+
+    1. Use the existing ConvTranspose3d from PyTorch.
+
+    2. Replace the logsumexp with a custom kernel.
+
+    3. Replace the subsequent operations with a fused kernel.
+
+    However, we need to handle the bias. In the original code, self.bias is a parameter of the model, so in the new model, we need to have the same parameter.
+
+    So the steps in the forward function of ModelNew would be:
+
+    x = self.conv_transpose(x)
+
+    x = logsumexp_cuda(x)  # using the custom kernel
+
+    x = fused_ops_cuda(x, self.bias)  # using the fused kernel
+
+    return x
+
+    So the ModelNew class would have the conv_transpose layer, and the two custom kernels.
+
+    Now, we need to write the CUDA code for both kernels and integrate them into the Python code.
+
+    Let's structure the code as follows:
+
+    - Define the logsumexp CUDA kernel and its Python wrapper.
+
+    - Define the fused operations CUDA kernel and its Python wrapper.
+
+    The logsumexp kernel requires the input tensor and the dimensions (B, C, D, H, W). However, in the forward pass, the dimensions can be determined dynamically. So the kernel function will need to accept the input tensor and compute the dimensions.
+
+    Alternatively, in the Python code, we can pass the dimensions as arguments.
+
+    Wait, in the example provided earlier, the kernel functions are written in a way that they take the tensor and compute their dimensions.
+
+    For the logsumexp kernel, the Python function would look like:
+
+    def logsumexp_cuda(input, dim):
+
+        # compute the dimensions
+
+        B, C, D, H, W = input.shape
+
+        # create output tensor of shape (B, 1, D, H, W)
+
+        output = torch.empty((B, 1, D, H, W), device=input.device, dtype=input.dtype)
+
+        # launch kernel
+
+        block_size = 256
+
+        num_elements = B * D * H * W
+
+        num_blocks = (num_elements + block_size -1 ) // block_size
+
+        logsumexp_kernel<<<num_blocks, block_size>>>(input.data_ptr(), output.data_ptr(), B, C, D, H, W)
+
+        return output
+
+    However, this requires that the kernel is designed to take the shape parameters.
+
+    Similarly, for the fused operations:
+
+    def fused_ops_cuda(input, bias, min_val, max_val):
+
+        output = torch.empty_like(input)
+
+        size = input.numel()
+
+        block_size = 256
+
+        num_blocks = (size + block_size -1 ) // block_size
+
+        fused_operations_kernel<<<num_blocks, block_size>>>(input.data_ptr(), bias.data_ptr(), output.data_ptr(), size, min_val, max_val)
+
+        return output
+
+    However, in the original code, the clamp is between -1 and 1, so min_val and max_val are -1 and 1.
+
+    Now, putting all this together into Python code with inline CUDA.
+
+    The code for the logsumexp kernel and fused operations:
+
+    First, the logsumexp kernel source:
+
+    logsumexp_source = """
+    #include <torch/extension.h>
+    #include <cuda_runtime.h>
+    #include <math.h>
+
+    __global__ void logsumexp_kernel(const float* input, float* output,
+                                    int B, int C, int D, int H, int W) {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= B * D * H * W)
+            return;
+
+        // Compute indices for batch, d, h, w
+        int w = idx % W;
+        int h = (idx / W) % H;
+        int d = (idx / (W * H)) % D;
+        int b = idx / (W * H * D);
+
+        float max_val = -INFINITY;
+        for (int c = 0; c < C; ++c) {
+            int offset = b * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+            float val = input[offset];
+            if (val > max_val) {
+                max_val = val;
+            }
+        }
+
+        float sum_exp = 0;
+        for (int c = 0; c < C; ++c) {
+            int offset = b * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+            float val = input[offset];
+            sum_exp += expf(val - max_val);
+        }
+
+        float res = max_val + logf(sum_exp);
+        // Output is (B, 1, D, H, W)
+        int out_offset = b * D * H * W + d * H * W + h * W + w;
+        output[out_offset] = res;
+    }
+
+    torch::Tensor logsumexp_cuda(torch::Tensor input) {
+        // Check dimensions
+        auto dims = input.sizes();
+        int B = dims[0];
+        int C = dims[1];
+        int D = dims[2];
+        int H = dims[3];
+        int W = dims[4];
+
+        auto output = torch::empty({B, 1, D, H, W}, torch::device("cuda"), input.scalar_type());
+
+        const int block_size = 256;
+        int num_elements = B * D * H * W;
+        int num_blocks = (num_elements + block_size - 1) / block_size;
+
+        logsumexp_kernel<<<num_blocks, block_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            B, C, D, H, W
+        );
+
+        return output;
+    }
+    """
+
+    The corresponding C++ header:
+
+    logsumexp_header = """
+    torch::Tensor logsumexp_cuda(torch::Tensor input);
+    """
+
+    Then the fused operations kernel:
+
+    fused_ops_source = """
+    #include <torch/extension.h>
+    #include <cuda_runtime.h>
+    #include <math.h>
+
+    __global__ void fused_operations_kernel(
+        const float* input,
+        const float* bias,
+        float* output,
+        int size,
+        float min_val,
+        float max_val
+    ) {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= size)
+            return;
+
+        float y = input[idx];
+        float temp = y + 3.0f;
+        float sig = 1.0f / (1.0f + expf(-temp));
+        float val = y * sig / 6.0f;
+
+        val -= bias[0]; // bias is a scalar
+
+        if (val < min_val)
+            val = min_val;
+        else if (val > max_val)
+            val = max_val;
+
+        output[idx] = val;
+    }
+
+    torch::Tensor fused_ops_cuda(
+        torch::Tensor input,
+        torch::Tensor bias,
+        float min_val,
+        float max_val
+    ) {
+        auto output = torch::empty_like(input);
+        int size = input.numel();
+
+        const int block_size = 256;
+        int num_blocks = (size + block_size - 1) / block_size;
+
+        fused_operations_kernel<<<num_blocks, block_size>>>(
+            input.data_ptr<float>(),
+            bias.data_ptr<float>(),
+            output.data_ptr<float>(),
+            size,
+            min_val,
+            max_val
+        );
+
+        return output;
+    }
+    """
+
+    fused_ops_header = """
+    torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias, float min_val, float max_val);
+    """
+
+    Now, in the Python code, we need to compile both kernels.
+
+    However, when using load_inline, we can't compile multiple CUDA kernels in a single load_inline call. Therefore, we need to compile each kernel separately.
+
+    Alternatively, we can combine both kernels into a single CUDA source, but the functions would be separate.
+
+    Let me structure the code as follows:
+
+    First, define the logsumexp CUDA kernel and its wrapper.
+
+    Then, define the fused operations CUDA kernel and its wrapper.
+
+    Then, in the ModelNew class, use these functions.
+
+    The complete Python code would be something like:
+
+    import torch
+    import torch.nn as nn
+    from torch.utils.cpp_extension import load_inline
+
+    # Define the logsumexp CUDA kernel
+    logsumexp_source = """
+    // ... [the kernel code above] ...
+    """
+    logsumexp_header = "torch::Tensor logsumexp_cuda(torch::Tensor input);"
+    logsumexp_cuda = load_inline(
+        name="logsumexp_cuda",
+        cpp_sources=logsumexp_header,
+        cuda_sources=logsumexp_source,
+        functions=["logsumexp_cuda"],
+        verbose=True
+    )
+
+    # Define the fused operations CUDA kernel
+    fused_ops_source = """
+    // ... [the kernel code above] ...
+    """
+    fused_ops_header = "torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias, float min_val, float max_val);"
+    fused_ops_cuda = load_inline(
+        name="fused_ops_cuda",
+        cpp_sources=fused_ops_header,
+        cuda_sources=fused_ops_source,
+        functions=["fused_ops_cuda"],
+        verbose=True
+    )
+
+    class ModelNew(nn.Module):
+        def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+            super(ModelNew, self).__init__()
+            self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+            self.bias = nn.Parameter(torch.randn(1, 1, 1, 1))  # shape (1,1,1,1)
+
+        def forward(self, x):
+            x = self.conv_transpose(x)
+            x = logsumexp_cuda.logsumexp_cuda(x)
+            x = fused_ops_cuda.fused_ops_cuda(x, self.bias, min_val=-1.0, max_val=1.0)
+            return x
+
+    # The get_inputs and get_init_inputs functions remain the same as the original.
+
+    Wait, but the problem says to name the optimized architecture ModelNew

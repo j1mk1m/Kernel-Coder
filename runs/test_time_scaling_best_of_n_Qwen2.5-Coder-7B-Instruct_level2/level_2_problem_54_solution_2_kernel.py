@@ -1,0 +1,233 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_kernel(const float* input, const float* weight, const float* bias, float* output, int N, int C, int H, int W, int K, int S, int P) {
+    int n = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h_out = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (n >= N || c >= C || h_out >= H) return;
+
+    int w_out = (h_out * S - P) / K;
+    if (w_out < 0 || w_out >= W) return;
+
+    float sum = 0.0f;
+    for (int kh = 0; kh < K; ++kh) {
+        for (int kw = 0; kw < K; ++kw) {
+            int h_in = h_out * S - P + kh;
+            int w_in = w_out * S - P + kw;
+            if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+                sum += input[n * C * H * W + c * H * W + h_in * W + w_in] * weight[c * K * K + kh * K + kw];
+            }
+        }
+    }
+
+    output[n * C * H * W + c * H * W + h_out * W + w_out] = sum + bias[c];
+}
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, std::vector<int> stride, std::vector<int> padding) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+    int K = weight.size(2);
+    int S = stride[0];
+    int P = padding[0];
+
+    int H_out = (H + 2 * P - K) / S + 1;
+    int W_out = (W + 2 * P - K) / S + 1;
+
+    auto output = torch::zeros({N, C, H_out, W_out}, input.options());
+
+    const int block_size = 16;
+    dim3 blocks((H_out + block_size - 1) / block_size, (C + block_size - 1) / block_size, (N + block_size - 1) / block_size);
+    dim3 threads(block_size, block_size, block_size);
+
+    convolution_kernel<<<blocks, threads>>>(input.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<float>(), N, C, H, W, K, S, P);
+
+    return output;
+}
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, std::vector<int> stride, std::vector<int> padding);"
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for multiplication
+multiplication_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void multiplication_kernel(const float* input, const float* multiplier, float* output, int N, int C, int H, int W) {
+    int n = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (n >= N || c >= C || h >= H) return;
+
+    output[n * C * H * W + c * H * W + h] = input[n * C * H * W + c * H * W + h] * multiplier[c];
+}
+
+torch::Tensor multiplication_cuda(torch::Tensor input, torch::Tensor multiplier) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 16;
+    dim3 blocks((H + block_size - 1) / block_size, (C + block_size - 1) / block_size, (N + block_size - 1) / block_size);
+    dim3 threads(block_size, block_size, block_size);
+
+    multiplication_kernel<<<blocks, threads>>>(input.data_ptr<float>(), multiplier.data_ptr<float>(), output.data_ptr<float>(), N, C, H, W);
+
+    return output;
+}
+"""
+
+multiplication_cpp_source = (
+    "torch::Tensor multiplication_cuda(torch::Tensor input, torch::Tensor multiplier);"
+)
+
+# Compile the inline CUDA code for multiplication
+multiplication = load_inline(
+    name="multiplication",
+    cpp_sources=multiplication_cpp_source,
+    cuda_sources=multiplication_source,
+    functions=["multiplication_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for LeakyReLU
+leaky_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void leaky_relu_kernel(const float* input, float* output, int N, int C, int H, int W, float negative_slope) {
+    int n = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (n >= N || c >= C || h >= H) return;
+
+    output[n * C * H * W + c * H * W + h] = max(input[n * C * H * W + c * H * W + h], negative_slope * input[n * C * H * W + c * H * W + h]);
+}
+
+torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 16;
+    dim3 blocks((H + block_size - 1) / block_size, (C + block_size - 1) / block_size, (N + block_size - 1) / block_size);
+    dim3 threads(block_size, block_size, block_size);
+
+    leaky_relu_kernel<<<blocks, threads>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, C, H, W, negative_slope);
+
+    return output;
+}
+"""
+
+leaky_relu_cpp_source = (
+    "torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope);"
+)
+
+# Compile the inline CUDA code for LeakyReLU
+leaky_relu = load_inline(
+    name="leaky_relu",
+    cpp_sources=leaky_relu_cpp_source,
+    cuda_sources=leaky_relu_source,
+    functions=["leaky_relu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for GELU
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_kernel(const float* input, float* output, int N, int C, int H, int W) {
+    int n = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (n >= N || c >= C || h >= H) return;
+
+    float x = input[n * C * H * W + c * H * W + h];
+    float y = 0.5 * (x + tanh(sqrt(2 / M_PI) * (x + 0.044715 * x * x * x)));
+    output[n * C * H * W + c * H * W + h] = y;
+}
+
+torch::Tensor gelu_cuda(torch::Tensor input) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 16;
+    dim3 blocks((H + block_size - 1) / block_size, (C + block_size - 1) / block_size, (N + block_size - 1) / block_size);
+    dim3 threads(block_size, block_size, block_size);
+
+    gelu_kernel<<<blocks, threads>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, C, H, W);
+
+    return output;
+}
+"""
+
+gelu_cpp_source = (
+    "torch::Tensor gelu_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for GELU
+gelu = load_inline(
+    name="gelu",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+        self.leaky_relu = leaky_relu
+        self.gelu = gelu
+
+    def forward(self, x):
+        x = self.conv.convolution_cuda(x, self.conv.weight, self.conv.bias, self.conv.stride, self.conv.padding)
+        x = x * self.multiplier
+        x = self.leaky_relu.leaky_relu_cuda(x, 0.01)  # Assuming a common value for negative slope
+        x = self.gelu.gelu_cuda(x)
+        return x

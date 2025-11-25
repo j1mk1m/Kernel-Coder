@@ -1,0 +1,25 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Your custom CUDA kernels go here
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_groups, eps=1e-5, negative_slope=0.01):
+        super(ModelNew, self).__init__()
+        # Replace the PyTorch layers with custom CUDA operators
+        self.fc = ...  # Custom FC layer
+        self.gn = ...  # Custom GN layer
+        self.leaky_relu = ...  # Custom LeakyReLU layer
+        self.addition = ...  # Custom Addition layer
+
+    def forward(self, x):
+        x = self.fc(x)
+        x = self.gn(x)
+        x = self.leaky_relu(x)
+        x = self.addition(x, x)
+        return x
+
+# Initialize the model with the same parameters as the original model
+model_new = ModelNew(input_size, hidden_size, num_groups)

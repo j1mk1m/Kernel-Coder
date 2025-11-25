@@ -1,0 +1,2 @@
+# Ensure the code compiles and runs without errors
+assert outputs.shape == (batch_size, channels, (depth - kernel_size + 2 * padding) // stride + 1, (height - kernel_size + 2 * padding) // stride + 1, (width - kernel_size + 2 * padding) // stride + 1)

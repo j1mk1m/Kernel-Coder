@@ -1,0 +1,14 @@
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, add_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride)
+        self.add_value = add_value
+        self.multiply_value = multiply_value
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x + self.add_value
+        x = torch.min(x, torch.tensor(0.0, device=x.device))
+        x = torch.nn.functional.gelu(x)
+        x = x * self.multiply_value
+        return x

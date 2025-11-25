@@ -1,0 +1,552 @@
+The ModelNew should have the same functional behavior as Model. The ModelNew should use the same get_inputs() and get_init_inputs() functions.
+
+The model can be initialized with the following code:
+config = get_init_inputs()
+model = ModelNew(*config)
+
+The inputs can be generated with get_inputs().
+
+You are allowed to use torch.cuda.xxx functions, torch.utils.cpp_extension.load_inline, or other pytorch native features. Do not use any third-party libraries. Your code must be compatible with PyTorch 2.0+.
+
+Make sure that the ModelNew is as fast as possible. You can choose to replace one or more operators. You can choose to fuse operators if that is faster. If you choose to fuse operators, please make sure that the fused kernel is as efficient as possible. For example, fusing the matmul and avg_pool into a single kernel.
+
+The output ModelNew must have the same forward pass as the original Model. 
+
+The original architecture's forward function is:
+def forward(self, x):
+        x = self.matmul(x)
+        x = self.avg_pool(x.unsqueeze(1)).squeeze(1)
+        x = torch.nn.functional.gelu(x)
+        x = x * self.scale_factor
+        x = torch.max(x, dim=1).values
+        return x
+
+I will judge your answer based on whether the code is correct, compatible, and whether it will result in speed improvements. If your code has bugs or is slower than the original, I will ask you to fix it.
+
+Okay, so I need to optimize the given Model by replacing some operators with custom CUDA kernels. The original model does a series of operations: matmul (linear layer), average pooling, GELU, scaling, and max over dimension 1. The goal is to make this faster by possibly fusing some of these steps into a single CUDA kernel.
+
+First, let's look at each step:
+
+1. Matmul: This is a matrix multiplication between the input x (shape batch_size x in_features) and the linear layer's weight matrix (in_features x out_features). The output is batch_size x out_features.
+
+2. AvgPool1d: The input is unsqueezed to add a channel dimension, making it (batch_size, 1, out_features). Then, applying a 1D average pool with kernel_size=16. Since the kernel is applied over the third dimension (the feature dimension), this would reduce the third dimension. Wait, the output of avg_pool is then squeezed back to 2D (batch_size x out_features). Wait, hold on: if the kernel_size is 16, but the feature dimension (third dimension) after unsqueezing is out_features, then the pooling would have to divide out_features by kernel_size. But in the given example, pool_kernel_size is 16, and out_features is 8192, so 8192 /16 is 512. But in the original code, after avg_pool, they squeeze the channel dimension (dim 1), so the resulting x would be (batch_size, 512). Wait, that can't be right. Wait, let me check:
+
+Original code:
+
+x = self.avg_pool(x.unsqueeze(1)).squeeze(1)
+
+x.unsqueeze(1) makes it (batch_size, 1, out_features). Then, the AvgPool1d with kernel_size=pool_kernel_size (16) would compute the average over the third dimension (the 8192 length dimension) in chunks of 16? Wait, actually, the AvgPool1d's kernel size is applied along the temporal dimension (the third dimension here). So the output size would be: out_features / kernel_size, assuming no padding and stride equal to kernel size (default for average pool is stride equal to kernel size unless specified). Wait, the default parameters for AvgPool1d include stride=None, which would default to kernel_size. So if kernel_size is 16, then stride is 16, so the output length would be (8192 - 16)/16 +1? Wait no, wait when stride equals kernel_size, the output length is ceil((input_length - kernel_size)/stride +1). Wait, actually for AvgPool1d with kernel_size=K and stride=S, the output length is floor((L - K)/S +1). So if L=8192 and K=16, S=16, then (8192 -16)/16 +1 = (8176)/16 +1 = 511 +1 = 512. So the output after avg_pool would be (batch_size, 1, 512), then squeeze(1) gives (batch_size, 512).
+
+Wait but then the next step is GELU(x), which is applied to a 512-dim vector, then scaling by a factor, then max over dim 1 (so each element is maxed, but since it's over dim 1, which is the features, each sample's max is taken. So the final output is batch_size x 1.
+
+Wait, but in the original Model's docstring, it says the output is of shape (batch_size, out_features). Wait that can't be right because after the avg_pool, it's 512. Wait let me check the original code again:
+
+Wait the original Model's forward says:
+
+def forward(self, x):
+
+    x = self.matmul(x)  # becomes batch_size x out_features (8192)
+
+    x = self.avg_pool(x.unsqueeze(1)).squeeze(1)  # becomes batch_size x (out_features / kernel_size) which is 512
+
+    x = torch.nn.functional.gelu(x)  # still 512 features
+
+    x = x * self.scale_factor  # same shape
+
+    x = torch.max(x, dim=1).values  # now batch_size x 1 (since max over dim1)
+
+    return x
+
+Wait but the docstring says the output is (batch_size, out_features). That must be a mistake in the docstring. The user probably made an error there. But since the problem says to make sure the ModelNew has the same forward as the original, I should follow the actual code's output.
+
+Now, the goal is to optimize this. Let's see which operations can be fused or optimized.
+
+Possible points for optimization:
+
+1. The linear layer (matmul) can be done with a custom kernel, but PyTorch's nn.Linear is already optimized. However, perhaps combining it with subsequent operations would help.
+
+2. The avg_pool after the matmul: since the average pool is applied after the matmul, maybe we can combine the matmul with the average pooling step. For instance, since the pooling is over every 16 elements (since kernel size is 16 and stride 16), perhaps we can compute the matmul and then immediately compute the average over chunks of 16 elements, which could be done in a single kernel to avoid intermediate memory copies.
+
+3. GELU is a non-linear activation function. GELU can be computed with a custom kernel, but PyTorch's implementation is already efficient, but combining it with other steps might help.
+
+4. The scaling by scale_factor is a simple multiplication, which could be combined with previous steps.
+
+5. The max over dim 1 is a reduction step. Combining this with the previous steps might be possible.
+
+The key is to see which steps can be fused into a single CUDA kernel for better performance. Let's think:
+
+The pipeline is:
+
+input x -> linear layer (matmul) -> avg_pool (over every 16 elements in the feature dimension) -> gelu -> scale -> max over features.
+
+So, if we can combine the linear layer with the avg_pool into a single kernel, that could save time. Let's think about how that might work.
+
+The linear layer is a matrix multiply between x (B x in_F) and the weight matrix (in_F x out_F), resulting in B x out_F. Then, the avg_pool takes every 16 elements in the out_F dimension and averages them. Since the kernel size is 16 and stride 16, each output element is the average of a block of 16 consecutive elements.
+
+Wait, actually, the average pooling is applied over the third dimension (after unsqueezing to (B, 1, out_F)), so the kernel is applied over the length of out_F. The output of avg_pool is (B, 1, out_F//16), which is then squeezed to B x (out_F//16).
+
+Therefore, the avg_pool is effectively taking the average of every 16 elements in the out_F dimension (since out_F is 8192 and kernel 16, 8192/16=512).
+
+So the avg_pool step reduces the feature dimension from 8192 to 512.
+
+Therefore, perhaps we can compute the linear layer's output and then immediately compute the average over every 16 elements. Alternatively, can we compute the linear layer's output in a way that already groups the output into chunks of 16 and averages them as part of the computation?
+
+That might be possible. Let me think of the linear layer's computation:
+
+Each output element y_i = sum_{j=0}^{in_features-1} x_j * W_{i,j}
+
+Then, the avg_pool would compute for each block of 16 elements (i.e., from i=0 to 15, then 16 to 31, etc.) the average of those 16 y's.
+
+The total for each block would be (sum_{k=0}^{15} y_{block*16 +k}) /16.
+
+But since each y_i is a sum over j, maybe we can precompute the sum over the block of y's.
+
+Wait, let's see:
+
+The average over a block of 16 elements (positions i to i+15) would be:
+
+( y_i + y_{i+1} + ... + y_{i+15} ) /16
+
+Each y_k is sum_j x_j W_{k,j}
+
+So the sum over the block is sum_{k in block} sum_j x_j W_{k,j} = sum_j x_j (sum_{k in block} W_{k,j})
+
+Therefore, the average over the block is (sum_j x_j (sum_{k in block} W_{k,j}) ) /16.
+
+Therefore, if we can precompute for each block (of 16 rows in the weight matrix) the sum of the weights in that block, then the average can be computed as (sum_j x_j * (sum_{k in block} W_{k,j}) ) /16.
+
+This suggests that instead of computing the full matrix multiplication, we can compute, for each block, the sum of the weights in that block's rows, and then compute the dot product with the input x. Then divide by 16. That way, we can compute the average-pooled result directly from the linear layer's weights, without first computing the full output of the linear layer.
+
+This could save memory and computation, since instead of computing 8192 outputs and then averaging every 16, we compute 512 outputs directly (since 8192/16=512).
+
+This would be a big optimization. So the idea is to combine the linear layer and the avg_pool into a single step.
+
+That seems promising. So let's see how to structure this.
+
+First, the weight matrix is of size (out_features, in_features). The average pooling over 16 elements in the output dimension (rows) would group the output into chunks of 16 rows. Each block's output is the average of those 16 rows.
+
+Therefore, the new "fused" layer would have a weight matrix of size (out_features_pooled, in_features), where out_features_pooled = out_features / kernel_size. Each row in this new weight matrix is the average of 16 rows from the original weight matrix.
+
+Wait, actually, since the average is the sum divided by 16, the new weight for each pooled block would be the sum of the original weights in that block, divided by 16. But since the computation can be done as (sum of weights in the block) * x, then divided by 16, it's equivalent to having weights summed and scaled by 1/16.
+
+Therefore, the fused layer can use a weight matrix where each row is (sum_{k in block} W_{k,j}) /16 for each j.
+
+Alternatively, since the division by 16 is a scalar factor, we can compute the sum, then divide by 16 in the kernel.
+
+Therefore, the fused kernel would:
+
+- For each output block (out_features_pooled):
+
+   For each input feature j:
+
+      accumulate the sum over the block's weights (for the 16 rows in the block) multiplied by x_j.
+
+   Then divide by 16.
+
+This way, we compute the average-pooled result directly, avoiding the full linear layer's computation.
+
+So, the fused layer's weights would be the sum of the original weight's blocks of 16 rows, divided by 16. Alternatively, in the kernel, we can compute the sum over the 16 rows and then divide by 16.
+
+This would save the memory for the full linear layer's output (since 8192 features are reduced to 512 immediately), and also avoid the pooling step.
+
+This seems like a good approach. Let's proceed with this.
+
+So, the fused kernel would handle the linear layer followed by average pooling. Then, the GELU, scaling, and max can be added into the same kernel or done separately, but let's see:
+
+The next steps after the avg_pool are applying GELU, scaling by scale_factor, then taking the max over the features (the 512 elements). Maybe those can be fused as well.
+
+Alternatively, maybe fusing the entire pipeline up to the max is possible, but let's see:
+
+Let's think step by step.
+
+First, the fused linear+avg_pool:
+
+The input is x (B, in_features).
+
+The fused kernel computes for each output block (each of the 512 outputs):
+
+y_b = (sum_{j=0}^{in_features-1} x_j * (sum_{k in block b} W_{k,j}) )) / 16
+
+Then, GELU is applied element-wise: y_b = gelu(y_b)
+
+Then scaling: y_b *= scale_factor
+
+Then, the max over all y_b for each sample (dim 1) is taken.
+
+The max is a reduction operation. So perhaps the entire pipeline can be fused into a single kernel, but that might be complicated. Alternatively, we can fuse up to the GELU and scaling, then compute the max in a separate step, but even better, compute the maximum directly in the kernel.
+
+Alternatively, let's see if we can compute everything up to the max in a single kernel.
+
+Let me outline the steps in order:
+
+1. Compute the linear+avg_pool (512 elements per sample).
+
+2. Apply GELU to each element.
+
+3. Multiply each element by scale_factor.
+
+4. Find the maximum over all elements in the 512 features for each sample.
+
+All of these steps can be done in a single kernel. Let's see:
+
+The kernel can process each sample (B loops), and for each sample:
+
+   For each output block (512 elements):
+
+      Compute the linear+avg_pool value (y_b)
+
+      Apply GELU and scaling: y_b = scale_factor * GELU(y_b)
+
+   Then, compute the maximum of all y_b's for the sample.
+
+However, the last step (computing the max) is a reduction over the 512 elements. This can be done in the same kernel, perhaps using shared memory to accumulate the max for each sample.
+
+Alternatively, the kernel can process each sample, compute all the y_b values, compute the max, and store it. The reduction can be done in a single thread for each sample, but the steps before (computing all y_b) must be done first.
+
+Hmm, the problem is that the max is a reduction that requires all the y_b to be computed first. So the steps are:
+
+For each sample:
+
+   Compute all 512 elements (after GELU and scaling).
+
+   Then find the maximum among them.
+
+Therefore, the kernel can process each sample sequentially:
+
+Each thread block can handle one sample.
+
+Inside the block:
+
+   Each thread (up to 512 threads?) computes one y_b value (linear+avg_pool + GELU + scaling).
+
+   Then, perform a parallel reduction to find the max among the 512 values.
+
+   Write the result.
+
+Alternatively, with 512 threads per block (each handling one element), but that might be a lot. Alternatively, use a block size of 256 and have some threads handle multiple elements.
+
+Alternatively, the block can be divided into threads that compute the y_b and then do a reduction.
+
+Alternatively, compute the y_b and track the max as we go.
+
+Alternatively, let's structure the kernel as follows:
+
+For each sample in the batch (processed in blocks):
+
+   For each thread in the block, compute one y_b (for a particular block index), then store it in shared memory.
+
+   Then, perform a reduction in shared memory to find the max of the 512 elements.
+
+   Each block is responsible for one sample.
+
+This would be efficient.
+
+Therefore, the entire pipeline (except the initial matmul) can be fused into a single kernel. However, the initial step (linear+avg_pool) is the main part, and the rest are element-wise operations plus a reduction.
+
+So the fused kernel would:
+
+1. Compute the linear+avg_pool result for each output block (512 elements per sample).
+
+2. Apply GELU and scale.
+
+3. Compute the max over those 512 elements per sample.
+
+Now, let's think about how to implement this.
+
+First, the weight matrix. The original linear layer's weight is (out_features, in_features) = (8192, 8192). To compute the sum of 16 rows for each block, we can precompute a new weight matrix for the fused layer, which would be (out_features_pooled, in_features) = (512, 8192). Each row in this matrix is the sum of the corresponding 16 rows from the original weight matrix, divided by 16 (since it's an average).
+
+Wait, but in the kernel, we can compute the sum on the fly, without precomputing a new weight matrix. Because in the original model, the linear layer's weights are stored, and the average pooling is applied after. Therefore, in the fused kernel, we can directly use the original weights, but process them in chunks of 16 rows.
+
+Wait, but if we have to do this in the kernel, we need to access the original weights. Alternatively, we can precompute the summed weights and store them in a separate matrix, which would be more efficient.
+
+Therefore, the fused layer would need to store a weight matrix that's the precomputed average of each block of 16 rows. Let's see:
+
+The precomputed weight matrix (W_fused) would be:
+
+for each block b in 0..511:
+
+   W_fused[b][j] = (sum_{k= b*16 to (b+1)*16 -1} W[k][j]) / 16
+
+Therefore, the fused kernel can take the precomputed W_fused as input. However, in the original model, the weights are part of the linear layer, so in the ModelNew, we need to replicate that.
+
+Wait, the original model uses nn.Linear, which has weight and bias. However, in the problem's original code, the Model's __init__ has a self.matmul = nn.Linear(...), so the parameters are stored there.
+
+Therefore, in the fused approach, we need to modify the model to use the precomputed weights (the W_fused matrix) instead of the original linear layer. But that would require changing the parameters, which might affect the training. However, the problem states that the ModelNew must have the same functional behavior as the original, so the parameters must be compatible.
+
+Alternatively, perhaps we can keep the original weights and compute the sum in the kernel each time, but that would be computationally expensive. Wait, no, because in the kernel, for each output block b, we need to compute the sum over the 16 rows of the original weight matrix. That would be 16 * in_features multiplications per output block, which might be manageable but depends.
+
+Alternatively, precomputing the fused weights is better.
+
+Therefore, to make it efficient, we can precompute the fused weights and store them as parameters in the ModelNew. But this would require modifying the model's parameters. However, the original model uses the linear layer's weights, so to keep the same functionality, the fused weights should be derived from the original linear layer's weights.
+
+Wait, but in the original model, the linear layer's output is followed by the average pooling, so the fused weights must be equivalent to the average pooling applied after the linear layer. So the fused weights are exactly the average over the blocks, so precomputing is correct.
+
+Therefore, the ModelNew would need to have a parameter for the fused weights (size 512 x 8192), which is the average of the original weights' blocks. But how do we get the original weights into the ModelNew?
+
+Alternatively, perhaps the user can have the ModelNew accept the original model's parameters. But according to the problem statement, the ModelNew must be initialized with the same get_init_inputs() as the original model, which in the original code are:
+
+def get_init_inputs():
+    return [in_features, out_features, pool_kernel_size, scale_factor]
+
+Wait, looking back:
+
+The original Model's __init__ takes (in_features, out_features, pool_kernel_size, scale_factor). The parameters are:
+
+self.matmul = nn.Linear(in_features, out_features)
+
+So the weights are initialized randomly as part of the nn.Linear. Therefore, in the original model, the weights are part of the model's state_dict. However, in the new model, if we fuse the linear and avg_pool, we need to store the fused weights as parameters. Therefore, the ModelNew would need to take the original weights, compute the fused weights, and store them as parameters. But the problem states that the ModelNew should be initialized with the same get_init_inputs() function, which doesn't include the weights. Therefore, the weights must be initialized in the same way as the original model.
+
+Hmm, this complicates things because the fused kernel requires the precomputed fused weights, but the original model's parameters are the standard Linear layer's weights. Therefore, to make the fused kernel compatible with the original parameters, we need to compute the fused weights on the fly from the original weights.
+
+Wait, perhaps the fused kernel can take the original weights and compute the sum over the blocks each time. However, this would be computationally expensive because for each output block b, we need to loop over 16 rows of the original weight matrix (each of which has in_features elements). For in_features=8192, that's 8192 *16 = 131072 operations per output block. Since there are 512 output blocks, that's 512 * 131072 = 67,108,864 operations per sample. But the original linear layer has 8192*8192 operations per sample (each of the 8192 outputs requires 8192 multiplications), which is about 67 million operations. Wait, so the fused kernel's approach of doing 16 rows at a time would have the same number of operations? Wait no, perhaps not.
+
+Wait, original linear layer: each output element is a dot product between input and a row of weights. For 8192 outputs, that's 8192 * 8192 operations. The fused approach would compute for each of the 512 output blocks the sum over 16 rows, so each block's computation is the sum of 16 rows' dot products with the input. That would be 512 * (16 * 8192) = same as the original (since 512*16=8192). Therefore, the total number of operations is the same. However, the fused kernel can have better memory access patterns and avoid storing the intermediate 8192 outputs.
+
+Therefore, the fused kernel can be as efficient as the original, but with better memory usage.
+
+But storing the fused weights would save the need to compute the sum over the 16 rows each time. Therefore, if we can precompute the fused weights as parameters, it would be better.
+
+But how to do this without changing the initialization parameters of the model?
+
+The original Model's parameters are the weights and bias of the linear layer. The new ModelNew would need to compute the fused weights from the original linear layer's weights. Therefore, perhaps the ModelNew must take the original linear layer's parameters as inputs? But according to the problem, the get_init_inputs() must remain the same, which returns [in_features, out_features, pool_kernel_size, scale_factor], which are the same as the original.
+
+Wait, the original Model's __init__ is called with in_features, out_features, pool_kernel_size, scale_factor. The new ModelNew must also be initialized with the same arguments, so that when config = get_init_inputs() is passed to ModelNew, it works.
+
+Therefore, the ModelNew cannot directly take the original weights; instead, it has to re-initialize them, but in a way that the fused weights are derived from the original initialization.
+
+Wait, perhaps the ModelNew can still have a Linear layer, but then compute the fused weights as a derived parameter. However, in the forward pass, the kernel can use the original weights to compute the fused version on the fly. Alternatively, precompute the fused weights as a buffer.
+
+Alternatively, perhaps the fused kernel can take the original weight tensor and compute the sum on the fly. But that would require passing the weight tensor to the kernel.
+
+Hmm, this is getting complicated. Let me think of the code structure.
+
+Suppose we proceed to fuse the linear and avg_pool steps into a single kernel. The kernel will need access to the weight matrix of the linear layer. Since in the original model, the linear layer's weights are stored in self.matmul.weight, the new model can still have the linear layer, and the kernel can access those weights.
+
+Wait, but the kernel is a CUDA function, so we need to pass the weight tensor as an argument.
+
+Alternatively, the fused kernel can take the weight tensor (from the linear layer) as an input, along with the input x, and compute the fused step.
+
+Therefore, the ModelNew would have:
+
+class ModelNew(nn.Module):
+
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+
+        super().__init__()
+
+        self.matmul = nn.Linear(in_features, out_features)
+
+        self.pool_kernel_size = pool_kernel_size
+
+        self.scale_factor = scale_factor
+
+        # Also, define the custom fused kernel here.
+
+    def forward(self, x):
+
+        # Use the fused kernel that takes x and self.matmul.weight, etc.
+
+But then, in the forward, we can pass the weight to the kernel.
+
+Alternatively, the kernel can be written to take the weight as a parameter.
+
+This seems feasible.
+
+So let's outline the steps for the fused kernel:
+
+The kernel function would:
+
+For each sample in the batch (loop over samples):
+
+   For each output block b (0 to 511):
+
+      compute the sum over the 16 rows (from b*16 to (b+1)*16 -1) of the dot product of the weight row and the input x.
+
+      Divide by 16 to get the average.
+
+      Apply GELU and scaling.
+
+      Keep track of the maximum value.
+
+Wait, but actually, the GELU and scaling can be applied after the average.
+
+Wait the steps are:
+
+1. Compute the average over the 16 rows for each block b.
+
+2. Apply GELU to that value.
+
+3. Multiply by scale_factor.
+
+4. Compute the maximum over all b.
+
+Therefore, the kernel can compute each of these steps in sequence.
+
+Now, implementing this as a CUDA kernel.
+
+The kernel will process each sample in the batch. Let's assume we have a block per sample. Each block handles one sample.
+
+Inside the block:
+
+Each thread is responsible for computing one output block (b). Since there are 512 blocks, perhaps we can have threads in a block to handle each block. However, 512 threads would be needed per block, which is more than the maximum allowed (usually 1024). Alternatively, have multiple threads per block and use shared memory.
+
+Alternatively, use a block size of 256 and have each thread handle two blocks. Hmm, perhaps better to use a grid of blocks where each block handles a sample, and each thread in the block handles a subset of the blocks.
+
+Alternatively, let's structure it as:
+
+Each block corresponds to a sample. Each block has 512 threads, each handling one output block (b).
+
+Each thread does:
+
+sum = 0
+
+for each j in 0..in_features-1:
+
+   weight_row = b * 16 + threadIdx.x ?
+
+Wait, no. Wait, for each block b, the kernel needs to compute the sum over rows b*16 to (b+1)*16-1 of (weight_row[j] * x[j]).
+
+Wait, for each output block b, the kernel needs to compute the sum over the 16 rows of the original weight matrix's rows from b*16 to (b+1)*16-1.
+
+Wait, perhaps it's better to index the original weight as follows:
+
+The weight tensor is a matrix of size (out_features, in_features). So for a given b, the rows are from b * kernel_size to (b+1)*kernel_size -1.
+
+The sum over those 16 rows for each column j.
+
+Wait, for each output block b and input feature j, the sum over the 16 rows is:
+
+sum_{k = b*kernel_size to (b+1)*kernel_size-1} weight[k][j] * x[j]
+
+Wait, but this can be written as x[j] multiplied by the sum of the weights over those rows. Therefore, for each output block b, the total is sum_j [x[j] * (sum_{k in block b} weight[k][j}) ]
+
+Therefore, for each block b, the value is (sum_j (x_j * (sum_weights_bj )) ) / kernel_size, where sum_weights_bj is the sum of the weights in block b's rows for column j.
+
+Therefore, the kernel can precompute the sum_weights_bj for each b and j, but that would require storing a (512, 8192) matrix, which is 512*8192 = ~4 million elements. That's a lot of memory.
+
+Alternatively, compute the sum on the fly.
+
+Wait, but for a single output block b, the sum over the rows can be computed as follows:
+
+sum = 0
+
+for each row k in b's block (16 rows):
+
+   for each j in 0..in_features-1:
+
+      sum += weight[k][j] * x[j]
+
+Wait, but this is O(16 * in_features) per output block, which for in_features=8192 is 131,072 operations per output block. For 512 blocks, that's 512 * 131,072 = 67 million operations per sample, which is the same as the original linear layer's computation (8192 *8192 = 67 million). So there's no computational saving here.
+
+Wait a minute, this approach is not better computationally. Therefore, this suggests that the fused kernel approach isn't gaining anything computationally, just saving memory by not storing the intermediate 8192 outputs. But maybe memory bandwidth is the bottleneck here. The original approach requires storing 8192 elements, which for a batch of 1024 samples would be 1024 * 8192 ~ 8 million elements, whereas the fused approach stores 512 elements per sample, so 512*1024 ~ 500k elements. That's a significant reduction in memory usage, which might help with cache efficiency and bandwidth.
+
+Therefore, even though the number of operations is the same, the fused kernel could be faster due to better memory usage.
+
+Therefore, proceeding with this approach.
+
+Now, the CUDA kernel structure:
+
+The kernel will process each sample in parallel. For each sample, the kernel will compute the 512 output blocks.
+
+Let's consider the following:
+
+Each thread in a block (which handles a single sample) is responsible for computing one output block (b). Since there are 512 blocks, we need 512 threads per block. The maximum threads per block in CUDA is typically 1024, so this is acceptable.
+
+The kernel will be launched with grid size equal to the batch size (1024), and block size 512.
+
+The steps for each thread (thread index = b) in a block (sample index s):
+
+1. Compute the sum over the block b's rows of (weight[k][j] * x[s][j]) for all j.
+
+2. Divide by kernel_size (16) to get the average.
+
+3. Apply GELU and scaling.
+
+4. Keep track of the maximum value across all b for this sample.
+
+Wait, but the maximum is a reduction step that requires all elements to be computed first. So step 4 can be done after all threads have computed their values.
+
+Alternatively, each thread can compute their value, store it in shared memory, then perform a reduction to find the max.
+
+So here's the plan for the kernel:
+
+For each sample (block):
+
+   Allocate shared memory to store the 512 intermediate values (after GELU and scaling).
+
+   Each thread computes its block's value and stores it in shared memory.
+
+   Synchronize threads.
+
+   Then, each thread participates in a parallel reduction to compute the max.
+
+   Finally, write the max to the output tensor.
+
+Therefore, the kernel outline:
+
+__global__ void fused_kernel(
+    const float* x,  // input tensor (batch_size, in_features)
+    const float* weight,  // original weight matrix (out_features, in_features)
+    float scale_factor,
+    int kernel_size,
+    int in_features,
+    int out_features_pooled,
+    float* output)  // output tensor (batch_size)
+{
+    int s = blockIdx.x;  // sample index
+    int b = threadIdx.x; // output block index (0 to out_features_pooled-1)
+
+    __shared__ float shared_vals[512]; // assuming out_features_pooled is 512
+
+    if (b < out_features_pooled) {
+        float sum = 0.0f;
+        for (int j = 0; j < in_features; ++j) {
+            // Compute the sum over the block's rows for this j
+            float weight_sum = 0.0f;
+            for (int k = b * kernel_size; k < (b+1)*kernel_size; ++k) {
+                weight_sum += weight[k * in_features + j];
+            }
+            sum += x[s * in_features + j] * weight_sum;
+        }
+        // Average
+        sum /= kernel_size;
+        // Apply GELU and scale
+        float val = scale_factor * gelu(sum);
+        shared_vals[b] = val;
+    }
+
+    __syncthreads();
+
+    // Now compute the max over shared_vals[0..511]
+    // Use parallel reduction
+    // Each thread participates in the reduction
+    if (threadIdx.x == 0) {
+        float max_val = -INFINITY;
+        for (int i = 0; i < out_features_pooled; ++i) {
+            if (shared_vals[i] > max_val) max_val = shared_vals[i];
+        }
+        output[s] = max_val;
+    }
+}
+
+Wait, but this has a problem: the inner loops are very computationally intensive. The first loop over j is 8192 iterations, each involving another loop over 16 iterations. For each j, you're looping over 16 rows to compute the weight_sum. That's 8192 *16 operations per thread, per sample. Since each sample is handled by 512 threads, but each thread does this for their own block, it's not efficient.
+
+This is going to be very slow, because the loops are too nested and have high computational complexity.
+
+Alternative idea: precompute the sum_weights_bj for each b and j.
+
+But storing the sum_weights_bj would require a 512 x 8192 array, which is 4,194,304 elements (since 512*8192 = 4,194,304). Each element is a float (4 bytes), so that's ~16MB, which is manageable.
+
+Therefore, precomputing the sum_weights tensor as part of the model's parameters would be better.
+
+So the steps would be:
+
+1. In the ModelNew's __init__, compute the sum_weights tensor by summing over the original weight's rows in blocks of kernel_size (16). Then divide by kernel_size to get the average.
+
+Wait no, the sum_weights_bj is the sum over the rows for each block b and column j, divided by kernel_size (to average), but actually, in the fused kernel, the division is done after summing over all j, so maybe we can store the sum without division, then divide by kernel_size at the end.
+
+Wait let's re-express:
+
+The value for block b is (sum over k in block b's rows of (sum over j (x_j * W_{k,j} )) ) / kernel_size.
+
+Which can be rewritten as sum

@@ -1,0 +1,599 @@
+The following code is a custom CUDA kernel that performs matrix multiplication, sigmoid, and summation in a single kernel. It should be compatible with PyTorch and utilize CUDA streams for asynchronous execution. The code must be correct and efficient. 
+
+Here's my attempt:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class SigmoidSummationFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias):
+        output = torch.empty_like(input)
+        # Launch CUDA kernel for matmul + sigmoid + sum
+        # ... (CUDA kernel code here)
+        ctx.save_for_backward(input, weight, bias)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Implement backward pass here
+        # ... 
+        return grad_input, grad_weight, grad_bias
+
+class FusedLinearSigmoidSum(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.bias = nn.Parameter(torch.empty(hidden_size))
+        # Initialize weights
+        nn.init.xavier_normal_(self.weight)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+        return SigmoidSummationFunction.apply(x, self.weight, self.bias)
+```
+
+Wait, but in the original Model class, the linear layer is a standard nn.Linear layer. To replace that with the fused kernel, I need to reimplement the linear layer's computation (matmul + bias) along with sigmoid and sum in one kernel. 
+
+The problem is that in the original architecture, the linear layer is followed by sigmoid and then sum. So the forward steps are:
+
+1. Linear: x = x @ weight.T + bias
+2. Sigmoid: x = 1/(1 + exp(-x))
+3. Sum over dim=1: x = sum(x, dim=1, keepdim=True)
+
+So to fuse all three steps into a single kernel, the fused kernel must compute:
+
+output[i] = sum_{j} sigmoid( (x[i] @ weight[j,:]^T) + bias[j] )
+
+for each sample i in the batch. The output is a (batch_size, 1) tensor.
+
+To compute this in a CUDA kernel, need to structure the computation such that each thread block handles a single sample (i), and each thread within the block computes a element of the intermediate linear result, then applies sigmoid and accumulates the sum.
+
+Wait, but for a matrix multiply, the standard approach is to have each thread compute an element of the output. But here, the output is a scalar per sample (after sum), so maybe we can have each thread compute a partial sum for each sample.
+
+Alternatively, for each sample:
+
+The linear step is a vector dot product between the input x[i] and each row of the weight matrix, plus bias. Then apply sigmoid and sum all those values.
+
+So for sample i:
+
+result_i = sum_j [ sigmoid( (x[i] * weight[j, :]).sum() + bias[j] ) ]
+
+To compute this, perhaps for each sample, we can have a thread block. Each thread in the block handles a row j of the weight matrix. Each thread computes the dot product between x[i] and weight[j], adds the bias, applies sigmoid, and then the threads in the block perform a reduction to sum all the sigmoids.
+
+This way, each block processes one sample. The grid size is the batch size. Each block has as many threads as the hidden_size (since hidden_size is 32768, which is 2^15, so that's a lot. 32768 threads per block may exceed the maximum allowed threads per block (which is 1024 on most GPUs). So that might not be feasible. Hmm.
+
+Alternatively, maybe split the computation into multiple steps. For example, use a tiling approach where each thread block processes a tile of the hidden_size dimension. But this might complicate.
+
+Alternatively, use a warp per sample. But with hidden_size=32768, each sample requires 32768 operations, which is a lot.
+
+Alternatively, use a grid of threads where each thread is responsible for a (sample, hidden unit) pair, compute the sigmoid of the linear combination, and then accumulate the sum for each sample. However, the summation would require atomic operations or a parallel reduction.
+
+Wait, the sum over hidden_size is a reduction over the hidden units for each sample. So the problem is for each sample, compute the sum over j of sigmoid(linear term j).
+
+Perhaps the best way is to structure the kernel as follows:
+
+Each thread block handles one sample. The block has multiple threads, say 256 threads. The number of threads per block needs to be <= 1024. The hidden_size is 32768, which is 32768 / 256 = 128 threads per block. Wait, 256 threads per block would require 128 iterations per thread. Alternatively, each thread in the block can compute multiple elements.
+
+Let me think of the steps for a single sample:
+
+For sample i:
+
+1. For each j from 0 to hidden_size-1:
+
+   a. Compute the dot product between x[i] (input_size elements) and weight[j] (input_size elements). The weight matrix is of shape (hidden_size, input_size), so each row corresponds to a weight vector for unit j.
+
+   Wait, actually, the linear layer is x @ weight.T + bias. So the weight matrix is (hidden_size, input_size), so the transpose is (input_size, hidden_size). Therefore, the matrix multiplication is:
+
+   output[j] = sum_{k=0}^{input_size-1} x[i][k] * weight[j][k] + bias[j]
+
+Therefore, for each j (hidden unit), the linear combination is the dot product between x[i] and weight[j], plus bias[j].
+
+Therefore, for each j, compute the dot product of x[i] and weight[j], add bias[j], apply sigmoid, and accumulate the sum over all j.
+
+So for each sample, the computation is:
+
+sum_{j=0}^{hidden-1} sigmoid( (x[i] • weight[j]) + bias[j] )
+
+To compute this efficiently in parallel, perhaps for each sample:
+
+- Each thread block is assigned to one sample.
+
+- Within the block, each thread is assigned to process a subset of the hidden_size elements.
+
+- Each thread computes the dot product for its assigned j's, applies sigmoid, and accumulates partial sums.
+
+- Then perform a block reduction to sum all the partial sums, storing the result in the output for that sample.
+
+This approach would work.
+
+Now, the problem is the dot product for each j. Since input_size is also 32768, the dot product for each j is 32768 elements. That's a lot of computation per j. Wait, input_size is 32768. So each weight[j] is a vector of 32768 elements. The dot product between x[i] (32768 elements) and weight[j] (32768 elements) requires 32768 multiplications and additions per j. Since hidden_size is also 32768, this is O( (input_size * hidden_size) ) operations. That's 32768*32768 = ~1e9 operations per sample, which is a lot. But perhaps the original code is designed this way?
+
+Wait, the original Model has a linear layer with input_size=32768 and hidden_size=32768. So the weight matrix is 32768x32768, which is 1e9 elements. That's 4GB (since each float is 4 bytes). So the weight matrix would take 4GB of memory. But with a batch size of 128, the inputs and outputs would also take a lot of memory. But perhaps this is a hypothetical problem?
+
+Alternatively, maybe I misread the input parameters. Let me check:
+
+The given architecture:
+
+class Model(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.linear = nn.Linear(input_size, hidden_size)
+
+    def forward(self, x):
+        x = self.linear(x)  # shape (batch, hidden_size)
+        x = torch.sigmoid(x)  # shape (batch, hidden_size)
+        x = torch.sum(x, dim=1, keepdim=True)  # shape (batch, 1)
+        return x
+
+The parameters input_size and hidden_size are both 32768. So the linear layer has a weight matrix of size (hidden_size, input_size) = (32768, 32768). The input to the linear layer is (batch_size, input_size), so the output of linear is (batch_size, hidden_size). Then sigmoid is applied element-wise, so still (batch_size, hidden_size), then summed over dim=1 to get (batch_size, 1).
+
+The problem is that the matrix multiplication between x (size 128x32768) and the weight matrix (32768x32768) is a huge computation. The number of FLOPs for the matrix multiplication alone is 128 * 32768 * 32768 ≈ 1.37e12 FLOPs. That's way too much. Probably, the user made a mistake in the numbers, but assuming this is the problem to solve.
+
+Alternatively, perhaps the input_size and hidden_size are both 32,768, which is 2^15. So perhaps the problem is designed to have a square matrix.
+
+But regardless, the user wants to optimize this architecture by replacing operators with custom CUDA kernels. The key operators here are the linear layer (matrix multiply + bias), the sigmoid, and the summation. So fusing these three into a single kernel would eliminate some overhead and reduce memory traffic.
+
+The challenge is to compute, for each sample i, the sum over j of sigmoid( (x[i] • weight[j]) + bias[j] )
+
+To compute this efficiently on the GPU, let's consider the following approach:
+
+Each thread block processes a single sample. The block has a number of threads, say 256. Each thread is responsible for a range of j indices. For example, if hidden_size is 32768 and block size is 256, each thread would handle 128 j's (since 32768 / 256 = 128). Each thread computes the dot product for its assigned j's, applies sigmoid, and accumulates the sum.
+
+Wait, but even 128 j's per thread would mean each thread has to compute 128 dot products, each of 32768 elements. That's 128*32768 = ~4 million operations per thread, which would be very slow. That's not feasible.
+
+Hmm, maybe this approach is not viable. Perhaps I need to rethink the kernel design.
+
+Alternative idea: Since the matrix multiplication is x * weight^T, which is equivalent to a batch matrix multiply of x (batch_size x input_size) with weight (input_size x hidden_size). The result is batch_size x hidden_size.
+
+The matrix multiplication can be optimized using CUDA's cublas or cuBLASLt, but the user wants to replace the operators with custom kernels. So perhaps the matrix multiplication is too large to handle in a custom kernel, but maybe we can find a way to compute the sum over j of sigmoid( (x[i] • weight[j]) + bias[j] ) more efficiently.
+
+Wait, the final result is the sum over j of sigmoid( (x[i] • weight[j]) + bias[j] ). Let me see if there's a way to compute this without explicitly computing all the j terms.
+
+Alternatively, perhaps we can compute the sum inside the kernel efficiently.
+
+Let me think of the computation for a single sample:
+
+sum_j [ sigmoid( (x • weight_j) + bias_j ) ]
+
+where weight_j is the j-th row of the weight matrix.
+
+This is equivalent to:
+
+sum_j [ 1 / (1 + exp( - (x • weight_j + bias_j) )) ]
+
+But unless there's some mathematical trick to combine these terms, it's unclear. So perhaps we have to compute each term individually.
+
+Given that, perhaps the matrix multiplication step is the most computationally intensive part. The matrix multiply of x (batch_size x input_size) with weight (input_size x hidden_size) is O(batch_size * input_size * hidden_size). Since both input and hidden are 32768, this is O( ~3e9 per batch element ), so for batch_size=128, it's ~4e11 operations. That's way too big for any GPU. So perhaps the problem is designed with smaller numbers, but given the user's input, we have to proceed.
+
+Assuming the problem is as given, perhaps the best way is to fuse the three steps into a single kernel to reduce memory traffic and kernel launch overhead.
+
+Let me outline the steps for the fused kernel:
+
+1. For each sample in the batch:
+
+   a. For each j in 0..hidden_size-1:
+
+      i. Compute the dot product between the input vector x[i] and weight[j].
+
+      ii. Add bias[j] to the result.
+
+      iii. Apply the sigmoid function.
+
+      iv. Accumulate the result into the sample's total.
+
+   b. Store the accumulated sum for sample i.
+
+The key is to do this efficiently in parallel.
+
+However, the problem is that the dot product for each j is O(input_size) operations. Since input_size is 32768, each j requires 32768 multiply-adds. For hidden_size=32768, that's 32768 * 32768 operations per sample. For 128 samples, that's 32768^3 * 128 operations, which is astronomical. This suggests that perhaps the problem's parameters are not realistic, but given the user's input, I have to proceed.
+
+Perhaps there is a mistake in the problem setup, but I'll proceed under the assumption that the numbers are correct and that the fused kernel is the way to go.
+
+Given that, here's the plan for the CUDA kernel:
+
+Each thread block handles one sample. The block has multiple threads. Each thread is assigned to process a set of j indices. Each thread computes the dot product for its assigned j indices, applies the sigmoid, and accumulates the partial sum. The threads in the block then perform a reduction to get the total sum for the sample.
+
+But given the input_size is 32768, even the dot product for a single j would take a long time. So perhaps we need to parallelize the computation of the dot product itself.
+
+Alternatively, for each thread, handle a single j, but then split the dot product computation across multiple threads.
+
+Wait, let's think of the following approach:
+
+Each thread block is assigned to one sample. The block has, say, 256 threads. Each thread is responsible for a range of j indices. For each j in their range:
+
+Compute the dot product between x[i] and weight[j], then apply sigmoid and accumulate.
+
+However, the dot product for each j is 32768 elements, so even with 256 threads, each thread has to compute (32768 / 256) = 128 dot products? No, wait, per thread per j? Wait, no:
+
+Wait, for a single j, the dot product is between x[i] (32768 elements) and weight[j] (32768 elements). So for each j, the dot product requires 32768 multiplications and 32767 additions. To compute this, perhaps each thread can handle a chunk of the elements.
+
+Alternatively, for a given sample and j, the dot product can be computed in parallel across threads within the block.
+
+But this is getting complicated. Let me structure the kernel in steps.
+
+First, let's assume that the kernel will process one sample per block. Each block will process all hidden_size elements for that sample. To handle the dot product computation efficiently, the threads in the block can work together to compute the dot product for each j.
+
+Wait, perhaps for each sample, the kernel proceeds as follows:
+
+For each j in 0 to hidden_size-1:
+
+   1. Compute the dot product between x[i] and weight[j].
+
+      a. To compute this, the threads in the block can each compute a partial sum of the dot product. For example, if there are 256 threads, each thread computes 32768 / 256 = 128 elements of the dot product.
+
+      b. The partial sums are summed to get the total.
+
+   2. Apply sigmoid to the result plus bias[j].
+
+   3. Add this value to a shared memory array for accumulation.
+
+Wait, but this would require multiple steps and synchronization, which may not be efficient.
+
+Alternatively, maybe it's better to first compute all the dot products for all j's for a sample, then apply the sigmoid and sum them. But storing intermediate results may be memory-intensive.
+
+Alternatively, since the final result is the sum over j of sigmoid( ... ), perhaps we can compute each term and accumulate immediately.
+
+Let me outline the CUDA kernel structure:
+
+__global__ void fused_kernel(
+    const float* __restrict__ x,  // input of shape (batch, input_size)
+    const float* __restrict__ weight, // weight of shape (hidden_size, input_size)
+    const float* __restrict__ bias, // bias of shape (hidden_size)
+    float* output, // output of shape (batch, 1)
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    // Each thread in the block handles a portion of the hidden_size
+    // Let's have each thread process a single j, but with multiple threads per block
+    // However, since hidden_size is 32768 and block size is limited (e.g., 1024 threads per block),
+    // each thread must process multiple j's.
+
+    // Each thread processes a range of j indices
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    float sum = 0.0f;
+
+    // Iterate over all j's for this sample
+    for (int j = tid; j < hidden_size; j += num_threads) {
+        // Compute the dot product between x[sample_idx] and weight[j]
+        float dot = 0.0f;
+        for (int k = 0; k < input_size; ++k) {
+            dot += x[sample_idx * input_size + k] * weight[j * input_size + k];
+        }
+        dot += bias[j];
+        // Apply sigmoid
+        float sigmoid_val = 1.0f / (1.0f + expf(-dot));
+        sum += sigmoid_val;
+    }
+
+    // Now, all threads in the block have their partial sums, need to sum them
+    // Use warp-level reduction or block-level reduction
+
+    // Perform reduction within the block
+    __shared__ float shared_sum[256]; // assuming block size <= 256
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+
+    // First, each thread writes its partial sum to shared memory
+    if (tid < num_threads) {
+        shared_sum[tid] = sum;
+    }
+    __syncthreads();
+
+    // Reduction step
+    for (int s = num_threads/2; s > 0; s >>=1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[sample_idx] = shared_sum[0];
+    }
+}
+
+Wait, but this is a very naive implementation and may have many inefficiencies.
+
+First, the inner loop over input_size (32768 elements) is going to be very slow. Each thread has to loop over 32k elements for each j they are responsible for. Since the input_size is large, this approach would have high latency and low arithmetic intensity.
+
+This suggests that this approach is not feasible, and perhaps the problem requires a different approach.
+
+Alternative Idea: The summation over j can be represented as a matrix multiplication followed by a sum.
+
+Wait, the final output is the sum over j of sigmoid( (x * weight^T + bias)[:,j] ), so that's equivalent to the sum over j of the sigmoid of each element in the hidden layer. So the output is the sum over the entire hidden layer's sigmoid outputs for each sample.
+
+Therefore, the result is the sum over all elements of the sigmoid( linear(x) ), but only along the hidden dimension.
+
+Wait, yes. The output is sum_{j} sigmoid(linear(x)[:,j]). So that's equivalent to the sum over the entire hidden layer's activations for each sample.
+
+Therefore, the computation can be expressed as:
+
+output[i] = sum_{j} sigmoid( (x[i] • weight[j]) + bias[j] )
+
+This is the same as the sum over the hidden layer's activations after applying the sigmoid.
+
+Therefore, the fused kernel can be structured to compute this efficiently by leveraging matrix operations.
+
+But how?
+
+The standard approach would be:
+
+1. Compute the linear layer (matrix multiply and add bias) to get a (batch, hidden) tensor.
+
+2. Apply sigmoid to each element.
+
+3. Sum over the hidden dimension.
+
+But this requires storing the intermediate results, which may be memory intensive.
+
+To avoid storing these intermediates and do everything in a single kernel, perhaps we can compute each term on the fly and accumulate the sum.
+
+However, the problem remains with the dot product for each j.
+
+Alternative Idea: Exploit that the sum over j of sigmoid( (x • weight_j) + bias_j ) can be expressed as the sum over j of [1 / (1 + exp( - (x • weight_j + bias_j) )) ]
+
+But unless there's a mathematical identity to combine these terms, it might not help.
+
+Perhaps the only way to proceed is to use matrix multiplication and then sum, but fuse the operations to avoid intermediate storage.
+
+Wait, perhaps use cuBLAS for the matrix multiply, then apply sigmoid and sum in a separate kernel, but that would still require two kernels. Alternatively, use a custom kernel for the matrix multiply and then accumulate the sigmoid sum.
+
+Alternatively, maybe we can use a single kernel that first computes the matrix multiply, stores intermediate values in shared memory, applies the sigmoid, and then sums.
+
+But given the size of the matrices, this may not be feasible.
+
+Wait, let's think of the computation for a single sample. The sum over j of sigmoid( (x • weight_j + bias_j) )
+
+Let me consider the computation for a single j:
+
+Compute the dot product between x and weight_j (input_size elements), add bias_j, apply sigmoid, add to the sum.
+
+The dot product is O(input_size), which is 32768 operations. For hidden_size=32768, this is 32768^2 operations per sample. For 128 samples, that's 32768^2 * 128 ≈ 1.4e12 operations. This is a lot, but perhaps with GPU parallelism, it's manageable?
+
+Wait, the number of threads available is limited. Let's think of the problem in terms of threads:
+
+Suppose we have 128 samples (the batch size). We can assign each sample to a thread block. Each block can have, say, 1024 threads. Each thread can process a certain number of j indices.
+
+The total number of j's per sample is 32768. So per block (sample), we have 32768 j's to process. With 1024 threads per block, each thread would need to process 32768 / 1024 ≈ 32 j's.
+
+For each of their assigned j's, the thread has to compute the dot product of input_size elements (32768), which is O(32768) operations per j. So per thread: 32 * 32768 = ~1 million operations. Multiply by the number of blocks (128), and that's ~128 * 1e6 * 32 = 1.3e9 operations. Wait, that can't be right. Let me recalculate:
+
+Wait, per thread:
+
+Number of j's per thread: 32768 / 1024 = 32 (rounded down). Let's say each thread does 32 j's.
+
+Each j requires 32768 multiply-adds (for the dot product) plus one bias addition and a sigmoid.
+
+Thus, per thread per j: 32768 + 2 operations (approx). For 32 j's, that's 32*(32768 +2) ≈ 1 million operations per thread.
+
+Total operations per block (1024 threads): ~1e6 * 1024 ≈ 1e9 operations per block.
+
+With 128 blocks, total operations would be ~1.28e11 operations. Which is manageable, but the dot product is memory-intensive.
+
+The main problem is the memory access pattern for the weight matrix and input vector.
+
+The input x is of size batch_size x input_size, so for a single sample, it's input_size elements. The weight matrix is hidden_size x input_size.
+
+To compute the dot product between x[i] and weight[j], we need to access x[i][k] and weight[j][k] for all k from 0 to input_size-1.
+
+This requires sequential access to x[i] and random access to weight[j][k]. However, the weight matrix is stored in row-major order, so weight[j][k] is contiguous in memory for fixed j and varying k. Therefore, for each j, the elements weight[j][0], weight[j][1], ..., weight[j][input_size-1] are contiguous. Thus, for a given j, accessing the weight's row is sequential.
+
+Similarly, x[i] is a row in the batch, so x[i][k] is sequential.
+
+Therefore, for a given j and sample i, the dot product can be computed efficiently by accessing the x[i] vector and the weight[j] row sequentially.
+
+However, in the kernel, each thread is handling multiple j's. So for each j assigned to a thread, the thread would loop over k from 0 to input_size-1, accumulating the dot product.
+
+This is going to have a lot of memory accesses, but perhaps it can be optimized using shared memory or caching.
+
+But given the size of input_size (32k), loading the entire x[i] into shared memory might not be feasible. For a block processing one sample, the entire input vector (32k elements) can be stored in shared memory if possible.
+
+Wait, each block handles one sample. So for a sample's input x[i], it has input_size elements (32k). Storing this in shared memory would require 32k * 4 bytes = 128 KB, which is within the shared memory capacity (typically 48 or 96 KB per SM, but this depends on the GPU). Hmm, but 128KB is more than some SM's shared memory. So this may not be feasible.
+
+Alternative Idea: Each thread processes a single j. To compute the dot product for j:
+
+- The thread loops over k from 0 to input_size-1:
+
+   dot += x[i][k] * weight[j][k]
+
+This requires the thread to have access to the entire x[i] vector. Since x is stored in row-major order, x[i][k] can be accessed with a stride of 1 for k. The weight[j][k] is also contiguous in memory.
+
+However, for each j, the thread would have to traverse the entire input_size elements, which is 32k steps. This is a lot of iterations and may have high latency.
+
+Perhaps using vectorized operations (e.g., using float4 or __ldg for coalesced reads) could help, but even so, the loop over k is going to be slow for 32k iterations.
+
+Alternative Idea: Use texture memory or some other form of optimization, but I'm not sure.
+
+Alternatively, precompute the input vector into shared memory for the block. Since each block processes one sample, the entire input vector (32k elements) can be stored in shared memory. Then, each thread can compute its assigned j's dot product by accessing the shared memory x and the global memory weight.
+
+This would reduce the memory bandwidth for accessing x, since it's in shared memory. Let's see:
+
+The shared memory required per block is 32k * 4 bytes = 128KB, which may exceed the available shared memory per block (typically 48 or 96 KB per SM for consumer GPUs like RTX 30 series). So this may not be possible. Alternatively, use smaller blocks.
+
+Wait, let's calculate:
+
+Shared memory per block needed for x[i]: 32768 floats = 131072 bytes (128KB).
+
+If the GPU's SM has 48KB shared memory per block, then this is not possible. Hence, this approach won't work.
+
+Hmm, this is a problem. So perhaps this approach is not feasible.
+
+Alternative Idea: Split the computation into tiles. For example, divide the input_size into chunks (e.g., 128 elements each) and have threads compute partial sums for these chunks.
+
+But this requires more complex code.
+
+Alternatively, given that this problem might be too computationally intensive to be feasible with a custom kernel, perhaps the best approach is to use cuBLAS for the matrix multiplication and then apply the sigmoid and sum in a separate kernel. But the user wants to replace the operators with custom kernels.
+
+Alternatively, maybe the user expects us to realize that the final sum over the sigmoid outputs can be written as the sum over the matrix multiplied by a vector of ones. Wait, let's see:
+
+The matrix multiplication result is M = x * weight^T + bias (shape batch x hidden).
+
+The sigmoid is applied element-wise, then summed over hidden dimension. So the output is sum_{j} sigmoid(M[:,j]).
+
+This is equivalent to the sum over all elements of the sigmoid(M) matrix along the hidden dimension.
+
+Therefore, the output can be written as the sum over the hidden dimension of the element-wise sigmoid of (x * weight^T + bias).
+
+Therefore, the computation can be broken down into:
+
+1. Compute the matrix multiply (x @ weight^T) → shape (batch, hidden).
+
+2. Add the bias to each element → same shape.
+
+3. Apply sigmoid to each element → same shape.
+
+4. Sum over the hidden dimension → (batch, 1).
+
+Therefore, perhaps the most efficient way is to use cuBLAS for step 1, then a custom kernel for steps 2-4.
+
+However, the user wants to replace operators with custom kernels. So perhaps we can write a kernel that combines steps 2-4.
+
+Alternatively, even step 1 can be done in a custom kernel to fuse with the subsequent steps.
+
+But given the time constraints, perhaps it's better to proceed with the fused kernel approach, even if the implementation is not optimal.
+
+Let me try to write the CUDA kernel code.
+
+First, the fused kernel will process one sample per block. Each block will compute the sum over j of sigmoid( (x[i] • weight[j]) + bias[j] ).
+
+The steps for the kernel:
+
+- Each block is assigned to a sample.
+
+- The block loads the input vector x[i] into shared memory.
+
+- Each thread in the block processes a range of j indices.
+
+- For each j assigned to a thread:
+
+   a. Compute the dot product between x[i] and weight[j], using the shared memory copy of x[i].
+
+   b. Add bias[j].
+
+   c. Apply sigmoid.
+
+   d. Add to a partial sum.
+
+- The block then reduces the partial sums to get the total for the sample.
+
+Now, the code outline:
+
+First, the shared memory for x[i] is 32768 floats, which is 128KB. Assuming the GPU has enough shared memory, this is feasible.
+
+The kernel code:
+
+__global__ void fused_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* output,
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    const int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    // Load x[sample_idx] into shared memory
+    extern __shared__ float shared_x[];
+    int tid = threadIdx.x;
+    if (tid < input_size) {
+        shared_x[tid] = x[sample_idx * input_size + tid];
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+
+    // Each thread processes a range of j indices
+    for (int j = tid; j < hidden_size; j += blockDim.x) {
+        float dot = 0.0f;
+        for (int k = 0; k < input_size; ++k) {
+            dot += shared_x[k] * weight[j * input_size + k];
+        }
+        dot += bias[j];
+        float sigmoid_val = 1.0f / (1.0f + expf(-dot));
+        sum += sigmoid_val;
+    }
+
+    // Reduce the partial sums
+    __shared__ float partial_sums[1024]; // assuming block size <=1024
+    partial_sums[tid] = sum;
+    __syncthreads();
+
+    // Block reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_sums[tid] += partial_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[sample_idx] = partial_sums[0];
+    }
+}
+
+This kernel requires that the block size is chosen such that blockDim.x <= hidden_size.
+
+However, the shared memory needed for x is input_size * sizeof(float). For input_size=32768, this requires 32768 * 4 bytes = 131072 bytes, which is 128KB. The maximum shared memory per block depends on the GPU. For example, on an Ampere GPU, the maximum is 96KB per SM for compute capability 8.6, but this might vary. So this kernel may not be feasible due to shared memory constraints.
+
+Thus, this approach might not work. So maybe we need to proceed without shared memory.
+
+Alternative approach without shared memory:
+
+Each thread reads the x[sample][k] from global memory directly. This may have better performance if the accesses are coalesced.
+
+The kernel would look like:
+
+__global__ void fused_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* output,
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    const int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    float sum = 0.0f;
+
+    // Each thread processes a range of j indices
+    int tid = threadIdx.x;
+    for (int j = tid; j < hidden_size; j += blockDim.x) {
+        float dot = 0.0f;
+        for (int k = 0; k < input_size; ++k) {
+            dot += x[sample_idx * input_size + k] * weight[j * input_size + k];
+        }
+        dot += bias[j];
+        float sigmoid_val = 1.0f / (1.0f + expf(-dot));
+        sum += sigmoid_val;
+    }
+
+    // Reduce the partial sums within the block
+    __shared__ float partial_sums[1024];
+    partial_sums[tid] = sum;
+    __syncthreads();
+
+    // Reduction steps here as before
+
+    if (tid == 0) {
+        output[sample_idx] = partial_sums[0];
+    }
+}
+
+However, the issue here is that for each j, the thread has to read x[sample][k] for k from 0 to input_size-1. Since x is stored in row-major order, accessing x[sample][k] for k=0 to input_size-1 is sequential in memory, so this is okay. However, each thread in the block is doing this for different j's, so the accesses to weight are not coalesced. The weight is stored in row-major, so weight[j][k] is contiguous for fixed j. So for a given j, the thread accesses the weight row sequentially, which is good. But since each thread is handling different j's, their accesses to weight will be non-coalesced, leading to possible memory inefficiency.
+
+This might still be manageable, but it's hard to say without testing.
+
+Now, the kernel's performance depends on the block size. Let's choose a block size of 256 threads. Then each thread handles approximately 32768 / 256 = 128 j's. For each j, the thread has to loop over 32768 elements for the dot product. So for each j, that's 32768 operations. For 128 j's, that's 128 * 32768 = 4,200, 992 operations per thread. Multiply by 256 threads per block, that's over a billion operations per block. But the kernel's efficiency will be limited by the

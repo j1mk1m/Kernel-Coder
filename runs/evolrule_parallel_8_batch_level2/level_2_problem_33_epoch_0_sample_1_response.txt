@@ -1,0 +1,787 @@
+Also, in your answer, first list the operators you replace, then the optimizations, then the new ModelNew class. 
+
+    You can use multiple kernels. For example, you can combine multiple operators into one kernel (e.g., matmul + scaling + batch norm) if that leads to better performance. But if doing so is too difficult, you can choose to replace individual operators. 
+
+    The goal is to maximize performance improvement. 
+
+My answer:
+
+First, I will analyze the given architecture. The model has three main operations:
+
+1. Linear layer (gemm)
+2. Scaling by learned parameter
+3. Batch normalization
+
+The current implementation uses PyTorch's built-in operators for these steps. To improve performance, we can consider fusing these operations into a single CUDA kernel to reduce memory copies and kernel launch overhead. 
+
+Specifically, the linear layer (matrix multiplication) followed by scaling and batch norm can be fused into one kernel. This avoids intermediate memory storage and multiple kernel launches. 
+
+Potential optimizations:
+
+- Fusion of gemm + scaling + batch norm into a single kernel.
+- Using Tensor Cores for matrix multiplication (if input dimensions are compatible)
+- Vectorization and thread coalescing for memory access
+- Reducing redundant computations in batch norm (since it's applied after scaling, maybe some computations can be merged)
+
+However, implementing fused batch norm is non-trivial. Let me think step by step:
+
+First, the linear layer is a matrix multiply of input (1024x8192) with weight (8192x8192). Then scaling is element-wise multiplication by scale parameter (8192 elements). Then batch norm computes mean/variance over the batch.
+
+Wait, batch norm for 1D data (BatchNorm1d) calculates statistics across the batch dimension (0) and features (1). Wait, for BatchNorm1d, the input is (N, C, ...) where C is the channel dimension. Here the input is (batch_size, out_features), so the batch norm is over the batch dimension? Or over the features?
+
+Wait, no. For BatchNorm1d, the normalization is over the batch and spatial dimensions, keeping the features (second dimension) as the channels. So for input of shape (N, C), it normalizes over N, so each feature in C has its own mean/variance.
+
+Therefore, the batch normalization requires computing mean and variance across the batch dimension (first dimension) for each feature (second dimension). 
+
+Fusing this into a single kernel with the gemm and scaling would require:
+
+1. Compute the matrix multiplication (gemm)
+2. Multiply by scale
+3. Compute mean and variance over batch dimension for each feature
+4. Apply batch norm using these statistics
+
+But steps 3 and 4 depend on the results of steps 1 and 2, so they must be computed in sequence. However, the computation of mean and variance can be done in parallel, but it's a reduction operation over the batch dimension.
+
+Fusing all steps into a single kernel might be complex, but let's see:
+
+First, the matrix multiplication is the most compute-intensive part. The scaling is just an element-wise multiply. The batch norm involves reduction steps and then application of the normalized values.
+
+Perhaps it's better to first try to combine the gemm and scaling into a single kernel, since they are both element-wise operations after the matrix multiply. 
+
+Wait, the scaling is an element-wise multiplication by a vector (scale_shape is (out_features,)), so after the gemm (matrix multiply) which produces a (batch_size, out_features) tensor, multiplying by the scale parameter (applied along the feature dimension) would be an element-wise multiplication where each element of the scale is multiplied by the corresponding feature across the batch.
+
+So after the gemm, each element in the output tensor is x[i][j] = sum_{k} input[i][k] * weight[j][k], then scaled by scale[j].
+
+Therefore, the scaling can be incorporated into the gemm computation. Instead of first computing the gemm and then multiplying by scale, we can multiply the weight matrix by the scale parameter before the matrix multiply. 
+
+Wait, let's think:
+
+Suppose scale is a vector of shape (out_features, ), then scaling the gemm result is equivalent to:
+
+x = (input @ weight) * scale 
+
+This can be rewritten as:
+
+x = input @ (weight * scale.view(1, out_features))
+
+Because multiplying the weight matrix by scale (broadcasted over the input dimension) before the matrix multiply would give the same result.
+
+Therefore, this scaling can be absorbed into the weight matrix, eliminating the need for a separate scaling step. However, this requires modifying the weight matrix with the scale during the forward pass, but since the scale is a learnable parameter, this may complicate the backward pass.
+
+Alternatively, perhaps during the forward pass, we can compute the scaled weight once (weight * scale), then perform the matrix multiply with the input. This way, the scaling is merged into the gemm operation, saving an element-wise multiply.
+
+However, the scale is a parameter that needs to be learned, so during training, the gradient for the scale would be part of the weight's gradient. Wait, but if we do weight_scaled = weight * scale, then the gradient for scale would be the sum over the gradients of the weight scaled by the corresponding weight elements.
+
+Alternatively, the scaling can be incorporated into the gemm computation, so that the kernel performs:
+
+for each output element x[i,j] = sum_k (input[i,k] * (weight[j,k] * scale[j]))
+
+Thus, the kernel can compute this in a single step, eliminating the need for a separate scaling step. This would save the time of the element-wise multiplication and also avoid storing an intermediate tensor.
+
+This seems promising. So combining the gemm and scaling into a single step.
+
+Then, the batch norm is another operation. But batch norm requires computing the mean and variance over the batch for each feature. 
+
+The batch norm computation can also be incorporated into the same kernel? Maybe not straightforward. Let's see:
+
+The batch norm steps are:
+
+1. Compute mean_j = mean over batch (x[:,j]) for each j in 0..out_features-1
+
+2. Compute var_j = variance over batch (x[:,j]) for each j
+
+3. Normalize: x_hat = (x - mean)/(sqrt(var + eps))
+
+4. Scale and shift by gamma and beta parameters (but in the given code, the model uses nn.BatchNorm1d, which includes learnable parameters gamma and beta).
+
+Wait, the given model's BatchNorm1d includes both scaling and shifting, so the batch norm operation is:
+
+x = (x - mean) / sqrt(var + eps) * gamma + beta
+
+So, after the gemm and scaling, we need to compute the batch norm, which involves:
+
+- Reduction (mean/var) over the batch dimension for each feature
+- Applying the normalization formula
+
+The reduction steps (mean and variance) can be parallelized across features, but each feature requires a reduction over the batch. Since the batch size is 1024, which is a large number, this requires efficient reduction.
+
+Alternatively, can we combine the gemm+scaling and the batch norm into a single kernel? Let's think:
+
+First, the gemm+scaling produces x = input @ (weight * scale). Then, we need to compute the mean and variance for each feature. 
+
+The problem is that the mean and variance depend on all elements in the batch for each feature. So, after computing x, we can compute the mean and variance in a separate kernel, then apply the batch norm in another kernel.
+
+However, doing this in a single kernel would require each thread to compute both the gemm and the reduction for mean/var. This might complicate the kernel, but perhaps possible.
+
+Alternatively, since the batch norm's mean and variance are computed across the batch, and the gemm is a matrix multiply, perhaps we can structure the computation such that each feature's computation is handled by a block, and within the block, threads compute the gemm contributions and accumulate the sums for mean and variance.
+
+This might be complex but feasible.
+
+Alternatively, perhaps it's easier to first combine the gemm+scaling into a single kernel, then handle the batch norm as a separate kernel. Let me outline steps:
+
+First, the original steps are:
+
+1. GEMM: input (1024x8192) @ weight (8192x8192) → output (1024x8192)
+
+2. Scaling: multiply each element by scale[j], so output[j] *= scale[j]
+
+3. BatchNorm1d: compute mean/var over batch for each feature, then normalize and scale/shift by gamma and beta.
+
+If we can combine steps 1 and 2 into a single kernel, that would save one step. Let's proceed with that first.
+
+So, first, implement a custom GEMM kernel that incorporates the scaling by the scale parameter.
+
+Then, handle the batch norm in a separate kernel or using existing PyTorch operators.
+
+Alternatively, even better, can we combine gemm+scaling+batch norm into a single kernel? Let's see.
+
+The steps would be:
+
+For each output element (i,j):
+
+x_ij = sum_k (input_ik * (weight_jk * scale_j))
+
+Then compute mean_j = mean over i of x_ij
+
+var_j = var over i of x_ij
+
+Then compute normalized_x_ij = (x_ij - mean_j)/sqrt(var_j + eps)
+
+Then apply gamma_j and beta_j (from BatchNorm):
+
+result_ij = normalized_x_ij * gamma_j + beta_j
+
+So, all these steps can be done in a single kernel, but the challenge is that mean and variance depend on all i for each j, so they have to be computed as reductions.
+
+This complicates things because the kernel would need to first compute all the x_ij, then compute the means and vars, then apply the normalization.
+
+But in a single kernel, this would require:
+
+1. Compute all x_ij (the gemm+scaling)
+
+2. Compute the reductions for mean and var for each j. But reductions need to be done across all i for each j.
+
+This would require a two-step process: first compute x_ij, then compute the reductions, then apply normalization. But doing this in a single kernel may not be straightforward.
+
+Alternatively, split into two kernels: first gemm+scaling, then batch norm.
+
+Alternatively, the gemm+scaling can be done in one kernel, then the batch norm can be implemented in another kernel, but with optimized code.
+
+Alternatively, let's see what is the computational cost of each step.
+
+The GEMM is O(batch_size * in_features * out_features). For 1024x8192x8192, this is 1024*8192^2 ≈ 6.87e10 FLOPS. That's the dominant term.
+
+The scaling is O(batch_size * out_features) ≈ 1024*8192 ≈ 8.4e6 FLOPS, negligible compared to GEMM.
+
+Batch norm involves:
+
+- For each feature j:
+
+   - Compute mean: O(batch_size)
+
+   - Compute variance: O(batch_size)
+
+   - Apply normalization: O(batch_size)
+
+So total for batch norm is O(out_features * batch_size) * 3 ≈ 3 * 8192 * 1024 ≈ 2.5e7 FLOPS, still negligible compared to GEMM.
+
+Thus, the main optimization opportunity is in the GEMM step, and perhaps reducing memory traffic.
+
+Wait, but the problem is not just FLOPS, but memory bandwidth and kernel launch overhead.
+
+The original implementation uses PyTorch's Linear layer, which is implemented with efficient kernels, perhaps cuBLAS. So replacing that with a custom kernel might not give a speedup unless we can fuse with other operations or find a more efficient way.
+
+Alternatively, maybe the scaling can be incorporated into the weight matrix, so the gemm is done with the scaled weights, eliminating the need for an explicit scaling step. That would save some computation and memory bandwidth, as we avoid the element-wise multiplication.
+
+But even better, if we can fuse the GEMM with the batch norm's computations, but that's more complex.
+
+Alternatively, let's think of the batch norm computation steps. Since the batch norm requires computing the mean and variance across the batch, perhaps we can compute these reductions while performing the GEMM.
+
+Wait, here's an idea:
+
+The GEMM produces x = input @ (weight * scale). Let me denote the scaled weight as W_scaled = weight * scale.
+
+Then, the batch norm requires for each feature j:
+
+mean_j = (1/N) * sum_{i=1}^N x_ij
+
+var_j = (1/N) * sum_{i=1}^N (x_ij - mean_j)^2
+
+But x_ij = sum_k input_ik * W_scaled_jk
+
+So, to compute mean_j, it's sum_i x_ij / N = [sum_i sum_k input_ik * W_scaled_jk ] / N = sum_k W_scaled_jk * [sum_i input_ik] / N
+
+Wait, this is interesting. The mean_j can be expressed as the dot product of W_scaled_j with the mean of the input's columns.
+
+Let me see:
+
+Let me denote input as a matrix where each column is a feature (k), and each row is a sample (i). So input has size N (batch) x K (in_features).
+
+Then, W_scaled is a matrix of size O (out_features) x K.
+
+Then x_ij = sum_{k} W_scaled_jk * input_ik
+
+The mean_j is (1/N) * sum_i x_ij = (1/N) * sum_i sum_k W_scaled_jk input_ik
+
+= sum_k W_scaled_jk [ (1/N) sum_i input_ik ]
+
+Let me denote the mean of the input's k-th feature as mean_in_k = (1/N) sum_i input_ik.
+
+Then, mean_j = sum_{k} W_scaled_jk * mean_in_k
+
+So the mean_j can be computed as the dot product of the j-th row of W_scaled with the vector of input means.
+
+Similarly, the variance computation might be expressible in terms of the input's covariance, but that might be more complex.
+
+If this is the case, then the mean for each output feature can be computed as the dot product of the corresponding row of W_scaled with the input's mean vector.
+
+This is a key insight. Therefore, the mean for each j can be computed without needing to compute all x_ij first.
+
+Similarly, perhaps the variance can be expressed in terms of the input's covariance matrix.
+
+If this is possible, then the computation of the batch norm's mean and variance can be done efficiently, possibly allowing the entire computation to be structured in a way that avoids storing the entire x matrix.
+
+However, this requires more detailed derivation:
+
+Let me re-derive:
+
+x_ij = sum_{k} W_scaled_jk * input_ik
+
+Compute mean_j:
+
+mean_j = (1/N) sum_{i=1}^N x_ij = (1/N) sum_i sum_{k} W_scaled_jk input_ik
+
+= sum_{k} W_scaled_jk ( (1/N) sum_i input_ik )
+
+= sum_{k} W_scaled_jk * mean_in_k
+
+Similarly, variance_j:
+
+var_j = (1/N) sum_i (x_ij - mean_j)^2
+
+Expand x_ij - mean_j:
+
+= sum_{k} W_scaled_jk (input_ik - mean_in_k )
+
+Because:
+
+x_ij - mean_j = sum_{k} W_scaled_jk input_ik - sum_{k} W_scaled_jk mean_in_k
+
+= sum_{k} W_scaled_jk (input_ik - mean_in_k)
+
+Thus,
+
+var_j = (1/N) sum_i [ sum_{k} W_scaled_jk (input_ik - mean_in_k) ]^2 
+
+This is a quadratic form. Expanding it:
+
+var_j = (1/N) sum_i sum_{k1} W_scaled_jk1 (input_ik1 - mean_in_k1) sum_{k2} W_scaled_jk2 (input_ik2 - mean_in_k2 )
+
+= sum_{k1,k2} W_scaled_jk1 W_scaled_jk2 [ (1/N) sum_i (input_ik1 - mean_in_k1)(input_ik2 - mean_in_k2) ) ]
+
+The term in brackets is the covariance between features k1 and k2 of the input.
+
+Let covariance_in_{k1,k2} = (1/N) sum_i (input_ik1 - mean_in_k1)(input_ik2 - mean_in_k2)
+
+Thus,
+
+var_j = sum_{k1,k2} W_scaled_jk1 * W_scaled_jk2 * covariance_in_{k1,k2}
+
+Therefore, both the mean and variance of the output can be computed using the mean and covariance of the input, without needing to compute the entire x matrix.
+
+This is a significant insight! Therefore, the batch norm's mean and variance can be computed as follows:
+
+1. Compute the mean of the input features (mean_in vector of size K)
+
+2. Compute the covariance matrix of the input (K x K matrix)
+
+3. For each output feature j:
+
+   a. Compute mean_j = W_scaled_j • mean_in (dot product)
+
+   b. Compute var_j = W_scaled_j^T • covariance_in • W_scaled_j (quadratic form)
+
+This allows us to compute the mean and variance of the output without actually computing the entire x matrix, which is a huge saving in terms of memory and computation.
+
+However, the covariance matrix is K x K, which for K=8192 would be 67 million elements. Computing and storing this covariance matrix would be very memory-intensive (about 67MB * 4 bytes = 268MB for a float matrix). But with K=8192, that's 8192x8192 elements, which is 67 million elements, which is 268MB. That's a lot of memory, and the computation of the covariance would be O(N*K^2), which for N=1024 and K=8192 would be 1024*8192^2 = 6.8e10 operations, which is way more than the original GEMM computation. So this approach might not be feasible computationally.
+
+Therefore, this approach might not be practical due to the large computational and memory costs of the covariance matrix.
+
+Therefore, perhaps this line of thinking is not viable.
+
+Alternative idea: Let's return to fusing the GEMM and scaling into a single kernel, and then implement batch norm in an optimized way.
+
+First, let's implement a custom GEMM kernel that incorporates the scaling by the scale parameter. Since the scaling is applied after the GEMM, but can be merged into the weight matrix.
+
+Wait, as I thought earlier, scaling the output of GEMM by scale_j is equivalent to scaling each row of the weight matrix by scale_j before the GEMM. Because:
+
+x_ij = sum_k (input_ik * weight_jk) * scale_j
+
+= sum_k (input_ik * (weight_jk * scale_j))
+
+Therefore, if we precompute the scaled weights (weight_scaled_jk = weight_jk * scale_j), then the GEMM can be done with the scaled weights, eliminating the need for a separate scaling step.
+
+Thus, the GEMM with scaled weights is equivalent to GEMM followed by scaling.
+
+This way, we can eliminate the scaling step, saving an element-wise multiplication and an intermediate tensor.
+
+Therefore, this is a worthwhile optimization.
+
+Next, the batch norm step.
+
+Implementing batch norm with a custom kernel.
+
+The batch norm requires computing the mean and variance over the batch dimension for each feature. This is a reduction operation. The existing PyTorch implementation likely does this efficiently, but we can try to optimize it further.
+
+Alternatively, perhaps we can combine the batch norm into the same kernel as the GEMM.
+
+Wait, let's think:
+
+The GEMM produces x_ij = sum_k (input_ik * weight_scaled_jk)
+
+To compute the mean_j = (1/N) sum_i x_ij
+
+Similarly, variance_j = (1/N) sum_i (x_ij - mean_j)^2
+
+These can be computed as:
+
+mean_j = (1/N) * sum_i x_ij
+
+var_j = (1/N) * sum_i (x_ij^2) - mean_j^2
+
+Wait, that's another formula for variance:
+
+var = E[x^2] - (E[x])^2
+
+So, variance_j = (sum_i x_ij^2)/N - (mean_j)^2
+
+This requires computing sum_i x_ij and sum_i x_ij^2 for each j.
+
+These sums can be accumulated as part of the GEMM computation.
+
+Therefore, here's the plan:
+
+1. Compute the GEMM with scaled weights (weight_scaled = weight * scale), resulting in x_ij.
+
+2. While computing x_ij, also accumulate the sum of x_ij and the sum of x_ij^2 for each j.
+
+   This way, after the GEMM, we have for each j:
+
+   sum_xj = sum_i x_ij
+
+   sum_xj_sq = sum_i x_ij^2
+
+   Then, mean_j = sum_xj / N
+
+   var_j = (sum_xj_sq / N) - mean_j^2
+
+3. Then, compute the normalized x_ij:
+
+   x_normalized_ij = (x_ij - mean_j) / sqrt(var_j + eps)
+
+4. Apply the batch norm's gamma and beta parameters:
+
+   output_ij = x_normalized_ij * gamma_j + beta_j
+
+Therefore, if we can compute the GEMM and the sums for mean and variance in a single kernel, we can eliminate the need for separate reduction kernels. The GEMM would be extended to also compute the per-j sums, then the batch norm steps can be done in a subsequent kernel that uses those sums.
+
+This approach would require:
+
+- A single kernel to compute x_ij, sum_xj, sum_xj_sq
+
+- Then, compute mean and var from the sums
+
+- Then, another kernel to compute the normalized values and apply gamma and beta.
+
+This reduces the number of kernels from 3 (GEMM, scaling, batch norm) to 2 (GEMM+sums, batch norm), but more importantly, the first kernel can handle all the necessary computations.
+
+But the challenge is efficiently accumulating the sums for each j across all i.
+
+The GEMM is a matrix multiplication, which is typically parallelized across the output elements. For example, in a tiled approach, each thread block handles a tile of the output matrix.
+
+To accumulate sum_xj and sum_xj_sq for each j, we need to have some way of accumulating these values across all i for each j.
+
+Alternatively, we can structure the computation such that for each j, the contributions from all i are accumulated.
+
+Wait, perhaps the following approach:
+
+The output x has dimensions [N x O], where N is batch_size, O is out_features.
+
+For each j (output feature):
+
+   x_ij for all i are the entries in column j of x.
+
+The sum over i of x_ij is the sum of column j.
+
+Similarly, sum_xj_sq is the sum of squares of column j.
+
+Therefore, for each j, we need to compute the sum of column j and the sum of squares of column j.
+
+The problem is that each thread block can process multiple j's or multiple i's.
+
+Alternatively, we can process each column j independently.
+
+For each j:
+
+   Compute x_ij for all i, sum them to get sum_xj, and sum the squares to get sum_xj_sq.
+
+But doing this for each j in parallel.
+
+This would require that for each j, all i are processed to compute the column's entries, and their sums.
+
+But how to parallelize this?
+
+Perhaps the kernel can be structured as follows:
+
+Each thread block is responsible for a single output feature j. Within the block, threads process different input indices i.
+
+For each thread in the block (handling i from 0 to N-1):
+
+   Compute x_ij = sum_k input_ik * weight_scaled_jk
+
+   Accumulate x_ij to a per-block sum_xj and sum_xj_sq.
+
+Wait, but summing across all i for each j:
+
+Each thread block handles one j. The block has enough threads to cover all N elements (if N is 1024, then a block of 1024 threads can handle it). 
+
+Wait, but 1024 threads per block is possible (max is 1024). 
+
+So for each j:
+
+   Launch a thread block with N threads (assuming N <= 1024, which it is here: N=1024).
+
+   Each thread i computes x_ij for their i, then accumulates to shared memory for sum_xj and sum_xj_sq.
+
+But this requires the weight_scaled_jk to be accessible. Since weight_scaled is a matrix of size O x K, and K is 8192, storing all of it might be a problem in shared memory.
+
+Alternatively, for each j, the weight_scaled_jk is a row vector of length K.
+
+To compute x_ij = sum_{k} input_ik * weight_scaled_jk, each thread i (handling a particular i) needs to compute this sum for their i and the current j.
+
+But to compute this sum for a particular j and all i:
+
+The input is a matrix of N x K. For a given j, we need to read the entire weight_scaled_j row (length K), and for each i, compute the dot product of input[i,:] with weight_scaled_j.
+
+Thus, the computation for each j requires reading the weight_scaled_j vector (size K), and the entire input matrix's rows for all i (size N*K).
+
+This might be a memory bandwidth bottleneck.
+
+Alternatively, perhaps it's better to structure the computation in a way that is more cache-friendly, but given that we're on the GPU, it's about coalesced memory access.
+
+Alternatively, perhaps this approach is not efficient, and a better way is to do the GEMM first, then compute the column sums for mean and variance.
+
+Wait, but the original approach of doing the GEMM with scaled weights first, then compute the column sums for mean and variance.
+
+The GEMM with scaled weights can be done with cuBLAS, which is already optimized. So replacing it with a custom kernel may not gain much, but fusing with the column sum computations might help.
+
+Alternatively, perhaps it's better to first implement the fused GEMM + scaling + batch norm as a single kernel.
+
+Wait, let's try to outline the steps for a fused kernel:
+
+The fused kernel will:
+
+1. For each output element x_ij (i in 0..N-1, j in 0..O-1):
+
+   a. Compute x_ij = sum_{k} input_ik * weight_scaled_jk
+
+   b. Accumulate x_ij to per-j sum_xj and sum_xj_sq (using atomic operations or shared memory)
+
+But this requires, for each j, to have all the x_ij computed and summed. To do this efficiently, perhaps the kernel can be organized as follows:
+
+- Each thread block processes a block of j's (e.g., 32 j's per block)
+
+- For each j in the block:
+
+   - Each thread in the block handles a portion of the i's (e.g., threads 0..255 handle i=0..255, etc.)
+
+   - Compute the dot product for each i and j, accumulate into shared memory for sum_xj and sum_xj_sq
+
+However, this may not be efficient due to the high dimensionality.
+
+Alternatively, we can process the computation in tiles, similar to matrix multiplication.
+
+The standard matrix multiplication (GEMM) is often tiled to optimize for shared memory usage and coalesced access. 
+
+Perhaps we can adapt such a tiled approach here.
+
+Let me outline a possible kernel structure:
+
+Each thread block is responsible for a tile of the output matrix:
+
+- Tile dimensions: T_N x T_O (e.g., 16x16), but given the large sizes, maybe T_N=16, T_O=16, and the grid is (ceil(N / T_N), ceil(O / T_O))
+
+Wait, but in our case, the output is N x O, so each thread block could handle a T_N x T_O tile. However, to compute the column sums, we need to accumulate across all i for each j.
+
+Alternatively, perhaps the kernel can compute the GEMM in a standard tiled manner, and also accumulate per-j sums.
+
+Alternatively, the problem is that the per-j sums need to be accumulated over all i, so for each j, all i's contributions must be summed.
+
+This is a reduction over the i dimension for each j.
+
+To compute this efficiently, we can use a reduction kernel.
+
+First, perform the GEMM (with scaled weights) to get the x matrix.
+
+Then, perform a reduction over each column (j) to compute the sum and sum of squares.
+
+However, this would require storing the x matrix, which is N x O = 1024 x 8192 = ~8 million elements, which is about 32MB (float). This is manageable on a GPU.
+
+The steps would be:
+
+1. Compute x = input @ weight_scaled (using cuBLAS, which is efficient)
+
+2. Compute sum_xj = sum_i x_ij for each j (reduction over i)
+
+3. Compute sum_xj_sq = sum_i x_ij^2 for each j
+
+4. Compute mean_j = sum_xj / N
+
+5. Compute var_j = (sum_xj_sq / N) - mean_j^2
+
+6. Normalize each x_ij: (x_ij - mean_j)/sqrt(var_j + eps)
+
+7. Apply gamma and beta: result_ij = normalized_ij * gamma_j + beta_j
+
+Steps 2-7 can be done with custom kernels or existing PyTorch functions.
+
+But even if steps 2-7 are done with PyTorch, perhaps there's a speedup by fusing steps 6 and 7 into a single kernel, avoiding multiple memory copies.
+
+Alternatively, using custom kernels for the reductions and normalization might be faster.
+
+Let me think about the computational steps:
+
+- The GEMM is the most expensive part, but using cuBLAS is likely as fast as possible.
+
+- The reductions (sum over i for each j) can be implemented with a custom kernel that efficiently processes the columns.
+
+- The normalization and application of gamma/beta can be done in a single element-wise kernel.
+
+Thus, the main optimizations would be:
+
+- Pre-scaling the weights (weight_scaled = weight * scale) to eliminate the explicit scaling step.
+
+- Implementing the reductions and normalization with custom CUDA kernels to minimize kernel launch overhead and maximize memory coalescing.
+
+Let's proceed to code.
+
+First, pre-scaling the weights:
+
+In the model's forward pass, we can compute the scaled weights once per forward pass, since the scale is a parameter that can change each step.
+
+Wait, but in the model definition, the scale is a parameter (nn.Parameter), so it's stored and updated during training. So, during the forward pass, we need to compute weight_scaled = weight * scale.
+
+But multiplying the weight matrix (8192x8192) by the scale vector (8192 elements) would require a broadcasted multiplication along the rows.
+
+This can be done efficiently on the GPU with a vector multiply. For example:
+
+weight_scaled = weight * scale.view(1, -1)
+
+This is an element-wise multiplication of the weight matrix by a row vector, so each row of the weight matrix is multiplied by the corresponding element of scale.
+
+This operation can be done quickly on the GPU.
+
+Therefore, the first step is to compute this scaled weight matrix.
+
+Then, perform the GEMM with the scaled weights.
+
+Next, compute the column sums for the mean and variance.
+
+To compute sum_xj and sum_xj_sq, we can launch a kernel that processes each column (j) in parallel.
+
+Each thread block can handle a single column j.
+
+Within the block, each thread processes a portion of the rows (i):
+
+For each j (blockIdx.x):
+
+   sum_xj = 0
+
+   sum_xj_sq = 0
+
+   for i in 0..N-1:
+
+       val = x[i][j]
+
+       sum_xj += val
+
+       sum_xj_sq += val * val
+
+   write sum_xj and sum_xj_sq to global memory
+
+This is a straightforward reduction over the rows for each column. The problem is that for N=1024, each column has 1024 elements, and with 8192 columns, the total number of operations is 8192 * 1024 * 2 (for sum and sum_sq). This is manageable.
+
+However, the kernel might have a lot of blocks (8192), but this is acceptable.
+
+This can be implemented as:
+
+__global__ void column_sum_kernel(float* x, float* sum_x, float* sum_x_sq, int N, int O) {
+
+    int j = blockIdx.x;
+
+    if (j >= O) return;
+
+    float sum = 0.0f;
+
+    float sum_sq = 0.0f;
+
+    for (int i = 0; i < N; i++) {
+
+        float val = x[i * O + j]; // assuming row-major storage
+
+        sum += val;
+
+        sum_sq += val * val;
+
+    }
+
+    sum_x[j] = sum;
+
+    sum_x_sq[j] = sum_sq;
+
+}
+
+This kernel would require O blocks and each block has 1 thread (or more threads if unrolling, but with N=1024, a single thread per block is okay).
+
+Wait, but for N=1024, a single thread would loop 1024 times, which might be slow. To parallelize this loop, perhaps have multiple threads in a block handle different ranges of i.
+
+For example, each block (processing a column j) has 32 threads, each handling 32 elements of i:
+
+__global__ void column_sum_kernel(float* x, float* sum_x, float* sum_x_sq, int N, int O) {
+
+    int j = blockIdx.x;
+
+    if (j >= O) return;
+
+    extern __shared__ float temp[];
+
+    int tid = threadIdx.x;
+
+    float local_sum = 0.0f;
+
+    float local_sum_sq = 0.0f;
+
+    for (int i = tid; i < N; i += blockDim.x) {
+
+        float val = x[i * O + j];
+
+        local_sum += val;
+
+        local_sum_sq += val * val;
+
+    }
+
+    // Use shared memory to accumulate partial sums
+
+    __syncthreads();
+
+    // perform reduction within block
+
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+
+        if (tid < s) {
+
+            local_sum += temp[tid + s];
+
+            local_sum_sq += temp[tid + s + blockDim.x]; // maybe separate arrays?
+
+        }
+
+        __syncthreads();
+
+    }
+
+    if (tid == 0) {
+
+        sum_x[j] = local_sum;
+
+        sum_x_sq[j] = local_sum_sq;
+
+    }
+
+}
+
+Wait, this requires more careful handling of shared memory.
+
+Alternatively, use a parallel reduction within the block.
+
+The key idea is to have each thread in the block process a portion of the i's, then accumulate their partial sums into shared memory, then perform a reduction within the block.
+
+This way, the per-column reduction can be done in O(log N) steps.
+
+This approach would be more efficient for large N.
+
+Implementing this would be a bit involved but manageable.
+
+Once the sums are computed, the means and variances can be computed as:
+
+mean_j = sum_xj / N
+
+var_j = (sum_xj_sq / N) - mean_j^2
+
+These can be computed in a separate kernel or even on the CPU if feasible (since they are O(O) operations).
+
+Then, the normalization step:
+
+For each element x_ij:
+
+x_normalized_ij = (x_ij - mean_j) / sqrt(var_j + eps)
+
+Then apply gamma and beta:
+
+result_ij = x_normalized_ij * gamma_j + beta_j
+
+This can be done in a single kernel:
+
+__global__ void batch_norm_kernel(float* x, float* mean, float* var, float* gamma, float* beta, float* out, int N, int O, float eps) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= N * O) return;
+
+    int i = idx / O;
+
+    int j = idx % O;
+
+    float mean_j = mean[j];
+
+    float var_j = var[j];
+
+    float x_val = x[idx];
+
+    float inv_std = 1.0f / sqrt(var_j + eps);
+
+    out[idx] = (x_val - mean_j) * inv_std * gamma[j] + beta[j];
+
+}
+
+This kernel can process all elements in parallel.
+
+Now, putting it all together:
+
+The custom kernels would be:
+
+1. The GEMM is done with cuBLAS, but scaled by the scale parameter.
+
+Wait, but scaling the weight matrix before the GEMM:
+
+In the forward pass:
+
+weight_scaled = self.gemm.weight * self.scale.view(1, -1)
+
+Then, x = torch.mm(input, weight_scaled.t())
+
+Wait, in PyTorch, the Linear layer's weight is (out_features, in_features), so the matrix multiply is input (N x in) @ weight.t() (in x out) → N x out.
+
+Therefore, the scaled weight is computed as:
+
+weight_scaled = self.gemm.weight * self.scale.view(1, -1)
+
+Then, x = F.linear(input, weight_scaled.t()) ?
+
+Wait, no, the Linear layer's forward is input @ weight^T + bias. Since we don't have a bias here, but in the original model, the Linear has a bias? Wait, in the given Model definition, the Linear layer is initialized with default parameters (bias=True?), but the forward function doesn't add a bias. Wait, checking the original code:
+
+Original Model class:
+
+class Model(nn.Module):
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):

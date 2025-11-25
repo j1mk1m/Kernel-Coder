@@ -1,0 +1,682 @@
+The above code is for the original architecture. Now, please generate the new optimized code with custom CUDA operators for the given architecture. Let's see, the model is doing matrix-vector multiplication, which is a matmul between a matrix A (MxK) and a vector B (Kx1). The result is Mx1. The dimensions given are M = 256*8=2048, K=131072*8=1048576. So the matrix A is 2048x1048576, which is a very large matrix. The vector B is 1048576x1. 
+
+The problem is to write a custom CUDA kernel to perform this matmul more efficiently than PyTorch's default implementation. The user wants to replace the torch.matmul operator with a custom CUDA kernel. Let's think about how to do this.
+
+First, let's recall how matrix-vector multiplication works. For each row in A, we compute the dot product between that row and the vector B. So the result C[i] = sum_{k=0}^{K-1} A[i,k] * B[k].
+
+The default implementation might be using a general matrix multiplication routine, which could be suboptimal for a vector (since one side is a vector). Maybe we can optimize this by taking advantage of the vector's dimensions.
+
+The key here is to write an efficient CUDA kernel. Let's consider the dimensions:
+
+- A is (M, K) = (2048, 1048576)
+- B is (K, 1), so effectively a vector of K elements.
+- The output C is (M, 1), so a vector of M elements.
+
+The computation is a series of dot products between each row of A and the vector B.
+
+Each thread can compute one element of the output. Since M is 2048, we can have 2048 threads, each computing one row's dot product. However, each thread would need to loop over K elements (1048576), which could be a problem in terms of memory access and latency.
+
+Alternatively, maybe we can use a tiled approach, where each block handles a block of rows, and threads in the block work together to compute the dot product. Let's think of a kernel structure.
+
+First, let's think of the kernel signature. The kernel would take pointers to A, B, and the output C. The size parameters are M and K.
+
+Let's outline the steps:
+
+1. Each thread is assigned a row index i in 0..M-1.
+
+2. For each such row i, the thread computes C[i] = sum_{k=0}^{K-1} A[i][k] * B[k]
+
+But for K=1e6, each thread has to do 1e6 operations. That's a lot. Each thread might have to loop over all K elements. But this could be slow due to memory access. Let's think of the data layout.
+
+In CUDA, accessing A in a row-major manner means that for row i, the elements are contiguous. However, B is a vector of K elements, so it's stored as a contiguous array. So for a given k, B[k] is the same across all rows. 
+
+Wait, but when we compute the dot product for row i, each element of B is multiplied by A[i][k]. So each thread needs to process all K elements of A's row and multiply each by B[k], then accumulate the sum. 
+
+This is going to be memory intensive. Since K is large (1e6), each thread needs to process 1e6 elements. 
+
+But with 2048 threads (since M=2048), each thread has to process 1e6 elements, so total computations are 2e9 operations. But the memory accesses for each thread are sequential through A's row, which is contiguous. So that's good for coalesced access.
+
+The problem is the latency of the loop over 1e6 elements. Maybe we can vectorize the operations or use shared memory to cache parts of B.
+
+Wait, B is a vector, so all threads need the same elements of B. If we can load B into shared memory, then all threads can access it quickly. But B has 1e6 elements, which is 4MB (since each float is 4 bytes). Shared memory per block is limited (like 48KB or 96KB per SM on some GPUs). So that won't be feasible. 
+
+Alternatively, perhaps we can tile the computation. Let's see:
+
+Each thread could handle multiple elements of the row, but since K is large, we can distribute the work.
+
+Alternatively, let's think of using a block of threads to handle one row's computation. For example, each block is responsible for one row (since M=2048, we can have 2048 blocks). Each block has, say, 256 threads, and each thread handles a portion of the K elements.
+
+Wait, but each row has K elements. So for a row, we can split the K elements among threads in a block. Let's formalize this.
+
+Suppose we have a block of threads for each row. Let's say blockDim.x is 256. Then each block has 256 threads, each responsible for K/(256) elements. Each thread computes a partial sum for their portion of the row, and then the block reduces the partial sums to get the final result.
+
+This way, each thread handles K / (blockDim.x) elements. For K=1e6, that's about 3906 elements per thread (if blockDim is 256). This reduces the per-thread loop count, but requires synchronization within the block to accumulate the partial sums.
+
+Alternatively, each thread in a block could process a segment of the K elements and accumulate into a shared memory array, then reduce that array.
+
+Another approach is to use a grid of blocks, each block handles a certain number of rows. For example, let's say each block handles one row, but with multiple threads per block. 
+
+Let me try to outline the kernel structure.
+
+Let's consider each row i of the matrix A is handled by a block. Each block is assigned to a row, and each thread in the block processes a portion of the elements in that row. Since K is large, the number of threads per block can be 256, so each thread would handle K/(256) elements.
+
+Here's a possible kernel outline:
+
+Kernel:
+
+__global__ void matvec_kernel(const float* A, const float* B, float* C, int M, int K) {
+
+    int row = blockIdx.x; // blockIdx.x ranges from 0 to M-1
+
+    // Each thread in the block computes a partial sum over a segment of the row
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    float sum = 0.0f;
+
+    for (int k = tid; k < K; k += num_threads) {
+        sum += A[row * K + k] * B[k]; // A is stored in row-major, so A[row][k] = A[row * K + k]
+    }
+
+    // Now, perform a reduction within the block to get the total sum for the row
+    // Use shared memory to accumulate partial sums
+    __shared__ float shared_sums[256]; // assuming blockDim.x is 256
+
+    shared_sums[tid] = sum;
+    __syncthreads();
+
+    // Now, perform reduction in shared memory
+    // This part can be optimized with a binary reduction
+    for (int s = num_threads/2; s > 0; s >>=1) {
+        if (tid < s) {
+            shared_sums[tid] += shared_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[row] = shared_sums[0];
+    }
+}
+
+The block size here is 256, so each thread processes K/256 elements. The reduction within the block requires shared memory and synchronization. The final result is written to C by the first thread of each block.
+
+The kernel would be launched with M blocks and 256 threads per block.
+
+But first, we need to make sure that the blockDim.x divides K, or at least that the loop can handle cases where K is not a multiple of the block size. However, the for loop with step num_threads (blockDim.x) should cover all elements even if K isn't a multiple.
+
+Now, in terms of memory access:
+
+- For A: each block is working on a single row, so the A data is accessed in a contiguous way. Each thread is accessing a stride of K elements (since the row is K elements). The access pattern for A is contiguous within each thread's loop (since they are stepping through their assigned elements in the row). However, since different threads in the block are working on different parts of the row, the coalescing might not be perfect. Since the threads are in a single block, and the row is contiguous, their accesses are coalesced.
+
+- For B: since B is a vector stored in contiguous memory, each element B[k] is accessed by all threads in the block (but each thread only accesses their own k's). Wait, no. Each thread is looping over their own k's. So for example, thread tid=0 is doing k=0,256,512,... etc. So B[k] is accessed once per thread's iteration. However, since all threads in the block are accessing different k's, but the B array is contiguous, this is also coalesced. So for B, each thread's access is sequential but different threads access different parts of B. Since they are in the same block, but different threads, the coalescing might not be as good, but since B is contiguous, it should be okay.
+
+The main issue with this approach is the amount of computation per thread. Each thread has to loop over K / blockDim.x elements. Since K is 1e6 and blockDim is 256, that's ~3906 iterations per thread, which is a lot. This might lead to high latency. Perhaps we can optimize this by using vectorized loads (e.g., using CUDA's vector types like float4), but that requires alignment and complicates the code.
+
+Alternatively, perhaps using a tiled approach where each thread processes multiple elements at a time. For example, using a loop unrolling or using CUDA's warp-level intrinsics to process multiple elements per thread.
+
+Alternatively, perhaps using a kernel that uses a grid of blocks, each block handling multiple rows and threads handling multiple elements.
+
+Another idea: since the vector B is the same for all rows, perhaps we can precompute some transformations or use shared memory to store B's elements, but as mentioned before, B is 1e6 elements, which is too big for shared memory.
+
+Alternatively, transpose A so that the rows are in a column-major format, but that might not help.
+
+Alternatively, use a kernel that processes multiple rows in parallel, with each thread handling multiple rows. For example, each block handles a block of rows and each thread processes a set of columns for those rows. But this requires more complex indexing.
+
+Alternatively, let's think of the problem as a matrix-matrix multiplication, where B is a matrix of size Kx1, so the result is Mx1. The standard matrix multiplication is C = A * B. The standard CUDA kernels for matrix multiplication are highly optimized, so perhaps the default PyTorch implementation already uses these. However, since B is a vector, maybe there's a way to optimize for this case.
+
+Wait, perhaps the default implementation already optimizes this. But the user wants to replace it with a custom kernel. Let's proceed.
+
+Another approach is to use the fact that the result is a vector, so we can process multiple rows in a block. Let's say each block handles multiple rows, and each thread in the block processes a portion of the columns for each of their assigned rows.
+
+Suppose the block size is 256, and each block handles 4 rows (so total rows processed is 256*4). Each thread is assigned to handle a set of rows (like 4 rows) and a portion of the columns.
+
+But this might complicate the indexing.
+
+Alternatively, let's think of the following kernel:
+
+Each thread processes a single element of the output, i.e., a single row. But that requires M threads, which might be too many if M is 2048. Wait, but each row is processed by a single thread, which has to loop over K elements. That would require each thread to loop over 1e6 elements, which is 1e6 operations per thread. With 2048 threads, that's 2e9 operations total. This could be slow because of the loop count.
+
+Wait, but perhaps with the current GPU's compute capability, even with that loop count, it might be manageable. Let's see:
+
+Suppose the kernel is launched with M=2048 threads, each thread doing a loop over K=1e6 iterations. Each iteration is a multiply-add. So total FLOPs is 2e9 (since each iteration is 2 FLOPs: multiply and add). A modern GPU can do about 10 TFLOPS, so 2e9 FLOPs would take 0.0002 seconds, but the actual time would depend on memory bandwidth and latency.
+
+However, the problem is that each thread has to loop over 1e6 elements, which is a lot of iterations, leading to high latency. The loop might not vectorize well, leading to suboptimal performance.
+
+Therefore, using a block of threads per row and splitting the work among threads in the block is better.
+
+Let me try to code the kernel as outlined earlier, but first, let's make sure the indexing is correct.
+
+Assuming that A is stored in row-major order (the default in PyTorch/CUDA), so A[i][k] is at position i*K + k in memory.
+
+The kernel would be:
+
+__global__ void matvec_kernel(
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    float sum = 0.0f;
+
+    for (int k = tid; k < K; k += num_threads) {
+        sum += A[row * K + k] * B[k];
+    }
+
+    __shared__ float shared_sums[256]; // assuming blockDim.x is 256
+
+    shared_sums[tid] = sum;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = num_threads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sums[tid] += shared_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[row] = shared_sums[0];
+    }
+}
+
+The grid size would be M (2048 blocks), and block size 256 threads. This way, each block (row) has 256 threads, each handling K/256 elements. The loop would have K / blockDim.x iterations per thread, so for K=1e6, that's ~3906 iterations per thread, which is a lot. But the reduction part would handle the final summation.
+
+Wait, but the blockDim.x is 256, so for each thread in a block, the number of iterations is ceil(K / 256). So for K=1e6, that's 1e6 /256 = 3906.25, so 3907 iterations per thread. That's a lot of loops. Each thread has to do 3906 iterations of the loop, each time doing a multiply and add. So per thread, that's about 7812 operations. For a block of 256 threads, that's 256 * 7812 = ~2 million operations per block. But with 2048 blocks, it's 2048 * 2e6 = 4e9 operations, which might be slow.
+
+Hmm, perhaps this approach is not optimal. Maybe we need to find a way to reduce the number of iterations.
+
+Alternative idea: use a block size of 1024 threads, so each thread only has to do 1e6 /1024 ≈ 976 iterations. Still a lot. Maybe a larger block size? But the maximum block size is typically 1024. Alternatively, use multiple warps per thread block.
+
+Alternatively, use a 2D grid of blocks, where each block handles a tile of rows and columns. For example, each block handles a block of rows and a block of columns. Let's think:
+
+Suppose we have a block size of 256 threads. Each block could handle, say, 16 rows (blockDim.y=16) and 16 columns (blockDim.x=16). Wait, this might complicate things. Alternatively, tile the computation into blocks.
+
+Another approach: use a tiled approach where each thread processes multiple elements in chunks. For example, each thread can process a vector of elements using vector types (like float4) to load multiple elements at a time.
+
+Let me try that. Using float4 (which is 4 floats) can allow us to process 4 elements at once. So, for K=1e6 elements, we can do 250,000 iterations per thread with float4.
+
+But this requires the data to be aligned properly, and the kernel would have to be adjusted to use vector types. Let's see:
+
+The kernel could be structured as follows:
+
+__global__ void matvec_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    float sum = 0.0f;
+
+    // Process elements in chunks of 4 using float4
+    for (int k = tid * 4; k < K; k += num_threads * 4) {
+        float4 a4 = reinterpret_cast<const float4*>(&A[row * K + k])[0];
+        float4 b4 = reinterpret_cast<const float4*>(&B[k])[0];
+        float4 product = a4 * b4;
+        sum += product.x + product.y + product.z + product.w;
+    }
+
+    // Handle remaining elements if K is not divisible by 4
+    for (int k = tid * 4 + (K % 4); k < K % 4; k += num_threads * 4) {
+        // Not sure, maybe a separate loop for the remainder
+    }
+
+    // Reduction within the block
+    // Same as before with shared memory
+}
+
+Wait, but this requires K to be a multiple of 4 for the vectorized part, and a remainder loop for the leftover elements. This complicates the kernel but can reduce the number of iterations by a factor of 4.
+
+This might be better. However, the code needs to be carefully written to handle the vectorization and the remainder.
+
+Alternatively, use a more efficient loop unrolling, but that could be tedious.
+
+Another idea: use CUDA's warp-level intrinsics to compute partial sums in parallel. Since each warp has 32 threads, they can process 32 elements at a time, but this requires synchronization.
+
+Alternatively, perhaps the initial approach is the simplest to implement, even if it's not the most optimized. Since the user wants a functional code, maybe the initial approach is acceptable.
+
+Now, let's consider the code structure for the Python side.
+
+The original code uses torch.matmul(A,B), which is a matrix-vector multiply. The custom kernel will replace this.
+
+First, the CUDA kernel needs to be compiled inline. Following the example, we'll write the CUDA kernel code as a string, then use load_inline to compile it.
+
+The kernel will take A (MxK), B (Kx1), and output C (Mx1). Since B is a vector, it's stored as a 1D array of size K. The output is also a 1D array of size M.
+
+The Python wrapper function should take A and B tensors, and return the result tensor C.
+
+The kernel launch configuration is:
+
+- blocks: M (2048)
+- threads per block: 256 (or some other number, but let's stick with 256 for now)
+
+Wait, but in the kernel, each block handles a row. So the number of blocks must be exactly M. Since M is 2048, which is less than the maximum grid size (which is 65535 or higher), that's okay.
+
+The code steps:
+
+1. Write the CUDA kernel code as a string.
+
+2. Write the wrapper function in C++ that calls the kernel.
+
+3. Compile it using load_inline.
+
+4. In the ModelNew class, replace the forward function with a call to this wrapper function.
+
+Now, let's proceed to write the code.
+
+First, the CUDA kernel:
+
+elementwise_add was replaced with matvec. Let's name the kernel matvec_kernel.
+
+The source code:
+
+matvec_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matvec_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    float sum = 0.0f;
+
+    for (int k = tid; k < K; k += num_threads) {
+        sum += A[row * K + k] * B[k];
+    }
+
+    __shared__ float shared_sums[256]; // blockDim.x is 256, so this is okay
+
+    shared_sums[tid] = sum;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = num_threads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sums[tid] += shared_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[row] = shared_sums[0];
+    }
+}
+
+torch::Tensor matvec_cuda(torch::Tensor A, torch::Tensor B) {
+    const int M = A.size(0);
+    const int K = A.size(1);
+    const int block_size = 256;
+    const dim3 blocks(M);
+    const dim3 threads(block_size);
+
+    auto C = torch::empty({M}, A.options());
+
+    matvec_kernel<<<blocks, threads>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, K);
+
+    cudaDeviceSynchronize(); // To ensure completion (though load_inline might handle this)
+
+    return C;
+}
+"""
+
+Wait, but in the example given earlier, the kernel was launched with cudaLaunchKernel, but using torch's extension API requires the kernel to be wrapped properly. The code above uses the standard kernel launch syntax with <<<blocks, threads>>>.
+
+However, when using torch.utils.cpp_extension.load_inline, the CUDA code is compiled and the functions are exposed. The function matvec_cuda is supposed to be called from Python.
+
+We also need to make sure that the shared memory size is correct. Since the block size is 256, the shared_sums array is of size 256, so that's okay.
+
+The input tensors A and B must be on the GPU. The output C is created with the same options as A (so also on the same device).
+
+The function matvec_cuda takes two tensors A and B, which are of sizes (M, K) and (K, 1). Wait, but B is a Kx1 matrix, but in the code, we treat B as a 1D array of size K. So in the Python code, when passing B, which is Kx1, we need to convert it to a 1D tensor. Alternatively, we can just take the first column (since it's Kx1). Let me check.
+
+The original forward function is:
+
+return torch.matmul(A, B)
+
+The B is a Kx1 matrix. The matmul would result in Mx1 matrix. The custom kernel's output is a 1D tensor of size M. To match, in the kernel, B is treated as a 1D array. So in the Python code, when passing B, we need to ensure it's a 1D tensor. However, in the original code, B is passed as a Kx1 tensor. So in the wrapper function, we should take B.view(-1) or B.squeeze().
+
+Wait, in the Python function matvec_cuda:
+
+The B tensor has shape (K,1), so to get a 1D array, we can use B.view(K). Or in the C++ code, since the kernel expects B to be a 1D array, perhaps we need to pass B's data as a 1D array. But in PyTorch, tensors are stored in contiguous memory, so even if it's (K,1), the data is stored as a contiguous block of K elements. So the pointer to B's data will be correct. However, the kernel is multiplying A[i][k] * B[k], which expects B to be 1D. So when B is a (K,1) tensor, B[k] would be B[k][0], which is not correct. Wait, no. Because B is stored as a (K,1) tensor, the memory is K elements of 1 element each. So the stride for B would be (1, K*element_size). Therefore, accessing B[k] in the kernel would actually access B[k][0], which is correct. Wait, maybe not.
+
+Wait, in C++, the tensor B passed to matvec_cuda is a tensor of shape (K,1). The data pointer B.data_ptr<float>() will point to the first element, and the next elements are in the next memory locations. So B[k] would correspond to the (k,0) element of the tensor. Since in the kernel, we are multiplying by B[k], which is correct because the B vector is the first column.
+
+Therefore, the kernel is okay as long as B is a 2D tensor of (K,1). However, in the kernel code, when accessing B[k], it's actually accessing the k-th element of the first column. Therefore, the code is okay.
+
+Alternatively, in Python, to make sure B is a 1D tensor, perhaps in the wrapper function, we can do B.squeeze() so that it becomes a 1D tensor of size K. That way, the indexing is correct.
+
+Therefore, modifying the matvec_cuda function:
+
+auto B_data = B.view({-1}); // to make it 1D
+But in C++, the code would be:
+
+auto B_cont = B.contiguous(); // Ensure it's contiguous
+// Or B.squeeze()
+
+Alternatively, in the kernel, the B array is accessed as a 1D array, so as long as B is a Kx1 tensor, the pointer is correct. So perhaps no need to squeeze.
+
+Proceeding with the code as written.
+
+Now, the wrapper function in C++ is:
+
+torch::Tensor matvec_cuda(torch::Tensor A, torch::Tensor B) {
+    const int M = A.size(0);
+    const int K = A.size(1);
+    const int block_size = 256;
+    const dim3 blocks(M);
+    const dim3 threads(block_size);
+
+    auto C = torch::zeros({M}, A.options());
+
+    matvec_kernel<<<blocks, threads>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, K);
+
+    return C;
+}
+
+Wait, but in the code above, there's a missing cudaDeviceSynchronize() to ensure the kernel finishes before returning, but torch's CUDA tensors are asynchronous. However, in PyTorch, the streams are managed automatically, so perhaps it's okay. But to be safe, maybe include it.
+
+Also, the kernel is launched with blocks = M. The maximum number of blocks in a grid is typically 65535, so M=2048 is okay.
+
+Now, the kernel's shared memory is 256 floats, which is 1KB. That's acceptable.
+
+Now, the Python code:
+
+from torch.utils.cpp_extension import load_inline
+
+matvec_source = the above code string.
+
+matvec_header = "torch::Tensor matvec_cuda(torch::Tensor A, torch::Tensor B);"
+
+matvec = load_inline(name="matvec", cpp_sources=matvec_header, cuda_sources=matvec_source, functions=["matvec_cuda"], verbose=True)
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.matvec = matvec  # The loaded module
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matvec.matvec_cuda(A, B)
+
+Wait, in the example given, the elementwise_add was stored as an attribute, and the function is called as self.elementwise_add.elementwise_add_cuda. So similarly, here, self.matvec is the loaded module, so the function is self.matvec.matvec_cuda.
+
+Therefore, the code is correct.
+
+Now, check if all parameters are correctly handled. The kernel requires A to be a 2D tensor (M, K), and B to be a 2D tensor (K,1). The output is a 1D tensor of size M, but the original code expects a (M,1) tensor. However, in the original forward function, the output of torch.matmul(A, B) is (M,1), but the custom kernel returns a 1D tensor. This might be an issue.
+
+Wait, in PyTorch, matmul of (M,K) and (K,1) gives (M,1). The custom kernel's output is a 1D tensor of length M. So the output is a vector of size M, but the original expects (M,1). To fix this, the output should be reshaped to (M,1).
+
+In the kernel, instead of creating C as a 1D tensor, we can make it a 2D tensor of shape (M,1). 
+
+Modify the kernel code:
+
+auto C = torch::empty({M, 1}, A.options());
+
+Then, in the kernel:
+
+C[row] would be C[row][0], but in the kernel code:
+
+if (tid == 0) {
+    C[row] = shared_sums[0]; // but C is 2D here
+}
+
+Wait, the pointer passed to the kernel is C.data_ptr<float>(), which for a 2D tensor (M,1) would still be a contiguous array. The indexing would be C[row * 1 + 0] = shared_sums[0]. So the kernel code can remain the same, because the output tensor is stored as a contiguous array of M elements (since the second dimension is 1). 
+
+Alternatively, better to make the output 1D and then reshape it.
+
+Alternatively, in the wrapper function:
+
+auto C = torch::empty({M, 1}, A.options());
+// Then in the kernel, write to C[row * 1 + 0] ?
+
+Wait, the kernel's output pointer is float* C, so when C is (M,1), the data is stored as M elements (since the stride for the first dimension is 1). Therefore, the kernel's code can write to C[row], since it's equivalent to C[row][0].
+
+Therefore, the code is okay.
+
+Alternatively, to avoid confusion, in the kernel, we can compute the offset as row * 1 + 0, but it's not necessary. The current code works.
+
+Therefore, the code is okay.
+
+Now, putting it all together.
+
+Final code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+matvec_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matvec_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    float sum = 0.0f;
+
+    for (int k = tid; k < K; k += num_threads) {
+        sum += A[row * K + k] * B[k];
+    }
+
+    __shared__ float shared_sums[256]; // Assuming block size is 256
+
+    shared_sums[tid] = sum;
+    __syncthreads();
+
+    for (int s = num_threads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sums[tid] += shared_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[row] = shared_sums[0];
+    }
+}
+
+torch::Tensor matvec_cuda(torch::Tensor A, torch::Tensor B) {
+    const int M = A.size(0);
+    const int K = A.size(1);
+    const int block_size = 256;
+    const dim3 blocks(M);
+    const dim3 threads(block_size);
+
+    auto C = torch::empty({M}, A.options());
+
+    matvec_kernel<<<blocks, threads>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, K);
+
+    return C.view({M, 1}); // Reshape to match original output shape (M, 1)
+}
+"""
+
+matvec_header = "torch::Tensor matvec_cuda(torch::Tensor A, torch::Tensor B);"
+
+# Compile the CUDA kernel
+matvec = load_inline(
+    name="matvec",
+    cpp_sources=matvec_header,
+    cuda_sources=matvec_source,
+    functions=["matvec_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.matvec = matvec
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matvec.matvec_cuda(A, B)
+
+# The get_inputs and get_init_inputs remain the same as in the original code
+M = 256 * 8  # 2048
+K = 131072 * 8  # 1048576
+
+def get_inputs():
+    A = torch.rand(M, K).cuda()
+    B = torch.rand(K, 1).cuda()
+    return [A, B]
+
+def get_init_inputs():
+    return []
+```
+
+Wait, but in the original code, the inputs are generated on CPU. Since the model is designed to run on GPU, we should move the inputs to CUDA. Hence, in the get_inputs function, adding .cuda().
+
+Also, in the kernel code, the kernel is launched with M blocks. The block size is 256 threads per block. The shared memory size is fixed at 256, which matches the block size.
+
+Another thing: in the kernel, the loop for k starts at tid and increments by num_threads (blockDim.x). This is correct for distributing the work among threads.
+
+However, in the kernel code, the shared memory array is declared as 256 elements, but if the block size is dynamic (e.g., if we wanted to use a different block size), this would be an issue. But since we fixed the block size to 256 in the wrapper function, this is okay.
+
+Also, the reduction in shared memory uses a binary reduction approach. The first step reduces to half the threads, and so on until one value remains. This is a standard approach.
+
+Potential issues:
+
+- The block size must be a power of two? Not necessarily, but the reduction loop uses division by 2 each time. Since 256 is a power of two, it works.
+
+- The kernel assumes that blockDim.x is 256, so the shared_sums array size must match. If we change the block size, this would need to be adjusted.
+
+But since we fixed the block size to 256, it's okay.
+
+Testing the code for a small M and K would help, but since the user wants the code as is, proceed.
+
+Another point: the original model uses torch.matmul(A, B), which is a matrix multiplication. The custom kernel computes the same as A @ B, where B is a column vector. The code should produce the same results.
+
+The final code also includes a .view({M,1}) to ensure the output is (M,1), matching the original model's output shape.
+
+Yes, that's important. The original output is (M,1), but the kernel returns a 1D tensor of M elements. The view() converts it to (M,1), which is correct.
+
+Therefore, the code should work.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+matvec_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matvec_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
+    int M,
+    int K
+) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    float sum = 0.0f;
+
+    for (int k = tid; k < K; k += num_threads) {
+        sum += A[row * K + k] * B[k];
+    }
+
+    __shared__ float shared_sums[256]; // blockDim.x is 256
+
+    shared_sums[tid] = sum;
+    __syncthreads();
+
+    for (int s = num_threads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sums[tid] += shared_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[row] = shared_sums[0];
+    }
+}
+
+torch::Tensor matvec_cuda(torch::Tensor A, torch::Tensor B) {
+    const int M = A.size(0);
+    const int K = A.size(1);
+    const int block_size = 256;
+    const dim3 blocks(M);
+    const dim3 threads(block_size);
+
+    auto C = torch::empty({M}, A.options());
+
+    matvec_kernel<<<blocks, threads>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, K);
+
+    return C.view({M, 1});
+}
+"""
+
+matvec_header = "torch::Tensor matvec_cuda(torch::Tensor A, torch::Tensor B);"
+
+matvec = load_inline(
+    name="matvec",
+    cpp_sources=matvec_header,
+    cuda_sources=matvec_source,
+    functions=["matvec_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.matvec = matvec
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matvec.matvec_cuda(A, B)
+
+M = 256 * 8  # 2048
+K = 131072 * 8  # 1048576
+
+def get_inputs():
+    A = torch.rand(M, K).cuda()
+    B = torch.rand(K, 1).cuda()
+    return [A, B]
+
+def get_init_inputs():
+    return []
+```

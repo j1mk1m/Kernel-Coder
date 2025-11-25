@@ -1,0 +1,26 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Your custom CUDA kernel code here
+
+custom_op = load_inline(
+    name="custom_op",
+    cpp_sources=custom_op_cpp_source,
+    cuda_sources=custom_op_source,
+    functions=["custom_op_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, bias: bool = False):
+        super(ModelNew, self).__init__()
+        # Replace the conv2d layer with your custom CUDA kernel
+        pass
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Call your custom CUDA kernel
+        pass

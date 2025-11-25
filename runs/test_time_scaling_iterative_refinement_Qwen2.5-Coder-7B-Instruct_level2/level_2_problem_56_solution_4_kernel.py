@@ -1,0 +1,63 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication followed by sigmoid
+matmul_sigmoid_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_sigmoid_kernel(const float* a, const float* b, float* c, int rows, int cols) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows && col < cols) {
+        float sum = 0.0f;
+        for (int k = 0; k < cols; ++k) {
+            sum += a[row * cols + k] * b[k * cols + col];
+        }
+        c[row * cols + col] = 1.0f / (1.0f + exp(-sum));
+    }
+}
+
+torch::Tensor matmul_sigmoid_cuda(torch::Tensor a, torch::Tensor b) {
+    auto rows = a.size(0);
+    auto cols = b.size(1);
+    auto c = torch::zeros({rows, cols}, a.options());
+
+    const int block_size = 16;
+    const int num_blocks_x = (cols + block_size - 1) / block_size;
+    const int num_blocks_y = (rows + block_size - 1) / block_size;
+
+    matmul_sigmoid_kernel<<<num_blocks_y, num_blocks_x>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), rows, cols);
+
+    return c;
+}
+"""
+
+matmul_sigmoid_cpp_source = (
+    "torch::Tensor matmul_sigmoid_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication followed by sigmoid
+matmul_sigmoid = load_inline(
+    name="matmul_sigmoid",
+    cpp_sources=matmul_sigmoid_cpp_source,
+    cuda_sources=matmul_sigmoid_source,
+    functions=["matmul_sigmoid_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(input_size, hidden_size)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = matmul_sigmoid.matmul_sigmoid_cuda(x, torch.zeros_like(x))
+        x = torch.sum(x, dim=1, keepdim=True)
+        return x

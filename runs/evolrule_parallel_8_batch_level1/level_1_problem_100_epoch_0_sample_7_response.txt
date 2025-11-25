@@ -1,0 +1,852 @@
+The new ModelNew must have the same external interface as Model. I.e., it must have the same parameters and forward() signature. The only difference is that the forward() method has been replaced with custom CUDA operators. 
+
+Make sure that the input and output tensor dimensions and data types are compatible with the original architecture. 
+
+The code you write must be compatible with PyTorch 1.13.1 and CUDA 11.8. 
+
+Now, the user has given a new architecture for a hinge loss model. The forward function computes the mean of the clamp of (1 - predictions * targets), where targets are binary labels {-1, 1}. The current implementation uses PyTorch's built-in clamp and mean operations. 
+
+The task is to optimize this by replacing some or all of these operations with custom CUDA kernels. 
+
+First, analyze which operations can benefit from a custom kernel. The critical path here is:
+
+predictions * targets → 1 - result → clamp → mean.
+
+Each of these steps can be considered for optimization.
+
+Multiplication of predictions and targets is an element-wise operation. Similarly, subtraction by 1 and clamping are element-wise. The mean is a reduction operation.
+
+Implementing these steps in a single fused kernel could reduce memory traffic and kernel launch overhead. For instance, fusing element-wise operations into a single kernel pass would be efficient.
+
+Another consideration is that the inputs are large (batch_size=32768, input_shape=32768; but wait, looking at the get_inputs() function, actually input_shape is (32768,), so the first dimension is batch_size=32768, and the second is 32768? Wait, no. Let me check:
+
+Wait the input_shape is given as (32768,), so the inputs to the model are:
+
+predictions: shape (batch_size, 32768) → since batch_size is 32768, this would be a tensor of shape (32768, 32768). Wait, that's a huge tensor. But in get_inputs(), it's written as:
+
+def get_inputs():
+    return [torch.rand(batch_size, *input_shape), torch.randint(0, 2, (batch_size,)).float() * 2 - 1]
+
+So the first input is predictions: shape (batch_size, *input_shape) → (32768, 32768). The second input is targets: shape (batch_size, ), since torch.randint(0,2, (batch_size,)).
+
+Wait, that would cause a problem when doing element-wise multiplication between predictions (shape 32768x32768) and targets (shape 32768). Unless targets are being broadcasted. But in the original code, the computation is predictions * targets. So that would require targets to have shape (batch_size, 1) so that it can broadcast to the predictions' shape. Wait, in the original code, let me check:
+
+The model's forward function is:
+
+def forward(self, predictions, targets):
+    return torch.mean(torch.clamp(1 - predictions * targets, min=0))
+
+So the multiplication is between predictions (shape (batch_size, input_shape)) and targets (shape (batch_size, )). 
+
+In PyTorch, when you multiply a tensor of shape (B, N) with a tensor of shape (B, ), it will broadcast the targets to (B, N) by expanding the second dimension. So the multiplication is valid. But in the current get_inputs(), targets is (batch_size, ), which is correct. So the predictions tensor has shape (32768, 32768), which is a very large tensor (about 32768 * 32768 * 4 bytes ≈ 4GB if float32). So this is a huge tensor. That might be an oversight, but given that the user provided this code, we have to proceed with it.
+
+However, in the problem statement, the user might have made a typo, but since we have to follow the given code, we proceed.
+
+The problem is to replace the computation with a custom CUDA kernel. Let's see:
+
+The existing code's forward is:
+
+predictions * targets → element-wise multiplication (broadcasted)
+
+Then 1 - that result.
+
+Then clamp at 0.
+
+Then take the mean.
+
+So, all of these can be done in a single kernel. Let's see:
+
+Each element in predictions is a value between 0 and 1 (since it's random). Targets are either -1 or 1. So predictions * targets will be between -1 and 1. Then 1 - that result will be between 0 and 2. Clamping to min 0 would leave it as 1 - pred*target if that's positive, else 0. The mean of all these values is the hinge loss.
+
+To compute this, we can do:
+
+For each element in predictions and targets (with targets broadcast):
+
+Compute the value (1 - predictions[i] * targets[i]). If that is less than 0, set to 0. Sum all these and divide by the total number of elements.
+
+Wait, but the targets are of shape (batch_size, ), so the code actually computes for each element in the predictions tensor, the corresponding target is targets[i] where i is the first dimension. So for predictions[i,j], the target is targets[i]. So the multiplication would be predictions[i,j] * targets[i].
+
+Therefore, the kernel can process each element (i,j) in the predictions tensor. The targets are a 1D array of size batch_size.
+
+Therefore, the steps per element would be:
+
+Compute val = 1.0 - (predictions[i][j] * targets[i])
+
+If val < 0, set to 0.0 else keep val.
+
+Sum all these val's and divide by (batch_size * input_shape[0]).
+
+Wait, but the original code uses torch.mean, which averages over all elements.
+
+Therefore, the kernel needs to:
+
+- Iterate over all elements in predictions (which is a 2D tensor of batch_size x input_shape[0])
+
+- For each element (i,j):
+
+    val = 1.0 - (predictions[i][j] * targets[i])
+
+    if val < 0: val = 0
+
+    accumulate the sum.
+
+- After all elements, divide the sum by the total number of elements (batch_size * input_shape[0])
+
+So the challenge is to write a CUDA kernel that does this efficiently.
+
+The problem is that the targets are a 1D array. So for each element (i,j), the target is targets[i].
+
+Therefore, in CUDA, we can launch a kernel where each thread is responsible for a single (i,j) element. The grid size would be batch_size * input_shape[0], and each thread would compute its contribution to the sum.
+
+But reduction (summing all elements) requires atomic operations or a parallel reduction algorithm, which can be computationally intensive. Alternatively, we can have each thread compute its val, and accumulate into a shared memory array, then do a parallel reduction.
+
+But considering the size of the data (32768 x 32768 elements), which is over a billion elements, this requires a large amount of memory and computation. However, the problem may have a different input_shape. Wait, the user's code defines input_shape as (32768,), but in get_inputs(), the first input is torch.rand(batch_size, *input_shape). Since batch_size is also 32768, the first input is (32768, 32768), which is 32768 squared elements. This is about 1.07 billion elements. Each float is 4 bytes, so that's about 4 GB of data. The targets tensor is 32768 elements (float32), so ~128 KB. So the data is manageable, but the computation is large.
+
+Therefore, to compute the sum efficiently, we can proceed as follows:
+
+Approach 1: Compute each element's contribution in parallel, and use a parallel reduction to compute the sum. Then divide by the total number of elements to get the mean.
+
+The kernel can be structured as:
+
+- A kernel that computes per-element val and stores in a temporary array, then another kernel for the sum. But this is inefficient.
+
+Approach 2: Use a single kernel with parallel reduction.
+
+CUDA has several approaches for parallel reduction. For example, each block can compute a partial sum, then these are combined in a second kernel or using a tree-like approach.
+
+Alternatively, use atomicAdd for the sum, but with many threads writing to the same location, this can be slow due to contention.
+
+Given that the number of elements is very large (over a billion), atomicAdd might not be efficient. So a better approach is to use a parallel reduction with blocks and threads.
+
+Let me outline the steps:
+
+1. Each thread processes a single element (i,j) and computes val = max(0, 1 - pred[i][j] * target[i]). The thread accumulates its val into a block-local shared memory array. The shared memory array is of size equal to the block size.
+
+2. The block then reduces its own shared memory array into a single value per block, which is stored in a global array.
+
+3. The second step is a reduction of all the block partial sums into a total sum. This can be done with a smaller grid of blocks, each processing a subset of the partial sums.
+
+Alternatively, we can use the standard CUDA reduction approach, as outlined in CUDA samples.
+
+Alternatively, given that the problem requires computing the mean, perhaps it's better to structure the kernel so that each thread can process a block of elements and accumulate its partial sum, then use a reduction step.
+
+But given that the number of elements is very large, it's necessary to structure this efficiently.
+
+Alternatively, since the operation is element-wise and the final result is a scalar, perhaps a fused kernel is the way to go.
+
+Let me think of the CUDA kernel structure.
+
+First, the input tensors:
+
+predictions: shape (B, N) where B = 32768, N = 32768 (input_shape[0])
+
+targets: shape (B, )
+
+The total number of elements is B*N.
+
+Each thread can handle one element. The total number of threads needed is B*N. To handle this, the grid can be divided into blocks of threads, each block can process a chunk of elements.
+
+The CUDA kernel can be structured as follows:
+
+Each thread is assigned an index, say tid = blockIdx.x * blockDim.x + threadIdx.x. Since the total elements are B*N, we need to cover all indices from 0 to (B*N - 1).
+
+For each tid, compute the corresponding i and j:
+
+i = tid // N
+
+j = tid % N
+
+Then, the target for this element is targets[i], and the prediction is predictions[i][j].
+
+Compute val = 1.0 - (predictions[i][j] * targets[i])
+
+if val < 0, set to 0.
+
+Add this val to a shared memory array, then do a block reduction to compute the block's partial sum. Then write that partial sum to global memory. Then, after all blocks have written their partial sums, perform a second kernel to sum all the partial sums, then divide by B*N to get the mean.
+
+But to avoid multiple kernels, perhaps use a two-step approach within a single kernel, but that might complicate.
+
+Alternatively, use a single kernel with a block reduction.
+
+Here's a possible approach:
+
+Use a kernel where each block processes a range of elements. The block computes its partial sum and writes it to a global array. Then, launch another kernel to reduce those partial sums. However, this requires two kernel launches.
+
+Alternatively, use a single kernel with a hierarchical reduction.
+
+Alternatively, use the atomicAdd approach, even though it may have contention. Let's see:
+
+The total number of threads is B*N = 32768^2 = ~1e9. Each thread would compute its val and then do atomicAdd to a global sum variable. However, atomicAdd for a single address with a billion threads would be extremely slow due to contention. Therefore, this approach is not feasible.
+
+Hence, a block-based reduction is better.
+
+Let me outline the steps:
+
+1. Each thread in the block processes a chunk of elements and accumulates into shared memory.
+
+Wait, perhaps a better approach is to have each thread process one element, accumulate into a per-block shared memory array, then do a block reduction.
+
+Here's a step-by-step plan for the kernel:
+
+- The kernel is launched with a grid of blocks, each block having, say, 256 threads.
+
+- Each block handles a range of elements. The total number of elements is B*N = (32768)^2 ≈ 1e9.
+
+- The number of blocks needed would be ceil(1e9 / (blockDim.x * num_blocks))? Wait, need to think in terms of grid dimensions.
+
+Alternatively, the total number of threads needed is B*N, so the gridDim.x must be ceil(B*N / blockDim.x). Since the maximum number of threads per block is 1024, and gridDim.x can be up to 2^31-1, but in practice, for such a large grid, it might be problematic. Wait, for 1e9 elements, with 1024 threads per block, the number of blocks would be about 1e9 / 1024 ≈ ~976,562 blocks. Which is manageable.
+
+But even with 1024 threads per block, this is a lot of blocks, but CUDA can handle that.
+
+Each thread in the kernel is assigned a unique index tid from 0 to (B*N -1). The thread computes i = tid // N, j = tid % N.
+
+Then, compute val as 1 - predictions[i][j] * targets[i]. If val <0, set to 0.
+
+Each thread then adds its val to a global sum variable, but using atomicAdd would be too slow. So instead, each block can have a partial sum, which is stored in shared memory, and then the block's total is added to a global array.
+
+Here's the plan:
+
+Each block has a shared memory array of size blockDim.x.
+
+Each thread computes its val and stores it in shared memory. Then the block does a reduction in shared memory to get the block's total. The block's total is then stored in a global array of partial sums. The number of partial sums is equal to the number of blocks.
+
+After all blocks have written their partial sums, we can launch another kernel to reduce those partial sums into a total.
+
+Alternatively, the first kernel can do the computation and each block can write its partial sum to global memory, then a second kernel reduces all those partial sums.
+
+Alternatively, combine both steps into a single kernel, but that requires a two-step reduction.
+
+Alternatively, use a single kernel with a block-wise reduction and then a grid-wide reduction.
+
+Alternatively, here's a more detailed approach:
+
+First kernel:
+
+- Each thread computes its element's val and stores it in a per-block shared memory array.
+
+- The block then reduces the shared memory array into a single value (the block's total), which is written to a global array of partial_sums.
+
+Second kernel:
+
+- This kernel takes the partial_sums array and reduces it into a total_sum.
+
+- This can be done by launching another kernel with a smaller grid, each processing a portion of the partial_sums array.
+
+But even the second kernel would need to handle a large number of partial_sums (e.g., ~976,562 elements), so the second reduction can be done recursively or using another kernel.
+
+Alternatively, use a hierarchical reduction approach in the first kernel.
+
+Alternatively, the first kernel can be structured with a two-step reduction:
+
+First, each block computes its partial sum.
+
+Then, within the same kernel, if the block is part of a second phase, it reduces the partial_sums array.
+
+But this might complicate the kernel code.
+
+Alternatively, the first kernel computes all the partial sums, and then a second kernel reduces those.
+
+This requires two kernel launches but is manageable.
+
+Now, let's think about implementing this.
+
+First, the code outline:
+
+CUDA kernel 1:
+
+__global__ void compute_partial_sums_kernel(
+    const float* predictions,
+    const float* targets,
+    float* partial_sums,
+    int B, int N
+) {
+    // per-thread processing
+    extern __shared__ float shared_mem[];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_idx = threadIdx.x;
+
+    if (tid < B*N) {
+        int i = tid / N;
+        int j = tid % N;
+        float pred_val = predictions[i * N + j];
+        float target_val = targets[i];
+        float val = 1.0f - pred_val * target_val;
+        val = (val < 0) ? 0.0f : val;
+        shared_mem[thread_idx] = val;
+    } else {
+        shared_mem[thread_idx] = 0.0f;
+    }
+
+    // barrier to ensure all data is in shared memory
+    __syncthreads();
+
+    // perform block-wise reduction in shared memory
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (thread_idx < s) {
+            shared_mem[thread_idx] += shared_mem[thread_idx + s];
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        partial_sums[blockIdx.x] = shared_mem[0];
+    }
+}
+
+Then, the second kernel would reduce the partial_sums array into a total_sum:
+
+__global__ void reduce_partial_sums(
+    float* partial_sums,
+    int num_partial_sums,
+    float* total_sum
+) {
+    // similar approach, but here each block handles a portion of partial_sums
+    extern __shared__ float shared_mem[];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_idx = threadIdx.x;
+
+    if (tid < num_partial_sums) {
+        shared_mem[thread_idx] = partial_sums[tid];
+    } else {
+        shared_mem[thread_idx] = 0.0f;
+    }
+
+    __syncthreads();
+
+    // reduce within block
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (thread_idx < s) {
+            shared_mem[thread_idx] += shared_mem[thread_idx + s];
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        atomicAdd(total_sum, shared_mem[0]);
+    }
+}
+
+However, even this second kernel may have contention if multiple blocks write to the same total_sum.
+
+Wait, the second kernel is supposed to process the partial_sums array, which is of size num_blocks. So if the second kernel is launched with a grid of blocks each processing a portion of the partial_sums array, then each block would compute its own partial sum and then use atomicAdd to accumulate into the total_sum.
+
+Alternatively, the second kernel can be designed to handle the entire partial_sums array in a single block (if possible). For example, if the number of partial_sums is manageable.
+
+Suppose the number of partial_sums is 1 million, which is manageable with a single block of 1024 threads, but 1 million / 1024 ≈ 1000 blocks. So perhaps a second kernel with a grid of, say, 1024 threads can't handle it, so the second kernel would also need to be launched with multiple blocks, and each block contributes to the total_sum via atomicAdd.
+
+Alternatively, the second kernel can be structured as follows:
+
+Each thread in the second kernel processes a portion of the partial_sums array and accumulates their contributions into shared memory, then the block's contribution is written via atomicAdd to the total_sum.
+
+This way, even with multiple blocks, each block's contribution is added atomically.
+
+The problem is that atomicAdd is still a point of contention, but with the number of partial_sums reduced from 1e9 to ~1e6, this might be manageable.
+
+Alternatively, use a hierarchical approach.
+
+Alternatively, in the first kernel, set the number of blocks such that the number of partial sums is small enough to fit in a single block's processing.
+
+Wait, perhaps the first kernel is launched with a block size of 1024 threads per block, so for 1e9 elements, the number of blocks is 1e9 / 1024 ≈ 976,562.5 blocks. Which is a very large number, but CUDA can handle that.
+
+The partial_sums array would then be of size 976,562, so the second kernel can process that array.
+
+If the second kernel is launched with a block size of 1024, then the number of blocks would be ceil(976,562 / 1024) ≈ 954 blocks.
+
+Each block in the second kernel would process 1024 elements of the partial_sums array, sum them into shared memory, and then have the block's thread 0 do atomicAdd to the total_sum.
+
+This way, the total_sum is the sum of all partial_sums.
+
+Once we have total_sum, the mean is total_sum / (B*N).
+
+Now, implementing this in code.
+
+First, we need to define the CUDA kernels.
+
+First, the first kernel:
+
+Compute each element's contribution, accumulate into block's shared memory, and write the partial sum.
+
+The second kernel reduces the partial sums into total_sum.
+
+Then, in the Python code, we can call these kernels.
+
+However, in the example given in the problem, the code for the kernel was written inline using load_inline.
+
+Therefore, the Python code would need to:
+
+- Define the CUDA kernels as strings.
+
+- Compile them with load_inline.
+
+- In the forward function, call the kernels.
+
+But let's structure this.
+
+First, the forward function in ModelNew would:
+
+1. Compute the predictions and targets inputs.
+
+2. Allocate the partial_sums array on the GPU.
+
+3. Launch the first kernel to compute the partial_sums.
+
+4. Launch the second kernel to reduce partial_sums to total_sum.
+
+5. Divide by the total number of elements to get the mean.
+
+6. Return the mean.
+
+Now, the code.
+
+First, the first kernel:
+
+```cpp
+__global__ void compute_partial_sums(const float* predictions, const float* targets, float* partial_sums, int B, int N) {
+    extern __shared__ float shared_mem[];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_idx = threadIdx.x;
+    float val = 0.0f;
+
+    if (tid < B * N) {
+        int i = tid / N;
+        int j = tid % N;
+        float pred_val = predictions[i * N + j];
+        float target_val = targets[i];
+        val = 1.0f - pred_val * target_val;
+        val = fmaxf(val, 0.0f); // Clamps to min 0
+    }
+
+    shared_mem[thread_idx] = val;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (thread_idx < s) {
+            shared_mem[thread_idx] += shared_mem[thread_idx + s];
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        partial_sums[blockIdx.x] = shared_mem[0];
+    }
+}
+```
+
+Wait, but the initial assignment of val may have a problem. For threads beyond the total elements, val is 0, but in the shared memory, we need to set those threads' contributions to zero.
+
+Wait in the code above, the first part:
+
+if (tid < B*N) { ... compute val ... } else val remains 0?
+
+No, the code currently has:
+
+if (tid < B*N) then compute val, else val remains 0?
+
+Wait in the code as written:
+
+val is initialized to 0.0f.
+
+Then, if (tid < B*N), compute val. Otherwise, val stays 0.0f.
+
+Therefore, the shared_mem[thread_idx] is set to val, which is 0 if tid is beyond the array.
+
+However, this may not be correct because in the case where the block has more threads than the remaining elements. Wait, but the shared_mem[thread_idx] is assigned val regardless.
+
+Yes, so all threads contribute their val (which is either the computed value or 0 if out of bounds).
+
+Thus, the code is okay.
+
+The next step is the reduction in shared memory.
+
+Then, if the thread is the first, write to partial_sums.
+
+The second kernel:
+
+```cpp
+__global__ void reduce_partial_sums(const float* partial_sums, int num_partial_sums, float* total_sum) {
+    extern __shared__ float shared_mem[];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_idx = threadIdx.x;
+    float val = 0.0f;
+
+    if (tid < num_partial_sums) {
+        val = partial_sums[tid];
+    }
+
+    shared_mem[thread_idx] = val;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (thread_idx < s) {
+            shared_mem[thread_idx] += shared_mem[thread_idx + s];
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        atomicAdd(total_sum, shared_mem[0]);
+    }
+}
+```
+
+Wait, in this kernel, each thread in the block reads a partial_sum element if within the range. The shared memory is filled with those values, then reduced.
+
+The result of the reduction is written to total_sum via atomicAdd. Since multiple blocks might be launched, each block's contribution is added to total_sum.
+
+Thus, this should accumulate all the partial_sums into total_sum.
+
+Now, in the Python code:
+
+We need to:
+
+- Compute the number of elements (total_elements = B*N)
+
+- Launch the first kernel with grid size = number of blocks needed for the first kernel.
+
+The first kernel's block size can be chosen, say 1024 threads per block.
+
+The number of blocks for the first kernel is ceil(total_elements / blockDim.x).
+
+The partial_sums array size is equal to the number of blocks for the first kernel.
+
+Then, the second kernel is launched with a block size, say 1024, and number of blocks as ceil(partial_sums_size / blockDim.x).
+
+But the second kernel must have enough shared memory to hold blockDim.x elements.
+
+Wait in both kernels, the shared memory is allocated dynamically using extern __shared__.
+
+For the first kernel:
+
+compute_partial_sums requires shared memory of size blockDim.x * sizeof(float).
+
+When launching the kernel, we have to specify the shared memory size.
+
+Similarly for the second kernel.
+
+Now, the Python code.
+
+First, define the CUDA source code strings.
+
+The CUDA code for the kernels:
+
+elementwise_hinge_loss_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void compute_partial_sums(const float* predictions, const float* targets, float* partial_sums, int B, int N) {
+    extern __shared__ float shared_mem[];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_idx = threadIdx.x;
+    float val = 0.0f;
+
+    if (tid < B * N) {
+        int i = tid / N;
+        int j = tid % N;
+        float pred_val = predictions[i * N + j];
+        float target_val = targets[i];
+        val = 1.0f - pred_val * target_val;
+        val = fmaxf(val, 0.0f);
+    }
+
+    shared_mem[thread_idx] = val;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (thread_idx < s) {
+            shared_mem[thread_idx] += shared_mem[thread_idx + s];
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        partial_sums[blockIdx.x] = shared_mem[0];
+    }
+}
+
+__global__ void reduce_partial_sums(const float* partial_sums, int num_partial_sums, float* total_sum) {
+    extern __shared__ float shared_mem[];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_idx = threadIdx.x;
+    float val = 0.0f;
+
+    if (tid < num_partial_sums) {
+        val = partial_sums[tid];
+    }
+
+    shared_mem[thread_idx] = val;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (thread_idx < s) {
+            shared_mem[thread_idx] += shared_mem[thread_idx + s];
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        atomicAdd(total_sum, shared_mem[0]);
+    }
+}
+""";
+
+Then, the wrapper functions in C++:
+
+We need to write a wrapper function that takes the predictions and targets tensors and returns the mean.
+
+Something like:
+
+torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    int B = predictions.size(0);
+    int N = predictions.size(1);
+    int total_elements = B * N;
+
+    // Determine the block and grid sizes for the first kernel
+    int block_size = 1024;
+    int num_blocks_first = (total_elements + block_size - 1) / block_size;
+
+    // Allocate partial_sums
+    auto partial_sums = torch::empty({num_blocks_first}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    // Launch compute_partial_sums kernel
+    compute_partial_sums<<<num_blocks_first, block_size, block_size * sizeof(float)>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        partial_sums.data_ptr<float>(),
+        B, N
+    );
+
+    // Now reduce the partial_sums into total_sum
+    int num_partial_sums = num_blocks_first;
+    block_size = 1024;
+    int num_blocks_second = (num_partial_sums + block_size - 1) / block_size;
+
+    auto total_sum = torch::zeros(1, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    reduce_partial_sums<<<num_blocks_second, block_size, block_size * sizeof(float)>>>(
+        partial_sums.data_ptr<float>(),
+        num_partial_sums,
+        total_sum.data_ptr<float>()
+    );
+
+    // Compute mean
+    float mean = total_sum.item<float>() / static_cast<float>(total_elements);
+    return torch::tensor({mean}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+}
+
+Wait, but in the reduce_partial_sums kernel, the total_sum is a single float, and we use atomicAdd. Therefore, even if multiple blocks are launched, their contributions are added via atomicAdd.
+
+Therefore, after launching the second kernel, total_sum will hold the sum of all partial_sums, which is the total of all elements.
+
+Thus, the mean is total_sum / (B*N).
+
+But in the code above, the function returns a tensor with the mean. However, PyTorch's mean function would return a scalar tensor, so this is okay.
+
+Now, compiling this with load_inline.
+
+The CPP source would need to have declarations for the two kernels and the wrapper function.
+
+The CPP source code:
+
+elementwise_hinge_loss_cpp = """
+torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+Thus, the Python code would load the CUDA code as:
+
+hinge_loss_cuda = load_inline(
+    name="hinge_loss_cuda",
+    cpp_sources=elementwise_hinge_loss_cpp,
+    cuda_sources=elementwise_hinge_loss_source,
+    functions=["hinge_loss_cuda"],
+    verbose=True,
+    extra_cflags=["-DWITH_CUDA"],
+    extra_cuda_cflags=["-gencode=arch=compute_86,code=sm_86"]  # or whatever the target architecture is
+)
+
+Wait, but the user specifies compatibility with CUDA 11.8. The architecture flags may vary. To avoid specifying, perhaps omit them.
+
+Alternatively, let's see:
+
+The user requires compatibility with PyTorch 1.13.1 and CUDA 11.8. The compute capability for CUDA 11.8 can vary, but perhaps using a generic flag.
+
+Alternatively, just let the compiler handle it without specifying the architecture.
+
+Thus, the code can proceed without the extra_cuda_cflags.
+
+Now, the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hinge_loss_cuda = hinge_loss_cuda
+
+    def forward(self, predictions, targets):
+        return self.hinge_loss_cuda.hinge_loss_cuda(predictions, targets)
+
+Wait, but in the wrapper function, the return is a tensor of shape (1,). The original Model returns a scalar tensor via torch.mean(...). Therefore, this is compatible.
+
+Testing this code, but since we can't run it, we need to make sure that the code is correct.
+
+Potential issues:
+
+1. The input tensors must be on the same device (CUDA). The get_inputs() function generates them on CPU, but in the problem statement, the original get_inputs() returns tensors on CPU. However, the user's original code's get_inputs() has a note that says:
+
+Wait looking back at the original code:
+
+The user's original code's get_inputs():
+
+def get_inputs():
+    return [torch.rand(batch_size, *input_shape), torch.randint(0, 2, (batch_size,)).float() * 2 - 1]
+
+But in the original problem, the inputs are generated on CPU. But the Model's forward function works on them, but when the model is on CUDA, the tensors need to be on CUDA.
+
+Wait in the original problem's code, the Model is a nn.Module, but the user's code didn't specify moving to CUDA. So perhaps in the problem's context, the inputs are expected to be on CUDA.
+
+Alternatively, the user's code may assume that the inputs are on the correct device. But the example given (the first example) had get_inputs() returning tensors on CUDA.
+
+Looking back at the example given by the user:
+
+In the first example, the get_inputs() returns tensors on CUDA:
+
+a = torch.randn(1, 128).cuda()
+
+b = torch.randn(1, 128).cuda()
+
+So perhaps in the problem's ModelNew, the inputs are expected to be on CUDA. So the code should handle tensors on CUDA.
+
+In the wrapper function, the code uses .data_ptr<float>(), which is okay as long as the tensors are on CUDA.
+
+Another thing to note is that the targets tensor is of shape (B,), and in the kernel, it is accessed as targets[i], which is correct.
+
+Another point: in the compute_partial_sums kernel, the targets array is a 1D array of size B, so when accessing targets[i], it's okay as long as i < B.
+
+Yes, since i = tid / N, and tid < B*N implies i < B.
+
+Thus, the code should be correct.
+
+Therefore, the final code would look like this.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+elementwise_hinge_loss_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void compute_partial_sums(const float* predictions, const float* targets, float* partial_sums, int B, int N) {
+    extern __shared__ float shared_mem[];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_idx = threadIdx.x;
+    float val = 0.0f;
+
+    if (tid < B * N) {
+        int i = tid / N;
+        int j = tid % N;
+        float pred_val = predictions[i * N + j];
+        float target_val = targets[i];
+        val = 1.0f - pred_val * target_val;
+        val = fmaxf(val, 0.0f);
+    }
+
+    shared_mem[thread_idx] = val;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (thread_idx < s) {
+            shared_mem[thread_idx] += shared_mem[thread_idx + s];
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        partial_sums[blockIdx.x] = shared_mem[0];
+    }
+}
+
+__global__ void reduce_partial_sums(const float* partial_sums, int num_partial_sums, float* total_sum) {
+    extern __shared__ float shared_mem[];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int thread_idx = threadIdx.x;
+    float val = 0.0f;
+
+    if (tid < num_partial_sums) {
+        val = partial_sums[tid];
+    }
+
+    shared_mem[thread_idx] = val;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (thread_idx < s) {
+            shared_mem[thread_idx] += shared_mem[thread_idx + s];
+        }
+        __syncthreads();
+    }
+
+    if (thread_idx == 0) {
+        atomicAdd(total_sum, shared_mem[0]);
+    }
+}
+
+torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    int B = predictions.size(0);
+    int N = predictions.size(1);
+    int total_elements = B * N;
+
+    const int block_size = 1024;
+    int num_blocks_first = (total_elements + block_size - 1) / block_size;
+
+    auto partial_sums = torch::empty({num_blocks_first}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    compute_partial_sums<<<num_blocks_first, block_size, block_size * sizeof(float)>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        partial_sums.data_ptr<float>(),
+        B, N
+    );
+
+    int num_partial_sums = num_blocks_first;
+    int num_blocks_second = (num_partial_sums + block_size - 1) / block_size;
+
+    auto total_sum = torch::zeros(1, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    reduce_partial_sums<<<num_blocks_second, block_size, block_size * sizeof(float)>>>(
+        partial_sums.data_ptr<float>(),
+        num_partial_sums,
+        total_sum.data_ptr<float>()
+    );
+
+    float mean = total_sum.item<float>() / static_cast<float>(total_elements);
+    return torch::tensor({mean}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+}
+"""
+
+elementwise_hinge_loss_cpp = """
+torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+hinge_loss_cuda = load_inline(
+    name="hinge_loss_cuda",
+    cpp_sources=elementwise_hinge_loss_cpp,
+    cuda_sources=elementwise_hinge_loss_source,
+    functions=["hinge_loss_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hinge_loss_cuda = hinge_loss_cuda
+
+    def forward(self, predictions, targets):
+        return self.hinge_loss_cuda.hinge_loss_cuda(predictions, targets)
+```

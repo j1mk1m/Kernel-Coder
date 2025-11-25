@@ -1,0 +1,203 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for GEMM
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+void gemm_cuda(const float* a, const float* b, float* c, int m, int n, int k) {
+    const int block_size = 32;
+    const int grid_x = (n + block_size - 1) / block_size;
+    const int grid_y = (m + block_size - 1) / block_size;
+
+    gemm_kernel<<<grid_y, grid_x>>>(a, b, c, m, n, k);
+}
+"""
+
+gemm_cpp_source = (
+    "void gemm_cuda(const float* a, const float* b, float* c, int m, int n, int k);"
+)
+
+# Compile the inline CUDA code for GEMM
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Group Normalization
+group_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void group_norm_kernel(const float* x, float* mean, float* var, float* gamma, float* beta, float eps, int N, int C, int H, int W, int group_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * H * W) return;
+
+    int c = idx % C;
+    int g = c / group_size;
+    int h = (idx / C) % H;
+    int w = idx / (C * H);
+
+    __shared__ float s_mean[256];
+    __shared__ float s_var[256];
+
+    int tid = threadIdx.x;
+    int step = blockDim.x;
+
+    float sum = 0.0f;
+    for (int i = 0; i < group_size; ++i) {
+        sum += x[(g * group_size + i) * H * W + h * W + w];
+    }
+
+    s_mean[tid] = sum;
+    __syncthreads();
+
+    if (tid == 0) {
+        for (int i = 1; i < step; ++i) {
+            s_mean[0] += s_mean[i];
+        }
+        mean[idx] = s_mean[0] / group_size;
+    }
+
+    __syncthreads();
+
+    sum = 0.0f;
+    for (int i = 0; i < group_size; ++i) {
+        sum += (x[(g * group_size + i) * H * W + h * W + w] - mean[idx]) * (x[(g * group_size + i) * H * W + h * W + w] - mean[idx]);
+    }
+
+    s_var[tid] = sum;
+    __syncthreads();
+
+    if (tid == 0) {
+        for (int i = 1; i < step; ++i) {
+            s_var[0] += s_var[i];
+        }
+        var[idx] = sqrt(s_var[0] / group_size + eps);
+    }
+
+    __syncthreads();
+
+    x[idx] = gamma[c] * (x[idx] - mean[idx]) / var[idx] + beta[c];
+}
+
+void group_norm_cuda(const float* x, float* mean, float* var, float* gamma, float* beta, float eps, int N, int C, int H, int W, int group_size) {
+    const int block_size = 256;
+    const int num_blocks = (N * C * H * W + block_size - 1) / block_size;
+
+    group_norm_kernel<<<num_blocks, block_size>>>(x, mean, var, gamma, beta, eps, N, C, H, W, group_size);
+}
+"""
+
+group_norm_cpp_source = (
+    "void group_norm_cuda(const float* x, float* mean, float* var, float* gamma, float* beta, float eps, int N, int C, int H, int W, int group_size);"
+)
+
+# Compile the inline CUDA code for Group Normalization
+group_norm = load_inline(
+    name="group_norm",
+    cpp_sources=group_norm_cpp_source,
+    cuda_sources=group_norm_source,
+    functions=["group_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Bias Addition
+bias_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bias_add_kernel(const float* x, const float* bias, float* y, int N, int C, int H, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * H * W) return;
+
+    y[idx] = x[idx] + bias[idx];
+}
+
+void bias_add_cuda(const float* x, const float* bias, float* y, int N, int C, int H, int W) {
+    const int block_size = 256;
+    const int num_blocks = (N * C * H * W + block_size - 1) / block_size;
+
+    bias_add_kernel<<<num_blocks, block_size>>>(x, bias, y, N, C, H, W);
+}
+"""
+
+bias_add_cpp_source = (
+    "void bias_add_cuda(const float* x, const float* bias, float* y, int N, int C, int H, int W);"
+)
+
+# Compile the inline CUDA code for Bias Addition
+bias_add = load_inline(
+    name="bias_add",
+    cpp_sources=bias_add_cpp_source,
+    cuda_sources=bias_add_source,
+    functions=["bias_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_groups = num_groups
+        self.bias_shape = bias_shape
+        self.gemm_weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.gamma = nn.Parameter(torch.ones(out_features))
+        self.beta = nn.Parameter(torch.zeros(out_features))
+        self.mean = nn.Parameter(torch.zeros(out_features), requires_grad=False)
+        self.var = nn.Parameter(torch.ones(out_features), requires_grad=False)
+        self.eps = 1e-5
+
+    def forward(self, x):
+        batch_size, _, height, width = x.size()
+
+        # GEMM
+        out_gemm = torch.empty((batch_size, self.out_features, height, width), dtype=torch.float32, device=x.device)
+        gemm_cuda(x.view(batch_size, -1).contiguous().data_ptr(), self.gemm_weight.contiguous().data_ptr(),
+                  out_gemm.view(-1).contiguous().data_ptr(), batch_size, height * width, self.in_features)
+
+        # Group Normalization
+        out_group_norm = torch.empty_like(out_gemm)
+        group_norm_cuda(out_gemm.view(-1).contiguous().data_ptr(), self.mean.contiguous().data_ptr(),
+                        self.var.contiguous().data_ptr(), self.gamma.contiguous().data_ptr(),
+                        self.beta.contiguous().data_ptr(), self.eps, batch_size, self.out_features, height, width, self.num_groups)
+
+        # Minimum Operation
+        out_min = torch.min(out_group_norm, dim=1, keepdim=True)[0]
+
+        # Bias Addition
+        out_bias_add = torch.empty_like(out_min)
+        bias_add_cuda(out_min.view(-1).contiguous().data_ptr(), self.bias.view(-1).contiguous().data_ptr(),
+                      out_bias_add.view(-1).contiguous().data_ptr(), batch_size, 1, height, width)
+
+        return out_bias_add

@@ -1,0 +1,1 @@
+AssertionError: Shapes do not match: expected torch.Size([8, 128, 512, 1024]), but got torch.Size([8, 128, 512, 1024])

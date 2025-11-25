@@ -1,0 +1,728 @@
+My first thought is to look at the operators in the Model class: convolution, batch normalization, and scaling. I should consider replacing these with custom CUDA kernels for potential speedups. Let me start by analyzing each operator.
+
+First, the convolution layer. Implementing a custom 2D convolution in CUDA could offer performance benefits, especially if optimized for the given input dimensions. The standard PyTorch convolution might have some overhead, so a specialized kernel could be faster. I need to handle the convolution operation efficiently, using shared memory for tiles, and coalesced memory access.
+
+Next, the batch normalization (BN). BN can be fused with convolution, but in this case, since it's a separate layer, maybe I can combine it into the same kernel as the convolution to reduce memory traffic. Alternatively, a custom BN kernel might be faster. Since BN involves mean and variance calculations, which are per-channel, I need to compute those efficiently on the GPU. Also, the scaling factor applied after BN could be incorporated into the same kernel to save operations.
+
+The scaling by a constant factor is straightforward, but combining it with the previous operations (convolution and BN) would eliminate the need for a separate step. This operator fusion is probably the best approach here. Let me think about how to combine these steps.
+
+First, the convolution computes the output feature maps. Then BN computes mean and variance over the spatial dimensions for each channel. The forward pass for BN involves normalizing the output, then scaling and shifting by learned parameters (gamma and beta). However, in the given model, the final scaling is by a constant factor (self.scaling_factor), not the BN's gamma. Wait, in the original code, the scaling after BN is a multiplication by scaling_factor, which is a scalar. So the BN has its own gamma and beta parameters, and then there's an extra scaling by a constant. That might be redundant, but according to the problem, we need to replace the operators as given. So the scaling is a separate operation. 
+
+Wait, looking at the original Model's forward:
+
+def forward(self, x):
+    x = self.conv(x)
+    x = self.bn(x)
+    x = x * self.scaling_factor
+    return x
+
+So after BN, multiply by a scalar. So the operators are: Conv2d, BatchNorm2d, and a scalar multiplication. So three operations. The scalar multiplication is a simple element-wise operation, which could be fused with the BN or the convolution.
+
+Fusing the convolution with batch normalization is possible, but I need to handle the mean and variance computation. Wait, but during the forward pass, BN requires the mean and variance computed over the batch. However, in training mode, it uses mini-batch statistics, while in evaluation mode it uses running averages. Since the problem doesn't specify the mode, perhaps the model is in evaluation mode. However, to make the kernel general, maybe I need to handle both cases. But perhaps in the given problem's context, we can assume it's in evaluation mode, so the BN parameters (running_mean, running_var, gamma, beta) are known, and the scaling is a constant. Therefore, the entire process can be expressed as a combination of convolution, normalization using precomputed stats, and scaling.
+
+Alternatively, during training, the batch normalization requires computing mean and variance on the fly, which complicates things. Since the problem doesn't mention the mode, maybe we can proceed under the assumption that the model is in evaluation mode, so the BN operation can be simplified by using the running_mean and running_var stored in the module. Therefore, the fused kernel can combine the convolution with the batch normalization computation (using stored parameters) and then apply the scaling.
+
+Alternatively, perhaps the problem expects us to implement a custom kernel for each operator individually, even if they are separate steps. Let's see:
+
+Option 1: Implement a custom convolution kernel, then the BN, then scaling. However, this may not give the best speedup. 
+
+Option 2: Fuse convolution and BN into a single kernel. This reduces memory accesses and can be faster. Then fuse the scaling into that kernel as well. So a single kernel for all three steps?
+
+Yes, that would be more efficient.
+
+Let me outline the steps of the fused kernel:
+
+The convolution computes the output as conv(x). Then, the BN normalizes each channel (over spatial dimensions) using mean and variances. Since in evaluation mode, these are fixed (running_mean and running_var). The BN formula is:
+
+y = gamma * (x - mean) / sqrt(var + eps) + beta
+
+But then the scaling factor is applied: y = y * scaling_factor
+
+Therefore, combining all steps:
+
+First, compute the convolution output. Then apply the BN normalization, then multiply by scaling_factor. However, this requires three steps. But perhaps the normalization and scaling can be combined into a single step. Let's see:
+
+After the convolution, for each element in the output, compute:
+
+output_conv = conv(x)
+
+bn_out = (output_conv - mean) / sqrt(var + eps) * gamma + beta
+
+final_out = bn_out * scaling_factor
+
+Alternatively, this can be written as:
+
+final_out = [ (output_conv - mean) / sqrt(var + eps) * gamma + beta ] * scaling_factor
+
+But since scaling_factor is a constant, we can precompute gamma * scaling_factor, and beta * scaling_factor.
+
+Wait, the scaling is applied after the entire BN operation. So:
+
+final_out = ( (output_conv - mean)/sqrt(var+eps) ) * gamma + beta ) * scaling_factor
+
+Which can be written as:
+
+final_out = output_conv * ( gamma / sqrt(var+eps) ) * scaling_factor + beta * scaling_factor - mean * gamma * scaling_factor / sqrt(var+eps)
+
+Hmm, but this might complicate the computation. Alternatively, perhaps the scaling can be incorporated into the gamma term. Since the final scaling is a constant, we can precompute the gamma scaled by the factor and beta scaled accordingly.
+
+However, in the kernel, the parameters (gamma, beta, mean, var) are known, so during the kernel computation, for each element, we can compute:
+
+temp = (output_conv_element - mean) / sqrt(var + eps)
+
+then, bn_out_element = temp * gamma + beta
+
+then, scaled_element = bn_out_element * scaling_factor
+
+Therefore, in the kernel, after computing the convolution output, we can immediately apply the normalization and scaling in the same thread.
+
+Therefore, a fused kernel that computes the convolution, applies batch norm, and then scales by the factor can be implemented. This would be more efficient as it reduces memory access and the number of kernel launches.
+
+Therefore, the plan is to implement a custom CUDA kernel that fuses the convolution, batch norm, and scaling operations.
+
+Now, implementing a 2D convolution in CUDA is quite involved. The standard approach is to use an optimized im2col or direct convolution implementation. Since the problem requires speedups, we need an efficient implementation.
+
+Alternatively, perhaps using PyTorch's existing convolution implementation but replacing the subsequent operations with fused steps. However, the question states that we should replace the PyTorch operators with custom CUDA kernels, so replacing the entire path with a custom kernel is better.
+
+First, let's recall the dimensions. The input is (batch_size, in_channels, height, width) = (128, 8, 128, 128). The convolution is kernel_size 3x3, out_channels 64. So the output size after convolution would be (batch, 64, H_out, W_out). Since stride is 1, padding? The problem didn't specify, so assuming default padding (0), so H_out = 128 - 3 +1 = 126, similarly for width. Wait, but in PyTorch's Conv2d, padding is 0 by default. So output spatial dimensions are 126x126.
+
+Wait, but in the get_inputs function, the input is generated with height and width as 128, so after kernel_size 3, output is (128-3+1) = 126. So the output tensor after convolution is (128, 64, 126, 126).
+
+Then, the batch norm is applied over the channels, so each channel's activations are normalized. Since the scaling factor is a scalar applied after BN, this is element-wise multiplication.
+
+To implement a fused kernel, we need to compute the convolution output, then apply the normalization and scaling in the same step.
+
+The steps in the kernel would be:
+
+1. For each output element (n, c, h, w):
+
+   a. Compute the convolution over the input's in_channels and kernel spatial dimensions.
+
+   b. Subtract the channel's mean, divide by sqrt(var + eps), multiply by gamma[c], add beta[c].
+
+   c. Multiply by the scaling_factor.
+
+But to do this efficiently, we need to compute the convolution efficiently.
+
+The challenge is to compute the convolution part efficiently, then apply the element-wise operations.
+
+Implementing a 2D convolution in CUDA requires handling the spatial dimensions, input channels, output channels, and the kernel weights.
+
+An efficient approach would be to use a tiled convolution implementation, using shared memory to load the input and kernel tiles to reduce global memory accesses.
+
+Alternatively, perhaps using the im2col approach, where the input is transformed into a matrix and the kernel into a vector, then matrix multiplication. This can be efficient if using CUDA's cublas for GEMM, but the problem requires writing a custom CUDA kernel, so we need to implement the convolution manually.
+
+Alternatively, given the problem constraints, perhaps we can simplify the convolution implementation, even if it's not the most optimized, but sufficient for the example.
+
+Alternatively, since the problem allows replacing any operators, maybe the convolution is the most time-consuming and replacing it with a fused kernel would be beneficial.
+
+Alternatively, perhaps the batch normalization and scaling can be fused into a single element-wise kernel that can be applied after the convolution. Since convolution is the main computational cost, replacing it with a custom kernel may give the most benefit, but fusing all three into a single kernel would be better.
+
+Let me outline the steps needed for the fused kernel.
+
+First, the kernel will process an output element (n, c, h, w). For each such element, the value is computed as:
+
+conv_output = sum_{ic=0 to in_channels-1} sum_{kh=0 to kernel_size-1} sum_{kw=0 to kernel_size-1} input[n, ic, h_in, w_in] * weight[c, ic, kh, kw]
+
+where h_in = h + kh - pad, etc. Assuming padding is zero, the input indices are h + kh (but need to stay within bounds).
+
+Wait, the kernel is 3x3, so for each output spatial position (h, w), the input region is from h to h+2 and w to w+2 (assuming stride 1, padding 0). Wait, actually, for a 3x3 kernel with no padding and stride 1, the output spatial position (h, w) corresponds to the input region (h : h + kernel_size) in both height and width. Wait, more precisely:
+
+For a given output position (h_out, w_out), the input region starts at (h_out - kh + pad) ? Wait, perhaps it's better to think in terms of:
+
+The output position (h_out, w_out) corresponds to the input starting at (h_out * stride - pad) in both dimensions. Since padding is 0, stride is 1, so the input region is:
+
+input_h_start = h_out
+
+input_w_start = w_out
+
+Then the kernel is applied over a 3x3 window starting at (input_h_start, input_w_start). Wait no, that would not cover the entire kernel. Actually, the input patch for output (h_out, w_out) is the 3x3 region centered at (h_out, w_out) only if there's padding, but without padding, the input region is from h_out to h_out + 2 (since the kernel is 3x3). Wait, actually, for a kernel of size kH x kW, the output spatial dimensions are:
+
+output_height = (input_height - kH) // stride + 1
+
+output_width = (input_width - kW) // stride + 1
+
+With stride 1 and padding 0, input_height=128, kernel_size 3, so output_height is (128-3)/1 +1 = 126.
+
+Therefore, for each output (h_out, w_out), the input region is from h_out to h_out + 2 (inclusive) in height, similarly for width.
+
+So, the kernel for the output element (n, c, h_out, w_out) would compute the sum over:
+
+ic from 0 to in_channels-1,
+
+kh from 0 to 2,
+
+kw from 0 to 2,
+
+of input[n, ic, h_out + kh, w_out + kw] * weight[c][ic][kh][kw]
+
+Then, after computing the convolution, apply the BN and scaling.
+
+But to implement this in CUDA, each thread can handle a single output element (or a tile).
+
+However, implementing this convolution in CUDA is quite involved. Let's see how to structure it.
+
+First, the kernel would need to process each output element (n, c, h, w). The grid and block dimensions need to be set up to cover all these elements.
+
+Alternatively, we can structure the kernel in a way that each thread block computes a tile of the output.
+
+Alternatively, for simplicity, let's consider a naive approach where each thread computes one output element. However, with batch size 128, 64 channels, 126x126 spatial, this would be 128 * 64 * 126^2 = 128 * 64 * 15876 ≈ 128*64*15876 ≈ 12,743,5776 elements. That's a lot of threads, which may be too much. So we need a more efficient approach.
+
+Alternatively, use a tiled approach with shared memory to load the input and kernel tiles, similar to the optimized convolution kernels.
+
+Alternatively, perhaps it's better to separate the convolution into its own kernel, then the batch norm and scaling into another kernel. But the problem allows operator fusion, so combining all three steps into a single kernel is better.
+
+Alternatively, considering that the problem may not require the most optimized implementation, but just a working custom kernel, perhaps proceed with a simpler approach.
+
+First, let's structure the fused kernel as follows:
+
+- The kernel computes the convolution for a single output element, then applies BN and scaling.
+
+However, this is not efficient, but for the purpose of the problem, let's proceed.
+
+First, define the parameters:
+
+The convolution weights: the model's conv.weight and conv.bias. Wait, in the original model, the Conv2d has its own weight and bias. The batch norm has running_mean, running_var, gamma, beta. And the scaling factor is a scalar.
+
+Wait, but in the original code, the Conv2d may have bias enabled or not. The code doesn't specify, so by default, PyTorch's Conv2d has bias enabled. Wait, looking at the code:
+
+In the Model's __init__:
+
+self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+The default for bias in Conv2d is True, so the convolution has a bias term. Therefore, the convolution output includes the bias. The BN then is applied over that.
+
+Therefore, the full computation is:
+
+conv_out = conv(x) + bias
+
+bn_out = (conv_out - mean) / sqrt(var + eps) * gamma + beta
+
+final_out = bn_out * scaling_factor
+
+Thus, in the fused kernel, we need to compute:
+
+conv_out = sum_{ic, kh, kw} (input[ic, h_in + kh, w_in + kw] * weight[c][ic][kh][kw]) + bias[c]
+
+then apply BN, then scaling.
+
+Therefore, the kernel must handle the convolution, including the bias, then the normalization, then scaling.
+
+To implement this, we need to have access to all the parameters:
+
+- Conv weights (out_channels, in_channels, kernel_size, kernel_size)
+
+- Conv bias (out_channels)
+
+- BN's running_mean (out_channels)
+
+- BN's running_var (out_channels)
+
+- BN's gamma (out_channels)
+
+- BN's beta (out_channels)
+
+- scaling_factor (scalar)
+
+These parameters can be passed to the kernel as tensors or pointers.
+
+Now, to structure the kernel:
+
+Each thread can be responsible for computing a single output element (n, c, h, w).
+
+The kernel's steps would be:
+
+1. Compute the convolution sum over the input channels and kernel spatial dimensions for the given (c, h, w, n).
+
+2. Add the bias term for channel c.
+
+3. Normalize using the channel's mean, var, gamma, beta.
+
+4. Multiply by scaling_factor.
+
+But to compute the convolution sum efficiently, the thread would need to loop over the input channels, kernel height, and kernel width, accessing the input data and weights.
+
+The input is a tensor of shape (batch_size, in_channels, height, width). The output is (batch_size, out_channels, out_height, out_width).
+
+The problem is that for each thread, accessing the input data across multiple channels and spatial positions could lead to inefficient memory access patterns, but for the purposes of the problem, perhaps this is acceptable.
+
+Let's proceed.
+
+First, the kernel function definition.
+
+Parameters:
+
+- Input tensor: input (batch, in_channels, H, W)
+
+- Weights: weight (out_channels, in_channels, K, K)
+
+- Bias: bias (out_channels)
+
+- Running_mean: running_mean (out_channels)
+
+- Running_var: running_var (out_channels)
+
+- Gamma: gamma (out_channels)
+
+- Beta: beta (out_channels)
+
+- Scaling factor: scaling_factor (float)
+
+- Output tensor: output (batch, out_channels, H_out, W_out)
+
+The kernel function would loop over all elements.
+
+Now, the CUDA kernel code would need to handle the indices properly.
+
+Let's define the kernel function.
+
+First, the CUDA kernel:
+
+__global__ void fused_conv_bn_scale_kernel(
+    const float* input, const float* weight, const float* bias,
+    const float* running_mean, const float* running_var,
+    const float* gamma, const float* beta, float scaling_factor,
+    float* output,
+    int batch_size, int in_channels, int in_height, int in_width,
+    int out_channels, int kernel_size, int out_height, int out_width) {
+
+    // Calculate the indices for the output element (n, c, h, w)
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+    int n = blockIdx.batch ? ... wait, this is getting complicated.
+
+Wait, the problem is that the grid dimensions in CUDA can't directly map to 4D indices (n, c, h, w). So we need to flatten the indices.
+
+Alternatively, use a single index and compute the 4D coordinates from it.
+
+Let me think of the output as a 4D tensor (N, C, H_out, W_out). To map a 1D thread index to the 4D coordinates:
+
+int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+int w = index % out_width;
+int rem = index / out_width;
+int h = rem % out_height;
+rem /= out_height;
+int c = rem % out_channels;
+rem /= out_channels;
+int n = rem;
+
+But this may not be efficient in terms of memory access, but for simplicity, let's proceed.
+
+Alternatively, we can structure the grid to have blocks per output channel or batch, but this might be more complex.
+
+Alternatively, let's assume that the kernel is launched with a 3D grid (for batch, channels, spatial) but that may not be straightforward.
+
+Alternatively, the kernel can be launched with a 1D grid where each thread is responsible for a single output element. The total number of threads is N * C * H_out * W_out. But this may require a large grid, but for the given dimensions:
+
+N=128, C=64, H_out=126, W_out=126 → total elements: 128*64*126*126 ≈ 128 * 64 * 15876 ≈ 12,743,5776 → that's over 12 million elements. CUDA can handle this, but the kernel needs to be designed properly.
+
+But let's proceed step by step.
+
+First, the kernel function:
+
+Each thread computes one output element (n, c, h, w). The kernel will be:
+
+__global__ void fused_conv_bn_scale_kernel(
+    const float* input, const float* weight, const float* bias,
+    const float* running_mean, const float* running_var,
+    const float* gamma, const float* beta, float scaling_factor,
+    float* output,
+    int batch_size, int in_channels, int in_height, int in_width,
+    int out_channels, int kernel_size, int out_height, int out_width) {
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= batch_size * out_channels * out_height * out_width) {
+        return;
+    }
+
+    int w = index % out_width;
+    int rem = index / out_width;
+    int h = rem % out_height;
+    rem /= out_height;
+    int c = rem % out_channels;
+    rem /= out_channels;
+    int n = rem;
+
+    // Compute the convolution for this (n, c, h, w)
+    float sum = 0.0f;
+    for (int ic = 0; ic < in_channels; ++ic) {
+        for (int kh = 0; kh < kernel_size; ++kh) {
+            for (int kw = 0; kw < kernel_size; ++kw) {
+                int input_h = h + kh;
+                int input_w = w + kw;
+                if (input_h < in_height && input_w < in_width) { // assuming padding=0
+                    float val = input[ n * in_channels * in_height * in_width +
+                                      ic * in_height * in_width +
+                                      input_h * in_width + input_w ];
+                    float weight_val = weight[ c * in_channels * kernel_size * kernel_size +
+                                              ic * kernel_size * kernel_size +
+                                              kh * kernel_size + kw ];
+                    sum += val * weight_val;
+                }
+            }
+        }
+    }
+    sum += bias[c]; // add the bias term
+
+    // Apply batch norm
+    float mean = running_mean[c];
+    float var = running_var[c];
+    float inv_std = 1.0f / sqrt(var + 1e-5f); // assuming eps=1e-5
+    float bn_gamma = gamma[c];
+    float bn_beta = beta[c];
+    float bn_out = (sum - mean) * inv_std * bn_gamma + bn_beta;
+
+    // Apply scaling factor
+    float scaled_out = bn_out * scaling_factor;
+
+    // Write the result to output
+    output[ n * out_channels * out_height * out_width +
+            c * out_height * out_width +
+            h * out_width + w ] = scaled_out;
+}
+
+This is a very naive implementation. However, it has several issues:
+
+1. Memory access patterns are poor because for each input element, it's accessed sequentially, leading to non-coalesced accesses.
+
+2. The loops over kernel dimensions are inside the innermost loops, which may not be optimal for the GPU.
+
+3. The kernel is launched with a large number of threads, which may lead to poor performance due to high memory access latency.
+
+4. The kernel does not handle the case when input_h exceeds in_height - 1, which would happen when h is near the edge (since h ranges from 0 to out_height-1=125, so h + kernel_size-1=125+2=127 < in_height=128). Wait, in_height is 128, so input_h can be up to h + 2 = 125 + 2 = 127, which is within in_height (128). So the check can be removed (since padding is 0, and the output is only computed where the kernel fits within the input).
+
+Wait, since the output's out_height = in_height - kernel_size + 1, so h ranges from 0 to out_height-1 = 125. Therefore h + kernel_size -1 = 125 +2 = 127 < 128. So the indices are always valid. Therefore, the condition can be removed, saving a branch.
+
+So the check can be omitted.
+
+But even then, the kernel is not optimized.
+
+However, given the problem's constraints, this is a starting point.
+
+Now, in the Python code, we need to pass all the parameters to the CUDA kernel.
+
+But in the original Model class, the parameters are stored in the convolution and batch norm layers. Therefore, when creating the ModelNew class, we need to capture these parameters.
+
+Wait, in the original Model:
+
+The parameters for convolution are conv.weight and conv.bias.
+
+The batch norm parameters are bn.running_mean, bn.running_var, bn.weight (gamma), bn.bias (beta).
+
+The scaling factor is a scalar (self.scaling_factor).
+
+Therefore, in the new model, we need to have access to these parameters.
+
+Therefore, the ModelNew class should have the same structure, and the custom kernel must be called with these parameters.
+
+But in the example given, the kernel was defined inline and the function was called with the tensors.
+
+Therefore, in the ModelNew's forward function, the custom CUDA function would be called, passing all the necessary parameters.
+
+First, in the Python code:
+
+We need to define the CUDA kernel inline, then wrap it into a function.
+
+The kernel's parameters are:
+
+input (Tensor), weight (Tensor), bias (Tensor), running_mean (Tensor), running_var (Tensor), gamma (Tensor), beta (Tensor), scaling_factor (float).
+
+Wait, scaling_factor is a scalar, so it can be passed as a float.
+
+The kernel function in Python would have the signature:
+
+def fused_conv_bn_scale_cuda(input: Tensor, weight: Tensor, bias: Tensor, running_mean: Tensor, running_var: Tensor, gamma: Tensor, beta: Tensor, scaling_factor: float) -> Tensor:
+
+But in the original model, the parameters are stored in the conv and bn layers. Therefore, the ModelNew class will have those layers and use their parameters in the custom kernel.
+
+Therefore, the ModelNew class will have:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.scaling_factor = scaling_factor
+        # Also, need to load the fused kernel here.
+
+Wait, but the kernel must be compiled when defining the module, so the code for the kernel will be placed outside the class.
+
+Therefore, the overall structure would be:
+
+First, define the CUDA kernel code as a string.
+
+Then, load it into a module using load_inline.
+
+Then, in the ModelNew class, the forward function will call this kernel, passing the parameters from the conv and bn layers.
+
+However, in PyTorch, the parameters of nn.Modules are stored in Tensors, so we can access them via self.conv.weight, self.conv.bias, self.bn.running_mean, etc.
+
+But note that the batch norm's running_mean and running_var are buffers, not parameters, so they are accessed via .running_mean and .running_var.
+
+Therefore, the forward function would look like:
+
+def forward(self, x):
+    # Get parameters
+    weight = self.conv.weight
+    bias = self.conv.bias
+    running_mean = self.bn.running_mean
+    running_var = self.bn.running_var
+    gamma = self.bn.weight  # or self.bn.gamma ?
+    beta = self.bn.bias
+    scaling_factor = self.scaling_factor
+
+    # Call the fused kernel
+    output = fused_conv_bn_scale_cuda(
+        x, weight, bias, running_mean, running_var, gamma, beta, scaling_factor
+    )
+    return output
+
+But we need to define the fused_conv_bn_scale_cuda function via the CUDA kernel.
+
+Now, writing the CUDA kernel code.
+
+The kernel code must be written in CUDA C++.
+
+The kernel function is as above, but with proper memory accesses.
+
+Wait, but in the kernel code, the parameters are passed as pointers.
+
+The function signature in the kernel code would be:
+
+torch::Tensor fused_conv_bn_scale_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
+                                      torch::Tensor running_mean, torch::Tensor running_var,
+                                      torch::Tensor gamma, torch::Tensor beta, float scaling_factor) {
+
+    // Get dimensions
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int in_height = input.size(2);
+    int in_width = input.size(3);
+
+    int out_channels = weight.size(0); // since weight is (out_channels, in_channels, kH, kW)
+    int kernel_size = weight.size(2); // assuming square kernel
+
+    // Compute output spatial dimensions
+    int out_height = in_height - kernel_size + 1;
+    int out_width = in_width - kernel_size + 1;
+
+    // Create output tensor
+    auto output = torch::zeros({batch_size, out_channels, out_height, out_width}, input.options());
+
+    // Launch kernel
+    dim3 threads(256); // or some other number
+    int total_elements = batch_size * out_channels * out_height * out_width;
+    dim3 blocks((total_elements + threads.x - 1) / threads.x);
+
+    fused_conv_bn_scale_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        scaling_factor,
+        output.data_ptr<float>(),
+        batch_size, in_channels, in_height, in_width,
+        out_channels, kernel_size, out_height, out_width
+    );
+
+    return output;
+}
+
+Wait, but in the CUDA kernel function, the parameters are passed as pointers, and the dimensions are also passed as parameters.
+
+However, in the kernel, the dimensions like in_height, in_width, etc., are needed.
+
+Alternatively, the kernel function can compute these from the input tensor's shape, but since the kernel is written in C++, we can get those from the input tensors in the wrapper function.
+
+Therefore, the kernel code is as above.
+
+Now, the CUDA source code for the kernel:
+
+elementwise_add_source in the example was a string containing the CUDA code.
+
+So, the fused_conv_bn_scale_source would be a string containing the kernel and the wrapper function.
+
+Putting it all together:
+
+The CUDA code string would be:
+
+fused_conv_bn_scale_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <typename T>
+__global__ void fused_conv_bn_scale_kernel(
+    const T* input, const T* weight, const T* bias,
+    const T* running_mean, const T* running_var,
+    const T* gamma, const T* beta, T scaling_factor,
+    T* output,
+    int batch_size, int in_channels, int in_height, int in_width,
+    int out_channels, int kernel_size, int out_height, int out_width) {
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= batch_size * out_channels * out_height * out_width) {
+        return;
+    }
+
+    int w = index % out_width;
+    int rem = index / out_width;
+    int h = rem % out_height;
+    rem /= out_height;
+    int c = rem % out_channels;
+    rem /= out_channels;
+    int n = rem;
+
+    T sum = static_cast<T>(0.0);
+    for (int ic = 0; ic < in_channels; ++ic) {
+        for (int kh = 0; kh < kernel_size; ++kh) {
+            for (int kw = 0; kw < kernel_size; ++kw) {
+                int input_h = h + kh;
+                int input_w = w + kw;
+                // No padding, so input indices are valid
+                int input_offset = n * in_channels * in_height * in_width +
+                                   ic * in_height * in_width +
+                                   input_h * in_width + input_w;
+                T val = input[input_offset];
+                T weight_val = weight[ c * in_channels * kernel_size * kernel_size +
+                                      ic * kernel_size * kernel_size +
+                                      kh * kernel_size + kw ];
+                sum += val * weight_val;
+            }
+        }
+    }
+    sum += bias[c]; // Add bias term
+
+    // Batch norm
+    T mean = running_mean[c];
+    T var = running_var[c];
+    T inv_std = static_cast<T>(1.0) / sqrt(var + static_cast<T>(1e-5));
+    T bn_gamma = gamma[c];
+    T bn_beta = beta[c];
+    T bn_out = (sum - mean) * inv_std * bn_gamma + bn_beta;
+
+    // Scaling factor
+    T scaled_out = bn_out * scaling_factor;
+
+    // Write output
+    int output_offset = n * out_channels * out_height * out_width +
+                        c * out_height * out_width +
+                        h * out_width + w;
+    output[output_offset] = scaled_out;
+}
+
+// Define the wrapper function
+torch::Tensor fused_conv_bn_scale_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
+                                      torch::Tensor running_mean, torch::Tensor running_var,
+                                      torch::Tensor gamma, torch::Tensor beta, float scaling_factor) {
+    // Check that the input tensor is on the same device as others
+    auto device = input.device();
+    TORCH_CHECK(weight.device() == device, "weight must be on device ", device);
+    TORCH_CHECK(bias.device() == device, "bias must be on device ", device);
+    TORCH_CHECK(running_mean.device() == device, "running_mean must be on device ", device);
+    TORCH_CHECK(running_var.device() == device, "running_var must be on device ", device);
+    TORCH_CHECK(gamma.device() == device, "gamma must be on device ", device);
+    TORCH_CHECK(beta.device() == device, "beta must be on device ", device);
+
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int in_height = input.size(2);
+    int in_width = input.size(3);
+
+    int out_channels = weight.size(0);
+    int kernel_size = weight.size(2);
+    int out_height = in_height - kernel_size + 1;
+    int out_width = in_width - kernel_size + 1;
+
+    auto output = torch::zeros({batch_size, out_channels, out_height, out_width}, input.options());
+
+    // Compute grid and block dimensions
+    int total_elements = batch_size * out_channels * out_height * out_width;
+    int threads_per_block = 256;
+    int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+
+    // Launch kernel
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "fused_conv_bn_scale_cuda", [&] {
+        fused_conv_bn_scale_kernel<<<blocks_per_grid, threads_per_block>>>(
+            input.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            bias.data_ptr<scalar_t>(),
+            running_mean.data_ptr<scalar_t>(),
+            running_var.data_ptr<scalar_t>(),
+            gamma.data_ptr<scalar_t>(),
+            beta.data_ptr<scalar_t>(),
+            scaling_factor,
+            output.data_ptr<scalar_t>(),
+            batch_size, in_channels, in_height, in_width,
+            out_channels, kernel_size, out_height, out_width
+        );
+    });
+
+    return output;
+}
+"""
+
+Wait, note that in the kernel code, I used templates to handle different data types (float, half, etc.), but since the example uses float, maybe it's okay. However, using AT_DISPATCH_FLOATING_TYPES allows the code to handle any floating point type.
+
+Also, the CUDA kernel must be defined with a template and then dispatched in the wrapper function.
+
+The wrapper function uses AT_DISPATCH_FLOATING_TYPES to handle different scalar types.
+
+Now, the corresponding header declarations:
+
+The CUDA code also needs to have a function declaration for the kernel in the C++ source.
+
+Therefore, the .cpp source would have:
+
+fused_conv_bn_scale_cpp_source = """
+torch::Tensor fused_conv_bn_scale_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
+                                      torch::Tensor running_mean, torch::Tensor running_var,
+                                      torch::Tensor gamma, torch::Tensor beta, float scaling_factor);
+"""
+
+Now, in the Python code:
+
+We can use the load_inline function to compile this CUDA code.
+
+Thus, the full Python code would be:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA kernel code
+fused_conv_bn_scale_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <typename T>
+__global__ void fused_conv_bn_scale_kernel(
+    const T* input, const T* weight, const T* bias,
+    const T* running_mean, const T* running_var,
+    const T* gamma, const T* beta, T scaling_factor,
+    T* output,
+    int batch_size, int in_channels, int in_height, int in_width,
+    int out_channels, int kernel_size, int out_height, int out_width) {
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= batch_size * out_channels * out_height * out_width) {
+        return;
+    }
+
+    int w = index % out_width;
+    int rem = index / out_width;
+    int h = rem % out_height;
+    rem /= out_height;
+    int c = rem % out_channels;
+    rem /= out_channels;
+    int n = rem;
+
+    T sum = static_cast<T>(0.0);
+    for (int ic = 0; ic < in_channels;

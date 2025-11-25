@@ -1,0 +1,729 @@
+Make sure to include the following elements in your code:
+
+1. The new class ModelNew that replaces the original Model.
+2. The custom CUDA kernels written inline in Python using the torch.utils.cpp_extension.load_inline function.
+3. The get_inputs() and get_init_inputs() functions should also be redefined to match the new model's input requirements, if needed. In this case, the inputs are the same as the original so no changes are needed.
+
+Additional requirements:
+
+- The code must be compatible with PyTorch 2.0 and above, and CUDA 11.8 or higher.
+- The generated CUDA kernels must handle tensors of size up to 2^31 elements, which requires using int64_t where necessary (e.g., for the tensor sizes or indices).
+- The kernels must be efficient and use shared memory, thread synchronization, or other optimization techniques where appropriate.
+- The kernels should include error checking for CUDA calls (e.g., using CUDA_KERNEL_ASSERT(cudaGetLastError())). 
+- The code should include detailed comments explaining your design choices and optimizations.
+
+Now, proceed to the problem.
+
+
+
+Okay, I need to optimize the L2 normalization operation using a custom CUDA kernel. The original model uses x / torch.norm(x, p=2, dim=1, keepdim=True). Let me think about how to do this efficiently with CUDA.
+
+First, the L2 norm calculation along dimension 1. For a tensor of shape (batch_size, dim), each element in the batch needs the norm of its own vector. The division then scales each element by that norm.
+
+The standard approach in PyTorch might involve multiple steps: compute the squared elements, sum along the dimension, take the square root, then divide. But doing this in a single kernel could save time.
+
+I should combine the norm computation and the division into one kernel to reduce memory traffic and kernel launches. Let me see how to structure this.
+
+Each thread can handle one element of the input. Since we're working along dim=1, each vector is a row. So for a given row (batch element), all threads in a block can process that row. Wait, but rows are independent. Maybe process each row in parallel using a block per row?
+
+Wait, for a batch_size of 32768 and dim 65535, each row has 65535 elements. The number of threads per block is limited (like 1024). Hmm, perhaps we can use a block for each row, and have each thread handle a portion of the elements in the row.
+
+So for each row (block), threads compute their part of the squared sum, then do a reduction to get the total. Then compute the norm, then do the division for each element.
+
+Let's outline steps:
+
+1. Each block handles a single row (since each row is independent).
+2. Within a block, threads divide the work of the row. For example, with 1024 threads, each thread could handle ~64 elements (since 65535 / 1024 ≈ 64).
+3. Each thread computes the square of their assigned elements and accumulates the partial sum.
+4. Use shared memory to accumulate the partial sums from all threads in the block to get the total squared norm for the row.
+5. Compute the norm (sqrt of sum).
+6. Then, each thread divides their assigned elements by the norm.
+
+But how to handle the reduction efficiently? Maybe using a parallel reduction in shared memory.
+
+First, let's think of the kernel structure. The grid will have as many blocks as there are rows (batch_size). Each block processes a single row.
+
+Each block has N threads (maybe 1024?), each handling a chunk of elements.
+
+Wait, the number of threads per block must be a power of two? Not necessarily, but best practice. Let's see:
+
+dim is 65535, which is 2^16 -1. So for a block processing a row of 65535 elements, if we use 1024 threads per block, each thread can handle 64 elements (since 65535 /1024 ≈ 64). So each thread's loop would process 64 elements. Then, the thread's partial sum can be stored in shared memory.
+
+Wait, let's formalize this:
+
+BlockIdx.x corresponds to the row index (from 0 to batch_size-1).
+
+Each thread in the block has an index threadIdx.x. The number of threads per block is chosen such that each thread can process a chunk of the elements in the row. Let's say threadsPerBlock = 1024, then each thread handles (dim + threadsPerBlock -1)/threadsPerBlock elements. Wait, no. Let me think: the total elements per row is dim. Each thread processes (dim + num_threads -1) / num_threads elements. For example, if dim=65535 and threadsPerBlock=1024, each thread handles 64 elements (since 65535 /1024 ≈64.0). Wait 1024*64=65536, which is one more than needed, so maybe 64 or 63? Need to adjust.
+
+Alternatively, let the threads handle exactly dim / threadsPerBlock elements each, with some threads handling the remainder. To make it simpler, perhaps using a loop over all elements in the row, but that could be inefficient for large dim.
+
+Alternatively, using a tiled approach.
+
+Alternatively, maybe use a 1D thread block, with each thread handling a chunk of the row's elements. The steps per block would be:
+
+1. Compute the squared sum for the row. This requires each thread to process a chunk of elements, accumulate their squares, then do a reduction within the block.
+
+But how to handle the reduction? Let's think:
+
+Each thread processes its chunk, sums the squares. Then, they store their partial sums in shared memory. Then, perform a reduction across the shared memory array to get the total sum. Then compute the norm as sqrt(sum). Then, each thread can divide their elements by the norm.
+
+But how to do the reduction?
+
+The reduction can be done in shared memory. Let's see:
+
+First, the threads process their chunks and compute their partial sums. These are stored in shared memory. Then, the block reduces the shared memory array to find the total sum. The first thread (thread 0) can handle the final step. Or, use a parallel reduction approach.
+
+Alternatively, have each thread do their own part, then after storing in shared memory, the first thread can loop through all the partial sums and add them. But that might be slow for large threadsPerBlock (1024 threads would need 1024 adds).
+
+Hmm. Alternatively, use a parallel reduction algorithm in shared memory. For example, first each thread has a partial sum. Then, each pair of threads combines their sums, then the next pair, etc. This requires log2(threadsPerBlock) steps. Let's see:
+
+Suppose threadsPerBlock is 1024. The first step reduces to 512 sums, then 256, etc., until the first thread has the total.
+
+This is manageable. The steps would be something like this:
+
+- Each thread loads their partial sum into shared memory.
+
+- Then, for each iteration of the reduction, each thread i (if even) adds thread i+1's value to thread i's value, and writes the result back. The threadsPerBlock is halved each step until one remains.
+
+Wait, but this requires synchronization between threads. So, the reduction steps must be done with __syncthreads() after each step.
+
+So the plan is:
+
+1. For a given row (blockIdx.x):
+
+   a. Each thread in the block reads their chunk of the input row, computes the square of each element, and accumulates into their private partial sum.
+
+   b. Store the partial sums into shared memory.
+
+   c. Perform a parallel reduction in shared memory to get the total squared norm.
+
+   d. Compute the norm (sqrt(total_squared)).
+
+   e. Then, each thread reads their chunk of the input again, divides by the norm, and writes to the output.
+
+But wait, the norm is a scalar, so once computed, each thread can use it for their elements.
+
+Now, the steps in code:
+
+First, the kernel function.
+
+We need to handle the input tensor, which is a 2D tensor of shape (batch_size, dim). The output is the same shape.
+
+The kernel parameters would be pointers to the input and output tensors, the batch_size, dim, and the stride (if necessary). Wait, since it's a contiguous tensor, the stride is 1 for the second dimension. So the input and output are stored in row-major order.
+
+The steps for the kernel:
+
+First, for each block (row):
+
+   1. Each thread processes their chunk of elements in the row.
+
+      a. The starting index in the row is threadIdx.x * chunk_size.
+
+      b. The chunk_size is (dim + blockDim.x -1)/blockDim.x.
+
+      Wait, need to calculate exactly. Alternatively, loop over elements in the chunk.
+
+But first, let's code this step.
+
+First, in the kernel:
+
+__global__ void l2_norm_kernel(float* in_data, float* out_data, int batch_size, int dim) {
+
+    int row = blockIdx.x;
+
+    if (row >= batch_size) return;
+
+    // Each thread in the block processes a portion of the row.
+
+    // Shared memory for partial sums.
+
+    extern __shared__ float shared[];
+
+    int tid = threadIdx.x;
+
+    float partial_sum = 0.0f;
+
+    // Each thread processes a chunk of elements.
+
+    for (int i = tid; i < dim; i += blockDim.x) {
+
+        float val = in_data[row * dim + i];
+
+        partial_sum += val * val;
+
+    }
+
+    // Store partial_sum to shared memory.
+
+    shared[tid] = partial_sum;
+
+    __syncthreads();
+
+    // Now perform reduction in shared memory.
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+
+        if (tid < s) {
+
+            shared[tid] += shared[tid + s];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    float total_squared = shared[0];
+
+    // Compute the norm. The first thread will do this, but need to broadcast it to all threads.
+
+    // Use __syncthreads() to ensure all threads see the total_squared.
+
+    float norm = sqrtf(total_squared);
+
+    __syncthreads();
+
+    // Now compute the output. Each thread does their chunk again.
+
+    for (int i = tid; i < dim; i += blockDim.x) {
+
+        float val = in_data[row * dim + i];
+
+        out_data[row * dim + i] = val / norm;
+
+    }
+
+}
+
+Wait, but the norm is only computed once, so how do other threads get it? Oh right, the total_squared is stored in shared[0], and after the reduction, all threads can read it. So each thread can compute norm as sqrt(total_squared). Wait, but the first thread (tid 0) will have the total_squared in shared[0], but others can read it too. So every thread can compute the norm. That's okay. But since it's the same for all threads in the block, that's fine.
+
+Wait, but when the first thread does sqrt, the others can do it as well, which is redundant. But in the code above, each thread would compute sqrt(total_squared). Hmm, but the total_squared is stored in shared[0], so after the reduction, all threads can read it. So each thread can compute the norm. Alternatively, have the first thread compute it and broadcast to shared memory.
+
+Alternatively, have the first thread compute the norm and store it in shared[0], then others can read it. Let me think:
+
+After the reduction step, only thread 0 has the total_squared. So:
+
+After the reduction loop, thread 0 computes the norm and stores it in shared[0], then sync.
+
+Then all threads can read it.
+
+So modifying the code:
+
+// After the reduction loop:
+
+if (tid == 0) {
+
+    norm = sqrtf(total_squared);
+
+    shared[0] = norm;
+
+}
+
+__syncthreads();
+
+norm = shared[0];
+
+This way, only thread 0 computes the norm, and others read it from shared memory.
+
+That's better, saves redundant sqrt calculations. So the code would be:
+
+    ...
+
+    // After reduction:
+
+    if (tid ==0) {
+
+        norm = sqrtf(total_squared);
+
+        shared[0] = norm;
+
+    }
+
+    __syncthreads();
+
+    norm = shared[0];
+
+    __syncthreads();
+
+    // Then proceed with division.
+
+Wait, but after the first __syncthreads(), all threads can read shared[0], so the norm is stored there, and then the threads can proceed.
+
+So that's better.
+
+Now, the shared memory size needed is blockDim.x + 1? Let's see:
+
+The shared array is declared as extern __shared__ float shared[];
+
+The size needed is blockDim.x for the partial sums, plus 1 for storing the norm. Wait, actually, in the code above, the partial_sum is stored in shared[tid], which is size blockDim.x. Then, the norm is stored in shared[0], but that's okay because after the first write, the thread 0 overwrites it with the norm.
+
+Alternatively, maybe the total_squared is stored in shared[0] after the reduction, and then thread 0 computes the norm and stores it in shared[0].
+
+Wait, let me retrace:
+
+The first loop accumulates the partial sums in each thread's partial_sum. They are written to shared[tid], so the shared array has blockDim.x elements.
+
+After the reduction loops, shared[0] contains the total_squared.
+
+Then, thread 0 computes the norm, stores it back into shared[0], then all threads read from there.
+
+Thus, the shared memory needs to be at least blockDim.x elements. So when we call the kernel, we need to allocate enough shared memory. The size is blockDim.x * sizeof(float). So in the kernel launch:
+
+We can calculate the shared memory size as blockDim.x * sizeof(float). But since the kernel uses extern __shared__, the user must specify the size when launching.
+
+So, when we call the kernel, we need to compute the shared memory size as blockDim.x + some buffer? Wait, no, in this case, the shared array's size is blockDim.x, so the shared memory required is blockDim.x * sizeof(float).
+
+Wait, in the code above, the shared array is used for the partial sums (blockDim.x elements), then for storing the norm. Since the norm is stored in the first element, which was previously the total_squared, but after that, the shared memory is reused.
+
+So the shared memory required is exactly blockDim.x floats.
+
+Therefore, when launching the kernel, the shared memory size is blockDim.x * sizeof(float).
+
+But how do we compute the block size?
+
+The block size (blockDim.x) is chosen as a parameter. Let's say we pick 1024 threads per block. Then, the shared memory needed per block is 1024 * 4 bytes = 4KB, which is acceptable.
+
+But the problem says the tensors can be up to 2^31 elements, which is way larger than the given dim (65535). Wait, but the problem specifies that the inputs are the same, so maybe dim is 65535 here, but the code must handle larger sizes. The kernel should use 64-bit indices where necessary.
+
+Wait, in the kernel code, the variables for the indices need to be int64_t to handle large tensors. Because the total elements could be up to 2^31, which is more than 2^31, but 64 bits can handle it.
+
+Wait, the code uses:
+
+for (int i = tid; i < dim; i += blockDim.x) {
+
+But if dim is very large (like 2^30), then 'int' may not be enough. So variables like dim and the indices should be of type int64_t (or size_t), but in CUDA, using int may be okay if dim is up to 2^31-1. Wait, the maximum value of an int is 2^31-1, so if dim is up to that, using int is okay. So perhaps it's okay here.
+
+Wait, the problem requires handling up to 2^31 elements, so the dimensions can be up to that. So in the kernel parameters, the dim and batch_size should be passed as int64_t.
+
+Wait, in the kernel function:
+
+__global__ void l2_norm_kernel(float* in_data, float* out_data, int64_t batch_size, int64_t dim) {
+
+That way, the parameters can handle large values.
+
+The code:
+
+Now, putting it all together.
+
+First, define the CUDA code as a string for inline compilation.
+
+The kernel function will be in the CUDA source.
+
+Also, the kernel needs to handle the shared memory allocation. The user must specify the shared memory size when launching the kernel.
+
+The kernel's extern __shared__ float shared[] requires that the caller specifies the shared memory size via the <<< ... , sharedMemSize >>> syntax.
+
+So, in the kernel launch code:
+
+blockDim = 1024 (or another value chosen)
+
+sharedMemPerBlock = blockDim * sizeof(float)
+
+So, the kernel launch would be:
+
+l2_norm_kernel<<<numBlocks, blockDim, sharedMemSize>>>(...);
+
+Now, in the Python code, the function to call the CUDA kernel would compute the required parameters.
+
+Now, the Python code would have:
+
+class ModelNew:
+
+    def __init__(self):
+
+        self.l2_norm = load_inline(...)
+
+    def forward(self, x):
+
+        return self.l2_norm.kernel(...)
+
+Now, the CUDA kernel code.
+
+Another consideration: The input and output tensors must be contiguous. The original code uses x = torch.rand(batch_size, dim).cuda(). So the tensors are in contiguous memory. But to be safe, maybe we should check or require contiguous.
+
+In the kernel, the input and output are accessed as in_data[row * dim + i], which assumes row-major order and contiguous storage.
+
+Thus, in the Python function, we can ensure that the input is contiguous by using .contiguous().
+
+Now, putting all together.
+
+First, the CUDA code:
+
+elementwise_add was an example, but here it's the L2 norm kernel.
+
+The CUDA source:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void l2_norm_kernel(float* in_data, float* out_data, int64_t batch_size, int64_t dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    extern __shared__ float shared[];
+    int tid = threadIdx.x;
+
+    float partial_sum = 0.0f;
+
+    // Compute partial sum of squares for this thread's chunk
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = in_data[row * dim + i];
+        partial_sum += val * val;
+    }
+
+    // Store partial sum in shared memory
+    shared[tid] = partial_sum;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float total_squared = shared[0];
+    float norm;
+    if (tid == 0) {
+        norm = sqrtf(total_squared);
+        shared[0] = norm;
+    }
+    __syncthreads();
+    norm = shared[0];
+
+    // Now perform the division
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = in_data[row * dim + i];
+        out_data[row * dim + i] = val / norm;
+    }
+}
+
+torch::Tensor l2_norm_cuda(torch::Tensor in) {
+    auto batch_size = in.size(0);
+    auto dim = in.size(1);
+
+    // Ensure input is contiguous
+    in = in.contiguous();
+    auto out = torch::empty_like(in);
+
+    // Launch configuration
+    int threads_per_block = 1024;
+    int blocks = batch_size;
+
+    // Shared memory size in bytes: threads_per_block * sizeof(float)
+    size_t shared_mem_size = threads_per_block * sizeof(float);
+
+    // Launch kernel
+    l2_norm_kernel<<<blocks, threads_per_block, shared_mem_size>>>(
+        in.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    // Check for errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
+    }
+
+    return out;
+}
+
+Then, the corresponding C++ header:
+
+extern "C" TORCH_API torch::Tensor l2_norm_cuda(torch::Tensor in);
+
+Wait, but in the inline code, the functions are declared in the cpp_sources. So the cpp source would be:
+
+"extern \"C\" torch::Tensor l2_norm_cuda(torch::Tensor in);"
+
+Wait, in the example, the CPP source was a header with a function prototype. So the CPP source is:
+
+l2_norm_cpp_source = (
+    "extern \"C\" torch::Tensor l2_norm_cuda(torch::Tensor in);"
+)
+
+Now, the Python code:
+
+We need to load this inline CUDA code.
+
+Putting it all together:
+
+The Python code:
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA kernel source
+l2_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void l2_norm_kernel(float* in_data, float* out_data, int64_t batch_size, int64_t dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    extern __shared__ float shared[];
+    int tid = threadIdx.x;
+
+    float partial_sum = 0.0f;
+
+    // Compute partial sum of squares for this thread's chunk
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = in_data[row * dim + i];
+        partial_sum += val * val;
+    }
+
+    // Store partial sum in shared memory
+    shared[tid] = partial_sum;
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float total_squared = shared[0];
+    float norm;
+    if (tid == 0) {
+        norm = sqrtf(total_squared);
+        shared[0] = norm;
+    }
+    __syncthreads();
+    norm = shared[0];
+
+    // Now perform the division
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = in_data[row * dim + i];
+        out_data[row * dim + i] = val / norm;
+    }
+}
+
+torch::Tensor l2_norm_cuda(torch::Tensor in) {
+    auto batch_size = in.size(0);
+    auto dim = in.size(1);
+
+    // Ensure input is contiguous
+    in = in.contiguous();
+    auto out = torch::empty_like(in);
+
+    int threads_per_block = 1024;
+    int blocks = batch_size;
+
+    // Shared memory size in bytes: threads_per_block * sizeof(float)
+    size_t shared_mem_size = threads_per_block * sizeof(float);
+
+    // Launch kernel
+    l2_norm_kernel<<<blocks, threads_per_block, shared_mem_size>>>(
+        in.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    // Check for errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
+    }
+
+    return out;
+}
+"""
+
+l2_norm_cpp_source = (
+    "extern \"C\" torch::Tensor l2_norm_cuda(torch::Tensor in);"
+)
+
+# Compile the CUDA code
+l2_norm = load_inline(
+    name="l2_norm",
+    cpp_sources=l2_norm_cpp_source,
+    cuda_sources=l2_norm_source,
+    functions=["l2_norm_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l2_norm = l2_norm  # Stores the module with the CUDA function
+
+    def forward(self, x):
+        return self.l2_norm.l2_norm_cuda(x)
+
+Now, the get_inputs and get_init_inputs functions don't need changes since the inputs are the same as before.
+
+Wait, but in the original code, the get_inputs returns [x], which is correct. The model takes a single input, so no changes needed.
+
+Now, check the code for any issues.
+
+First, the kernel uses blockDim.x as the threads per block. The kernel's block size is set to 1024 in the launcher. But the code uses blockDim.x in the kernel, which is 1024, so the shared memory size is 1024 * 4 bytes = 4KB. That's okay.
+
+Another thing: when dim is not divisible by the threads_per_block, the loop for (int i = tid; i < dim; i += blockDim.x) correctly handles all elements.
+
+The reduction loop in shared memory is correct. The first step reduces to half the threads, then repeats until one remains.
+
+Error checking is done via cudaGetLastError().
+
+The CUDA function ensures the input is contiguous.
+
+Potential optimizations:
+
+- Choosing the block size. Maybe 512 threads per block would give better occupancy? Or 1024 is okay.
+
+- The reduction in shared memory could be optimized further, but for now, the code should work.
+
+- Using double precision? The original code uses float, so the kernel uses float.
+
+- The kernel could handle larger data types, but the problem states the input is float.
+
+The code should handle large batch sizes and dimensions as required (since parameters are int64_t).
+
+Another consideration: the kernel uses float. If the input is double, this won't work, but the problem's example uses float, so that's okay.
+
+Now, testing in mind:
+
+Suppose batch_size=1, dim=3.
+
+Input tensor is [[a, b, c]]
+
+The norm is sqrt(a² + b² + c²). The kernel would process each row (only 1 block).
+
+Each thread (up to 1024, but dim=3) would process their elements. For example, thread 0 does element 0, 1024, etc. But since dim is small, the loop will handle all elements.
+
+The reduction would sum their partial sums correctly.
+
+Then the norm is computed and division done.
+
+So the code should work.
+
+Thus, the code seems correct.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA kernel source for L2 normalization
+l2_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void l2_norm_kernel(float* in_data, float* out_data, int64_t batch_size, int64_t dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    extern __shared__ float shared[];
+    int tid = threadIdx.x;
+
+    float partial_sum = 0.0f;
+
+    // Compute partial sum of squares for each thread's chunk
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = in_data[row * dim + i];
+        partial_sum += val * val;
+    }
+
+    // Store partial sum in shared memory
+    shared[tid] = partial_sum;
+    __syncthreads();
+
+    // Reduction in shared memory to compute total squared norm
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float total_squared = shared[0];
+    float norm;
+    if (tid == 0) {
+        norm = sqrtf(total_squared);
+        shared[0] = norm;
+    }
+    __syncthreads();
+    norm = shared[0];
+
+    // Perform division by norm for each element
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = in_data[row * dim + i];
+        out_data[row * dim + i] = val / norm;
+    }
+}
+
+torch::Tensor l2_norm_cuda(torch::Tensor in) {
+    auto batch_size = in.size(0);
+    auto dim = in.size(1);
+
+    // Ensure input is contiguous for row-major access
+    in = in.contiguous();
+    auto out = torch::empty_like(in);
+
+    const int threads_per_block = 1024;
+    const int blocks = batch_size;
+
+    // Calculate shared memory size (floats) and convert to bytes
+    size_t shared_mem_size = threads_per_block * sizeof(float);
+
+    // Launch kernel with proper configuration
+    l2_norm_kernel<<<blocks, threads_per_block, shared_mem_size>>>(
+        in.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    // Check for CUDA errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
+    }
+
+    return out;
+}
+"""
+
+l2_norm_cpp_source = (
+    "extern \"C\" torch::Tensor l2_norm_cuda(torch::Tensor in);"
+)
+
+# Compile the inline CUDA code
+l2_norm = load_inline(
+    name="l2_norm",
+    cpp_sources=l2_norm_cpp_source,
+    cuda_sources=l2_norm_source,
+    functions=["l2_norm_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l2_norm = l2_norm
+
+    def forward(self, x):
+        return self.l2_norm.l2_norm_cuda(x)
+
+def get_inputs():
+    x = torch.rand(batch_size, dim).cuda()
+    return [x]
+
+def get_init_inputs():
+    return []
+```

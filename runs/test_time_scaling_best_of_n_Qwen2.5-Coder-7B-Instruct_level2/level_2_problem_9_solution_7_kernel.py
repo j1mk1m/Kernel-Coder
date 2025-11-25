@@ -1,0 +1,86 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused GEMM and ReLU
+fused_gemm_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_gemm_relu_kernel(const float* A, const float* B, float* C, int m, int n, int k, float subtract_value, float multiply_value) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += A[row * k + i] * B[i * n + col];
+        }
+        C[row * n + col] = max(sum - subtract_value, 0.0f) * multiply_value;
+    }
+}
+
+torch::Tensor fused_gemm_relu_cuda(torch::Tensor A, torch::Tensor B, float subtract_value, float multiply_value) {
+    auto m = A.size(0);
+    auto n = B.size(1);
+    auto k = A.size(1);
+
+    auto C = torch::zeros({m, n}, A.options());
+
+    const int block_size = 256;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    fused_gemm_relu_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(
+        A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), m, n, k, subtract_value, multiply_value);
+
+    return C;
+}
+"""
+
+fused_gemm_relu_cpp_source = (
+    "torch::Tensor fused_gemm_relu_cuda(torch::Tensor A, torch::Tensor B, float subtract_value, float multiply_value);"
+)
+
+# Compile the inline CUDA code for fused GEMM and ReLU
+fused_gemm_relu = load_inline(
+    name="fused_gemm_relu",
+    cpp_sources=fused_gemm_relu_cpp_source,
+    cuda_sources=fused_gemm_relu_source,
+    functions=["fused_gemm_relu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, subtract_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.fused_gemm_relu = fused_gemm_relu
+
+    def forward(self, x):
+        x = self.fused_gemm_relu.fused_gemm_relu_cuda(x, x, subtract_value, multiply_value)
+        return x
+
+# Example usage
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+subtract_value = 2.0
+multiply_value = 1.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, subtract_value, multiply_value]
+
+# Initialize model and inputs
+model_new = ModelNew(in_features, out_features, subtract_value, multiply_value)
+inputs = get_inputs()
+
+# Forward pass
+output = model_new(inputs[0])
+print(output.shape)

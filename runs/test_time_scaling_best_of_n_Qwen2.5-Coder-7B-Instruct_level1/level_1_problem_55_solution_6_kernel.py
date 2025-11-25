@@ -1,0 +1,33 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+// Your CUDA kernel implementation here
+"""
+
+convolution_cpp_source = (
+    // Your C++ function declaration here
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.conv2d = convolution
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv2d.convolution_cuda(x)

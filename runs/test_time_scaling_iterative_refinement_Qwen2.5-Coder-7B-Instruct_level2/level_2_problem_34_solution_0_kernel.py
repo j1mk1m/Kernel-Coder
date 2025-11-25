@@ -1,0 +1,106 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D transposed convolution
+conv_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose_kernel(const float* input, float* output, const float* weight, int batch_size, int in_channels, int out_channels, int D_in, int H_in, int W_in, int D_out, int H_out, int W_out, int kernel_size, int stride, int padding) {
+    // Implement the 3D transposed convolution kernel here
+}
+
+torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, int stride, int padding) {
+    // Implement the CUDA function wrapper here
+}
+"""
+
+conv_transpose_cpp_source = (
+    "torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for 3D transposed convolution
+conv_transpose = load_inline(
+    name="conv_transpose",
+    cpp_sources=conv_transpose_cpp_source,
+    cuda_sources=conv_transpose_source,
+    functions=["conv_transpose_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for Layer Normalization
+layer_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void layer_norm_kernel(const float* input, float* output, const float* mean, const float* inv_std, int batch_size, int channels, int D, int H, int W) {
+    // Implement the Layer Normalization kernel here
+}
+
+torch::Tensor layer_norm_cuda(torch::Tensor input) {
+    // Implement the CUDA function wrapper here
+}
+"""
+
+layer_norm_cpp_source = (
+    "torch::Tensor layer_norm_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for Layer Normalization
+layer_norm = load_inline(
+    name="layer_norm",
+    cpp_sources=layer_norm_cpp_source,
+    cuda_sources=layer_norm_source,
+    functions=["layer_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for GELU activation
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_kernel(const float* input, float* output, int batch_size, int channels, int D, int H, int W) {
+    // Implement the GELU kernel here
+}
+
+torch::Tensor gelu_cuda(torch::Tensor input) {
+    // Implement the CUDA function wrapper here
+}
+"""
+
+gelu_cpp_source = (
+    "torch::Tensor gelu_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for GELU activation
+gelu = load_inline(
+    name="gelu",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True, eps=1e-5, scaling_factor=1.0):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = conv_transpose
+        self.layer_norm = layer_norm
+        self.gelu = gelu
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose.conv_transpose_cuda(x, weight=None, stride=stride, padding=padding)
+        x = self.layer_norm.layer_norm_cuda(x)
+        x = self.gelu.gelu_cuda(x)
+        x = x * self.scaling_factor
+        return x

@@ -1,0 +1,1 @@
+// (No additional C++ code needed beyond the inline CUDA kernel)

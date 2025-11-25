@@ -1,0 +1,1 @@
+RuntimeError: CUDA error: invalid device function

@@ -1,0 +1,906 @@
+The new architecture must be a valid replacement of the original architecture, and the inputs and outputs of the forward function must be identical to the original architecture. You can make any changes to the code structure of the model (e.g., adding helper functions, variables, etc.) as long as the forward function inputs and outputs are the same as the original architecture. Also, the get_inputs() function must remain the same as the original. 
+
+The new architecture must not use the original operators. That is, you cannot call the original operators (like x / torch.mean(...)) in the new architecture. All operations must be implemented with custom CUDA kernels.
+
+Specifically for the L1 normalization, the operation is as follows:
+
+Given a tensor x of shape (..., dim, ...), compute the mean of the absolute values along dim, then divide each element by this mean. The result should have the same shape as x.
+
+
+Okay, let's see. The user wants me to optimize the L1 normalization in their PyTorch model by replacing the existing operations with custom CUDA kernels. The original model uses x / torch.mean(torch.abs(x), dim=1, keepdim=True). I need to reimplement both the absolute value, the mean along a specific dimension, and the division, all in CUDA.
+
+First, I should break down the steps. The L1 normalization involves three main steps: computing the absolute values of the input, taking the mean along dimension 1, and then dividing each element by that mean. The original code uses torch.mean and torch.abs, which I can't use anymore. So each of these operations needs a custom kernel or combined into a fused kernel for better performance.
+
+Hmm, combining them into a single kernel might be more efficient. Because doing each step separately would involve multiple kernel launches and memory accesses, which could be slow. If I can compute the absolute values, accumulate the sums, compute the mean, and then divide all in one pass, that could save time. But how?
+
+Wait, the mean is the sum divided by the number of elements in the dimension. The division by the mean would then be equivalent to multiplying by (count / sum). Maybe I can structure the kernel to first compute the absolute values and accumulate the sums per batch along the specified dimension, then compute the inverse of the mean, and apply the division in a second kernel. Or perhaps do it in a single kernel with shared memory?
+
+Alternatively, maybe split into two steps: first compute the absolute values and the sum along dimension 1, then compute the inverse mean and apply it. Let me think.
+
+The dimension here is dim=65535, which is a large dimension. The input shape is (batch_size, dim, ...), but in the given get_inputs, it's (batch_size, dim) since dim is 65535. Wait, in the problem statement, the shape is (..., dim, ...), but in the get_inputs, it's 2D (batch_size, dim). So the dimension to normalize over is dim=1 (the second dimension in the 2D case).
+
+So for each element in the batch (along the batch axis), we compute the mean of the absolute values along dim=1, then divide each element in that batch's slice by that mean.
+
+The challenge is to compute this efficiently with CUDA. Let's think about how to structure the kernel.
+
+First, for the absolute values: that's straightforward, each element's absolute value is computed. Then, the sum over the dimension (dim=1, which is the columns in a 2D tensor) for each row (each sample in the batch). The sum for each row is the sum of all elements in that row's column dimension. Then, divide each element by (sum / dim_length), so the mean is sum / dim_length. So the division would be x[i,j] / (sum_i / dim_length) = x[i,j] * (dim_length / sum_i).
+
+Wait, the mean is sum(abs(x_i)) / dim_length, so dividing by that mean is equivalent to multiplying by (dim_length / sum). So, the division can be expressed as multiplication by a scalar for each row.
+
+Therefore, the steps are:
+
+1. Compute absolute values of all elements in the input tensor. But actually, the absolute values are needed only to compute the sum. Wait, the actual L1 normalization requires the absolute values in the denominator's mean, but the numerator is the original x, not the absolute value. So the division is x divided by the mean of the absolute values. Therefore, the absolute is only for the denominator's computation. So actually, the absolute of the input is computed only for the purpose of calculating the denominator. So the numerator uses the original x, but the denominator's mean is based on the absolute values.
+
+Ah right! So the steps are:
+
+- Compute the absolute values of the input tensor (to get |x|), then sum along dimension 1 to get sum_abs for each row, then compute mean_abs = sum_abs / dim_length, then divide each element in x by mean_abs (element-wise).
+
+Therefore, the operations are:
+
+1. Compute the absolute of x (but only needed for summing). But actually, the absolute is part of the computation for the denominator, so we don't need to store the absolute values of x unless we need to compute the sum. So perhaps we can compute the sum in the same pass as the absolute computation. Wait, the absolute is needed only to compute the sum, so in a kernel, for each element, we can compute the absolute value and accumulate the sum. So the first kernel can compute the sum for each row's dimension 1 (the columns).
+
+Then, the next step is to compute the inverse of the mean (1/(mean_abs)), which is dim_length / sum_abs. Then, multiply each element in x by (dim_length / sum_abs) for their respective row.
+
+Therefore, the steps can be broken into:
+
+- A kernel to compute the sum_abs along dimension 1 for each row.
+- Then, compute inv_mean = dim_length / sum_abs (this can be done on CPU or in a kernel, but maybe better in a kernel for parallelism).
+- Then, a kernel to multiply each element by inv_mean for their row.
+
+Alternatively, combine the last two steps into a single kernel.
+
+Wait, perhaps all can be done in two kernels: one for the sum and another for the division.
+
+Let me outline the approach.
+
+First, the input is a 2D tensor of shape (batch_size, dim). Let's say batch_size is 32768 and dim is 65535.
+
+The first step is to compute, for each row (each batch element), the sum of absolute values of all elements in that row.
+
+So for each element x[i][j], compute |x[i][j]|, accumulate over j (since dim=1 is the second dimension, so the columns). The sum for row i is sum_{j=0}^{dim-1} |x[i][j]|. The total sum per row is stored in a tensor of shape (batch_size,).
+
+Then, the mean_abs for row i is sum_abs[i] / dim. So the inverse is dim / sum_abs[i].
+
+The result is x * (dim / sum_abs[i]) for each element in row i.
+
+Therefore, the operations can be structured as follows:
+
+1. Compute the sum_abs array (shape [batch_size]).
+
+2. Compute inv_mean = dim / sum_abs (element-wise).
+
+3. Multiply each element in the original x by the corresponding inv_mean[i].
+
+But how to implement this in CUDA.
+
+First, the kernel for sum_abs. Let's think about how to parallelize this.
+
+The rows are independent. So each block can handle a row. For each row, the elements are dim elements. So each thread in the block can process a portion of the elements in the row. But for large dim (65535), even a single thread per element would be too many threads. Alternatively, use a reduction.
+
+Alternatively, for each row, we can use a block to compute the sum. Each block processes a row. The threads in the block can process the elements in the row in parallel, and perform a reduction within the block to compute the sum.
+
+For example, each block is responsible for one row. The block has, say, 256 threads. The row has 65535 elements, so each thread can process a chunk of elements. For example, 65535 / 256 ≈ 256 elements per thread. Each thread computes the sum of its chunk's absolute values, then the block reduces those sums to get the total.
+
+Similarly, for the multiplication, each element can be processed in parallel. So another kernel can process the elements, each thread taking an element, and multiplying by the inv_mean for its row.
+
+Now, let's think about the kernel code.
+
+First, for the sum_abs kernel.
+
+The input is a tensor of shape (B, D), B is batch_size, D is dim.
+
+Each block handles one row (so B blocks). Each block has T threads, say 256.
+
+Each thread in the block processes (D / T) elements. But D is 65535, so 65535 / 256 ≈ 256. So each thread would process 256 elements.
+
+Wait, but 256 * 256 = 65536, so maybe 256 elements per thread would be about right. Wait 256 * 256 is 65536, which is just one more than 65535. So each thread can process 256 elements, except the last thread would process 255.
+
+Alternatively, to handle this, each thread can process D / blockDim.x elements, with some remainder.
+
+But in CUDA, it's common to use a reduction approach. Let me outline the steps for the sum_abs kernel:
+
+Kernel 1: Compute sum of absolute values along dim=1 for each row.
+
+Parameters:
+
+- Input tensor: float* x, size B x D (row-major storage)
+
+- Output tensor: float* sum_abs, size B.
+
+Each block handles one row (so blockIdx.x is the row index i from 0 to B-1).
+
+Within a block:
+
+- Each thread loads a portion of the elements in the row, computes the absolute value, and accumulates the sum.
+
+But how to structure this. Let's see.
+
+Each thread in the block can process a chunk of elements. Let's say each thread processes a chunk of elements, and then we perform a block-wide reduction.
+
+Alternatively, use a shared memory array to accumulate partial sums, then reduce those.
+
+The code outline for the kernel would be something like:
+
+__global__ void compute_sum_abs(float* x, float* sum_abs, int B, int D) {
+    int row = blockIdx.x;
+    if (row >= B) return;
+
+    // Each block processes one row. The row is stored as x[row * D + col]
+    // Initialize sum to 0
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    sdata[tid] = 0.0f;
+
+    // Each thread processes a portion of the elements in the row
+    for (int col = tid; col < D; col += blockDim.x) {
+        float val = abs(x[row * D + col]);
+        sdata[tid] += val;
+    }
+
+    // Perform block reduction
+    __syncthreads();
+    // Reduction steps here, like in a block reduce
+    // Use a binary reduction approach
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        sum_abs[row] = sdata[0];
+    }
+}
+
+This way, each block's threads process the elements of the row in chunks, accumulate in shared memory, then reduce to get the total sum for the row. The shared memory size per block is blockDim.x (e.g., 256 floats). The block size should be chosen such that the number of threads can handle the D elements efficiently. For example, with D=65535 and a block size of 256, each thread would process 65535/256 ≈ 256 elements. That's manageable.
+
+Next, after computing sum_abs, compute inv_mean = D / sum_abs[i] for each row i.
+
+This can be done in a kernel, but perhaps even on the CPU since it's just an element-wise division. However, if D is a constant (as in the problem's get_inputs, D is fixed), then it's a scalar. Wait, D is 65535, so it's a constant here. Wait in the problem statement, dim is set to 65535. So D is known at compile time? Or is it variable?
+
+Wait in the problem, the get_inputs function uses dim=65535, but the code might be general. But in the given code, the Model's forward function uses dim=1 as the axis. Since the problem says "the inputs and outputs of the forward function must be identical to the original architecture", so the kernel must handle any dimension provided by the input. Wait no, the problem says the inputs must be the same as the original architecture, so the inputs are generated via get_inputs which uses the given batch_size and dim. So in this specific case, dim is fixed. Therefore, D is a compile-time constant (65535). But perhaps in a more general case, the kernel should handle arbitrary D, but for now, let's proceed with the given dim.
+
+Wait but in the code, the user may want the code to work for any input, but since the problem says to replace the operators, and the given code uses a fixed dim in get_inputs, perhaps we can hardcode D=65535? Or perhaps not, but the kernel can take it as an argument.
+
+Hmm, better to make it a parameter so that it can handle any dim. Because the problem says the new architecture must be a valid replacement, so it must work with any inputs (as per get_inputs). Since the get_inputs uses the dim defined there, which may vary (though in this case it's fixed). But the kernel should handle whatever dim is passed in the input. Wait, but in the forward function, the dim is the second dimension (since in the original code, the dim is passed to torch.mean as dim=1). So in the kernel, we can take D as the size of dim=1 (the second dimension). So in the kernel, the D can be obtained as x.size(1). So the kernel code can get D as an argument.
+
+Therefore, the inv_mean computation can be done in a kernel. For example, a kernel that for each row i, computes inv_mean[i] = D / sum_abs[i].
+
+Wait, but D is known (the dimension over which we're summing), so it can be a constant in the kernel. Let's see.
+
+So, for inv_mean computation:
+
+Each element in inv_mean is D / sum_abs[i]. Since D is a constant here (65535), but in general, it should be passed as an argument. Let me proceed.
+
+The second kernel could be:
+
+__global__ void compute_inv_mean(float* sum_abs, float* inv_mean, int B, int D) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < B) {
+        float s = sum_abs[i];
+        inv_mean[i] = D / s;
+    }
+}
+
+But that's a simple element-wise computation. Alternatively, this can be done on the CPU. But for the sake of kernel fusion, perhaps it's better to do it in a kernel. Let me see.
+
+Alternatively, combine the inv_mean and the multiplication into a single kernel. Let's see.
+
+The third step is to compute the output as x * inv_mean[i], where inv_mean[i] is D / sum_abs[i], and for each element in row i, multiply by inv_mean[i].
+
+So the third kernel would process each element of x and multiply by the inv_mean for its row.
+
+This can be done with a kernel like:
+
+__global__ void apply_inv_mean(float* x, float* inv_mean, float* out, int B, int D) {
+    int row = blockIdx.x;
+    if (row >= B) return;
+    int tid = threadIdx.x;
+    for (int col = tid; col < D; col += blockDim.x) {
+        int idx = row * D + col;
+        out[idx] = x[idx] * inv_mean[row];
+    }
+}
+
+Wait but this would have a block per row, and each thread in the block processes some columns. Alternatively, have a grid of B*D threads, each responsible for an element. That might be more efficient, but depends on the block size.
+
+Alternatively, for the multiplication kernel:
+
+Each thread processes an element in the output. So total threads: B * D.
+
+So:
+
+__global__ void apply_inv_mean(float* x, float* inv_mean, float* out, int B, int D) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * D) return;
+    int row = idx / D;
+    int col = idx % D;
+    out[idx] = x[idx] * inv_mean[row];
+}
+
+This way, each thread processes one element. The grid size would be ceil(B*D / block_size). But with B=32768 and D=65535, that's a very large number of elements (32768 * 65535 ≈ 2.1e9 elements). So a block size of 256 would need a grid of 2.1e9 / 256 ≈ 8 million blocks. That might exceed the maximum grid size in CUDA (which is typically 2^31 per dimension). So that's a problem. So perhaps the first approach with per-row blocks is better.
+
+Wait, in the first approach, the block is per row, and each block has D threads (but D is 65k, which is way too big). Alternatively, use a block size of 256, and have each block process a row, with each thread processing a portion of the columns.
+
+Wait the first approach for the apply_inv_mean kernel: each block is a row. The block has blockDim.x threads. Each thread in the block handles a slice of the D columns.
+
+So for example, if D=65535 and blockDim.x=256, each thread handles D / 256 ≈ 256 columns.
+
+So the kernel would be:
+
+__global__ void apply_inv_mean(float* x, float* inv_mean, float* out, int D) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    float inv = inv_mean[row];
+    for (int col = tid; col < D; col += blockDim.x) {
+        int idx = row * D + col;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+The grid size is B, and the block size can be 256. The loop over columns would run for each thread in the block.
+
+This way, the number of blocks is B (32768), which is manageable. Each block has 256 threads, which is okay.
+
+So putting it all together, the three kernels would be:
+
+1. compute_sum_abs: computes the sum of absolute values along dim=1 for each row.
+
+2. compute_inv_mean: computes inv_mean[i] = D / sum_abs[i].
+
+3. apply_inv_mean: multiplies each element by inv_mean[row].
+
+Alternatively, can we combine the compute_inv_mean step into the first kernel? Probably not, since after computing the sum_abs, we need to compute inv_mean, which is a separate step.
+
+Wait, but perhaps the compute_inv_mean can be done in the same kernel as the apply_inv_mean? Let's see.
+
+Wait in the apply_inv_mean kernel, each block (row) has inv_mean[row], which is D / sum_abs[row]. Since sum_abs is computed in the first kernel, we can compute inv_mean on the fly in the apply_inv_mean kernel. Wait, but how do we get sum_abs?
+
+Wait no, because sum_abs is an intermediate array. So first, we need to compute sum_abs, then compute inv_mean (either via a separate kernel or CPU), then apply it. So the steps are:
+
+- Run compute_sum_abs kernel to get sum_abs array.
+
+- Compute inv_mean array by doing D / sum_abs[i] for each row.
+
+- Run apply_inv_mean kernel using inv_mean.
+
+Alternatively, if D is a constant, perhaps we can do inv_mean in the apply_inv_mean kernel by dividing D by the sum_abs[row] on the fly. That would eliminate the need for the inv_mean array and the compute_inv_mean kernel.
+
+Wait that's a good idea. Let me see:
+
+In the apply_inv_mean kernel, for each row, we have the sum_abs[row], so inv_mean is D / sum_abs[row]. So if we can access sum_abs directly in the apply_inv_mean kernel, then we can compute inv_mean on the fly.
+
+Therefore, the kernels can be:
+
+1. compute_sum_abs (as before, outputs sum_abs).
+
+2. apply_inv_mean, which takes sum_abs and x, and for each element:
+
+out[i,j] = x[i,j] * (D / sum_abs[i])
+
+So the apply_inv_mean kernel can be rewritten as:
+
+__global__ void apply_inv_mean(float* x, float* sum_abs, float* out, int D) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    float inv = D / sum_abs[row];
+    for (int col = tid; col < D; col += blockDim.x) {
+        int idx = row * D + col;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+This way, the inv_mean array is not needed. We can compute it on the fly in the apply_inv_mean kernel.
+
+That would save memory and a step. So that's better.
+
+So now, the steps are:
+
+- compute_sum_abs to get sum_abs.
+
+- apply_inv_mean using sum_abs and D.
+
+Therefore, only two kernels are needed.
+
+Now, let's think about the dimensions and memory allocation.
+
+The sum_abs array is of size B (batch_size).
+
+So the code outline would be:
+
+In the forward function of the new model:
+
+def forward(self, x):
+    # compute sum_abs using compute_sum_abs kernel
+    # then compute out using apply_inv_mean kernel
+    # return out
+
+Now, how to structure the CUDA code.
+
+First, define the CUDA kernels and compile them.
+
+The compute_sum_abs kernel:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void compute_sum_abs(const float* x, float* sum_abs, int B, int D) {
+    int row = blockIdx.x;
+    if (row >= B) return;
+
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    sdata[tid] = 0.0f;
+
+    for (int col = tid; col < D; col += blockDim.x) {
+        float val = abs(x[row * D + col]);
+        sdata[tid] += val;
+    }
+
+    __syncthreads();
+
+    // Block reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sum_abs[row] = sdata[0];
+    }
+}
+
+__global__ void apply_inv_mean(const float* x, const float* sum_abs, float* out, int D) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    float inv = D / sum_abs[row];
+    for (int col = tid; col < D; col += blockDim.x) {
+        int idx = row * D + col;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+Then, in the Python code, we need to compile these kernels and call them.
+
+Now, the Python code steps:
+
+In the ModelNew class:
+
+- The forward function will:
+
+1. Get the input tensor x (shape B x D).
+
+2. Compute the sum_abs array using the compute_sum_abs kernel.
+
+3. Compute the output using the apply_inv_mean kernel.
+
+First, the parameters:
+
+B = x.size(0)
+
+D = x.size(1)
+
+We need to allocate memory for sum_abs (a tensor of size B).
+
+So steps in code:
+
+sum_abs = torch.empty(B, dtype=x.dtype, device=x.device)
+
+Compute the compute_sum_abs kernel:
+
+compute_sum_abs<<<B, blockDim, sharedMem>>>(x.data_ptr(), sum_abs.data_ptr(), B, D)
+
+Wait, but what's the block size and shared memory.
+
+In the compute_sum_abs kernel, each block has blockDim.x threads. The shared memory size needed is blockDim.x * sizeof(float). So for example, if we use a block size of 256, the shared memory is 256 * 4 bytes = 1024 bytes.
+
+So when launching the kernel:
+
+blockDim = 256
+
+compute_sum_abs<<<B, blockDim, blockDim * sizeof(float)>>>(x_ptr, sum_abs_ptr, B, D)
+
+Wait, the shared memory is specified as the third argument in the kernel launch. So in code:
+
+stream = 0  # default stream
+
+kernel_launch_parameters:
+
+compute_sum_abs<<<B, blockDim, blockDim * sizeof(float), stream>>>(...)
+
+But in PyTorch, how to handle this.
+
+Alternatively, in the CUDA code, when we define the kernel function, in the Python code when we load the inline CUDA, the functions are exposed. So the Python code needs to call these kernels with the appropriate parameters.
+
+Wait, the example code from the user had a helper function that wraps the kernel launch. Let's look back at their example:
+
+In their example, they had a function elementwise_add_cuda that called the kernel. So similarly, for our case, we can have two helper functions: compute_sum_abs_cuda and apply_inv_mean_cuda.
+
+Wait, perhaps better to have a single helper function that encapsulates the entire process, but given the problem statement, we need to inline the CUDA code into the Python.
+
+Alternatively, structure the code like this:
+
+First, write the CUDA code as a string, then compile it, then create functions to call the kernels.
+
+So in Python:
+
+sum_abs_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void compute_sum_abs(const float* x, float* sum_abs, int B, int D) {
+    // same as above
+}
+
+__global__ void apply_inv_mean(const float* x, const float* sum_abs, float* out, int D) {
+    // same as above
+}
+
+void launch_compute_sum_abs(torch::Tensor x, torch::Tensor sum_abs, int B, int D) {
+    const int block_size = 256;
+    int sharedMem = block_size * sizeof(float);
+    dim3 blocks(B);
+    dim3 threads(block_size);
+    compute_sum_abs<<<blocks, threads, sharedMem>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), B, D);
+}
+
+void launch_apply_inv_mean(torch::Tensor x, torch::Tensor sum_abs, torch::Tensor out, int D) {
+    const int block_size = 256;
+    dim3 blocks(B);  // Wait B is needed here, but in the function parameters, it's not passed. Hmm, need to get it from the tensors.
+    // Wait, the out tensor's size is B x D, so B can be inferred as out.size(0)
+    // Alternatively, compute B as x.size(0)
+    int B = x.size(0);
+    dim3 threads(block_size);
+    apply_inv_mean<<<blocks, threads>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), out.data_ptr<float>(), D);
+}
+"""
+
+Wait but in the launch functions, we need to have B as an argument or compute it. Since the function launch_compute_sum_abs takes B as an argument, that's okay. For launch_apply_inv_mean, we can compute B from the input tensor's size.
+
+Alternatively, pass B as an argument to the second function as well.
+
+Alternatively, in Python, when calling these functions, we can pass B.
+
+But in the helper functions, the code must be written to take the necessary parameters.
+
+Alternatively, perhaps the functions can take the tensors and compute B and D from their sizes.
+
+Alternatively, adjust the code to compute B and D from the tensors.
+
+Wait, the helper functions can be written as follows:
+
+void launch_compute_sum_abs(torch::Tensor x, torch::Tensor sum_abs) {
+    int B = x.size(0);
+    int D = x.size(1);
+    const int block_size = 256;
+    int sharedMem = block_size * sizeof(float);
+    dim3 blocks(B);
+    dim3 threads(block_size);
+    compute_sum_abs<<<blocks, threads, sharedMem>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), B, D);
+}
+
+void launch_apply_inv_mean(torch::Tensor x, torch::Tensor sum_abs, torch::Tensor out) {
+    int B = x.size(0);
+    int D = x.size(1);
+    const int block_size = 256;
+    dim3 blocks(B);
+    dim3 threads(block_size);
+    apply_inv_mean<<<blocks, threads>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), out.data_ptr<float>(), D);
+}
+
+This way, the Python functions can be called with just the tensors, and the B and D are inferred.
+
+That's better. So the CUDA code becomes:
+
+sum_abs_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void compute_sum_abs(const float* x, float* sum_abs, int B, int D) {
+    int row = blockIdx.x;
+    if (row >= B) return;
+
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    sdata[tid] = 0.0f;
+
+    for (int col = tid; col < D; col += blockDim.x) {
+        float val = abs(x[row * D + col]);
+        sdata[tid] += val;
+    }
+
+    __syncthreads();
+
+    // Block reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sum_abs[row] = sdata[0];
+    }
+}
+
+__global__ void apply_inv_mean(const float* x, const float* sum_abs, float* out, int D) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    float inv = D / sum_abs[row];
+    for (int col = tid; col < D; col += blockDim.x) {
+        int idx = row * D + col;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+void launch_compute_sum_abs(torch::Tensor x, torch::Tensor sum_abs) {
+    int B = x.size(0);
+    int D = x.size(1);
+    const int block_size = 256;
+    int sharedMem = block_size * sizeof(float);
+    dim3 blocks(B);
+    dim3 threads(block_size);
+    compute_sum_abs<<<blocks, threads, sharedMem>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), B, D);
+}
+
+void launch_apply_inv_mean(torch::Tensor x, torch::Tensor sum_abs, torch::Tensor out) {
+    int B = x.size(0);
+    int D = x.size(1);
+    const int block_size = 256;
+    dim3 blocks(B);
+    dim3 threads(block_size);
+    apply_inv_mean<<<blocks, threads>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), out.data_ptr<float>(), D);
+}
+"""
+
+Then, in Python:
+
+from torch.utils.cpp_extension import load_inline
+
+sum_abs_cpp_source = """
+void launch_compute_sum_abs(torch::Tensor x, torch::Tensor sum_abs);
+void launch_apply_inv_mean(torch::Tensor x, torch::Tensor sum_abs, torch::Tensor out);
+"""
+
+sum_abs_cuda = load_inline(
+    name="sum_abs_cuda",
+    cpp_sources=sum_abs_cpp_source,
+    cuda_sources=sum_abs_source,
+    functions=["launch_compute_sum_abs", "launch_apply_inv_mean"],
+    verbose=True,
+    extra_cflags=["-std=c++14"],
+    extra_ldflags=[""],
+)
+
+Then, in the ModelNew class's forward function:
+
+def forward(self, x):
+    B = x.size(0)
+    D = x.size(1)
+    sum_abs = torch.empty(B, dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+
+    # Launch compute_sum_abs kernel
+    self.sum_abs_cuda.launch_compute_sum_abs(x, sum_abs)
+
+    # Launch apply_inv_mean kernel
+    self.sum_abs_cuda.launch_apply_inv_mean(x, sum_abs, out)
+
+    return out
+
+Wait but in the code, the CUDA functions are part of the module returned by load_inline. So the ModelNew class would have to have an instance of the module. Like in the example, they had:
+
+elementwise_add = load_inline(...)
+class ModelNew:
+    def __init__(self):
+        self.elementwise_add = elementwise_add
+
+So similarly, in this case:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sum_abs_cuda = sum_abs_cuda
+
+    def forward(self, x):
+        B = x.size(0)
+        D = x.size(1)
+        sum_abs = torch.empty(B, dtype=x.dtype, device=x.device)
+        out = torch.empty_like(x)
+
+        self.sum_abs_cuda.launch_compute_sum_abs(x, sum_abs)
+        self.sum_abs_cuda.launch_apply_inv_mean(x, sum_abs, out)
+
+        return out
+
+Wait but the CUDA functions are called via the module. The helper functions are part of the loaded module.
+
+But in the code above, the functions launch_compute_sum_abs and launch_apply_inv_mean are C++ functions that take tensors and launch the kernels. So the Python code can call them via the module.
+
+Now, the problem is to make sure that the code is correct and compiles.
+
+Potential issues:
+
+1. Shared memory in compute_sum_abs: the size must be blockDim.x * sizeof(float). The code uses extern __shared__ float sdata[]; which requires that the kernel is launched with the correct shared memory size. In the launch function, it's set to block_size * sizeof(float), which is correct.
+
+2. The block size for compute_sum_abs is 256, which may need to be adjusted. For example, if D is smaller than the block size, but in our case D is 65535, which is larger than 256, so each thread in the block will process at least 256 elements (65535/256 ~ 256). The loop for (int col = tid; col < D; col += blockDim.x) will cover all columns.
+
+3. The apply_inv_mean kernel uses a block per row, and each thread processes a portion of the columns. The loop for col in apply_inv_mean is okay.
+
+4. The sum_abs tensor is allocated with the correct size (B elements).
+
+Another thing to note: the input tensor x is passed to the kernels. The output is stored in out, which is initialized as empty_like(x).
+
+Now, let's think about the data types and dimensions.
+
+In the problem's code, the input x is of shape (batch_size, dim), which is 2D. So the kernels are designed for 2D tensors. But in CUDA, the data is stored as a contiguous array. So the code is correct for 2D tensors stored in row-major order.
+
+Another point: the kernel functions should be called with the correct block and grid dimensions. The launch functions in the C++ code handle this.
+
+Testing for correctness: The output of the new code should match the original code's output. The original code was x / torch.mean(torch.abs(x), dim=1, keepdim=True).
+
+The new code computes for each element x[i,j], x[i,j] * (D / sum_abs[i]), where sum_abs[i] is the sum of absolute values of the row. The mean_abs[i] is sum_abs[i]/D, so dividing by mean_abs[i] is equivalent to multiplying by D/sum_abs[i]. So the code is correct.
+
+Potential optimization: The compute_sum_abs kernel can be optimized further, but given time constraints, this implementation should suffice.
+
+Now, putting all together in Python code.
+
+Wait, but in the CUDA code, the functions are declared in the .cpp sources. The header for the functions must be present in the CPP source.
+
+Wait the cpp_sources provided to load_inline must declare the functions. The sum_abs_cpp_source was written as:
+
+sum_abs_cpp_source = """
+void launch_compute_sum_abs(torch::Tensor x, torch::Tensor sum_abs);
+void launch_apply_inv_mean(torch::Tensor x, torch::Tensor sum_abs, torch::Tensor out);
+"""
+
+That declares the functions, so the C++ code will compile.
+
+Now, the final code would look like this:
+
+The Python code with the CUDA kernels inlined.
+
+So the complete code would be:
+
+```python
+import torch
+import torch.nn as nn
+
+from torch.utils.cpp_extension import load_inline
+
+sum_abs_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void compute_sum_abs(const float* x, float* sum_abs, int B, int D) {
+    int row = blockIdx.x;
+    if (row >= B) return;
+
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    sdata[tid] = 0.0f;
+
+    for (int col = tid; col < D; col += blockDim.x) {
+        float val = abs(x[row * D + col]);
+        sdata[tid] += val;
+    }
+
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sum_abs[row] = sdata[0];
+    }
+}
+
+__global__ void apply_inv_mean(const float* x, const float* sum_abs, float* out, int D) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    float inv = D / sum_abs[row];
+    for (int col = tid; col < D; col += blockDim.x) {
+        int idx = row * D + col;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+void launch_compute_sum_abs(torch::Tensor x, torch::Tensor sum_abs) {
+    int B = x.size(0);
+    int D = x.size(1);
+    const int block_size = 256;
+    int sharedMem = block_size * sizeof(float);
+    dim3 blocks(B);
+    dim3 threads(block_size);
+    compute_sum_abs<<<blocks, threads, sharedMem>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), B, D);
+}
+
+void launch_apply_inv_mean(torch::Tensor x, torch::Tensor sum_abs, torch::Tensor out) {
+    int B = x.size(0);
+    int D = x.size(1);
+    const int block_size = 256;
+    dim3 blocks(B);
+    dim3 threads(block_size);
+    apply_inv_mean<<<blocks, threads>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), out.data_ptr<float>(), D);
+}
+"""
+
+sum_abs_cpp_source = """
+void launch_compute_sum_abs(torch::Tensor x, torch::Tensor sum_abs);
+void launch_apply_inv_mean(torch::Tensor x, torch::Tensor sum_abs, torch::Tensor out);
+"""
+
+sum_abs_cuda = load_inline(
+    name="sum_abs_cuda",
+    cpp_sources=sum_abs_cpp_source,
+    cuda_sources=sum_abs_source,
+    functions=["launch_compute_sum_abs", "launch_apply_inv_mean"],
+    verbose=True,
+    extra_cflags=["-std=c++14"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sum_abs_cuda = sum_abs_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.size(0)
+        D = x.size(1)
+        sum_abs = torch.empty(B, dtype=x.dtype, device=x.device)
+        out = torch.empty_like(x)
+
+        self.sum_abs_cuda.launch_compute_sum_abs(x, sum_abs)
+        self.sum_abs_cuda.launch_apply_inv_mean(x, sum_abs, out)
+
+        return out
+
+# The get_inputs and get_init_inputs remain as in the original
+batch_size = 32768
+dim = 65535
+
+def get_inputs():
+    x = torch.rand(batch_size, dim).cuda()
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+Wait, but in the forward function, the output is initialized with torch.empty_like(x). That's okay because we fill all elements in the kernel.
+
+Testing for correctness: Let me imagine a small example. Let's say B=1, D=3. Input x is [[1, -2, 3]]. The absolute values are [1,2,3], sum is 6. The mean_abs is 6/3 = 2. The output should be [0.5, -1, 1.5]. The code should compute that correctly.
+
+The compute_sum_abs kernel would set sum_abs[0] = 6. Then apply_inv_mean would multiply each element by 3/6=0.5. So the output would be correct.
+
+Potential issues:
+
+- In the compute_sum_abs kernel, the loop for col in the first kernel may not cover all columns if the block size is not a divisor of D. But the loop uses col += blockDim.x, so it should cover all columns, even if there's a remainder. For example, if D=65535 and blockDim.x=256, then the loop runs for col starting at tid (0-255), incrementing by 256 each time. So for tid=0: 0, 256, 512,... up to 65535. Since 65535 = 256*256 -1? Wait 256*256 is 65536, so 256*255=65280, then 65280+256=65536, which is over. So for the last element, the loop will stop at 65535.
+
+Wait, for col in the loop:
+
+The loop runs while col < D. So for each thread, it will process all columns from their starting point up to D.
+
+Yes, that should handle any D.
+
+Another thing to note: the CUDA kernels are written for float tensors. The problem's get_inputs uses torch.rand, which is float32. So this should be okay.
+
+I think this code should work.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+
+from torch.utils.cpp_extension import load_inline
+
+sum_abs_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void compute_sum_abs(const float* x, float* sum_abs, int B, int D) {
+    int row = blockIdx.x;
+    if (row >= B) return;
+
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    sdata[tid] = 0.0f;
+
+    for (int col = tid; col < D; col += blockDim.x) {
+        float val = abs(x[row * D + col]);
+        sdata[tid] += val;
+    }
+
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sum_abs[row] = sdata[0];
+    }
+}
+
+__global__ void apply_inv_mean(const float* x, const float* sum_abs, float* out, int D) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    float inv = D / sum_abs[row];
+    for (int col = tid; col < D; col += blockDim.x) {
+        int idx = row * D + col;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+void launch_compute_sum_abs(torch::Tensor x, torch::Tensor sum_abs) {
+    int B = x.size(0);
+    int D = x.size(1);
+    const int block_size = 256;
+    int sharedMem = block_size * sizeof(float);
+    dim3 blocks(B);
+    dim3 threads(block_size);
+    compute_sum_abs<<<blocks, threads, sharedMem>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), B, D);
+}
+
+void launch_apply_inv_mean(torch::Tensor x, torch::Tensor sum_abs, torch::Tensor out) {
+    int B = x.size(0);
+    int D = x.size(1);
+    const int block_size = 256;
+    dim3 blocks(B);
+    dim3 threads(block_size);
+    apply_inv_mean<<<blocks, threads>>>(x.data_ptr<float>(), sum_abs.data_ptr<float>(), out.data_ptr<float>(), D);
+}
+"""
+
+sum_abs_cpp_source = """
+void launch_compute_sum_abs(torch::Tensor x, torch::Tensor sum_abs);
+void launch_apply_inv_mean(torch::Tensor x, torch::Tensor sum_abs, torch::Tensor out);
+"""
+
+sum_abs_cuda = load_inline(
+    name="sum_abs_cuda",
+    cpp_sources=sum_abs_cpp_source,
+    cuda_sources=sum_abs_source,
+    functions=["launch_compute_sum_abs", "launch_apply_inv_mean"],
+    verbose=True,
+    extra_cflags=["-std=c++14"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sum_abs_cuda = sum_abs_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.size(0)
+        D = x.size(1)
+        sum_abs = torch.empty(B, dtype=x.dtype, device=x.device)
+        out = torch.empty_like(x)
+
+        self.sum_abs_cuda.launch_compute_sum_abs(x, sum_abs)
+        self.sum_abs_cuda.launch_apply_inv_mean(x, sum_abs, out)
+
+        return out
+
+batch_size = 32768
+dim = 65535
+
+def get_inputs():
+    x = torch.rand(batch_size, dim).cuda()
+    return [x]
+
+def get_init_inputs():
+    return []
+```

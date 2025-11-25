@@ -1,0 +1,169 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+conv_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose_kernel(const float* input, const float* weight, float* output, int in_channels, int out_channels, int kernel_size, int stride, int padding, int output_height, int output_width) {
+    int oc = blockIdx.y * blockDim.y + threadIdx.y;
+    int oh = blockIdx.z * blockDim.z + threadIdx.z;
+    int ow = blockIdx.w * blockDim.w + threadIdx.w;
+
+    if (oc >= out_channels || oh >= output_height || ow >= output_width) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int ic = 0; ic < in_channels; ++ic) {
+        for (int kh = 0; kh < kernel_size; ++kh) {
+            for (int kw = 0; kw < kernel_size; ++kw) {
+                int ih = oh * stride - padding + kh;
+                int iw = ow * stride - padding + kw;
+                if (ih >= 0 && ih < output_height && iw >= 0 && iw < output_width) {
+                    int input_idx = ic * output_height * output_width + ih * output_width + iw;
+                    int weight_idx = ic * kernel_size * kernel_size + kh * kernel_size + kw;
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+    }
+    output[oc * output_height * output_width + oh * output_width + ow] = sum;
+}
+
+torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, int in_channels, int out_channels, int kernel_size, int stride, int padding, int output_height, int output_width) {
+    auto output = torch::zeros({out_channels, output_height, output_width}, input.options());
+
+    dim3 threads_per_block(8, 8, 8);
+    dim3 blocks_per_grid((output_width + threads_per_block.x - 1) / threads_per_block.x,
+                          (output_height + threads_per_block.y - 1) / threads_per_block.y,
+                          (out_channels + threads_per_block.z - 1) / threads_per_block.z);
+
+    conv_transpose_kernel<<<blocks_per_grid, threads_per_block>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), in_channels, out_channels, kernel_size, stride, padding, output_height, output_width);
+
+    return output;
+}
+"""
+
+conv_transpose_cpp_source = (
+    "torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, int in_channels, int out_channels, int kernel_size, int stride, int padding, int output_height, int output_width);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+conv_transpose = load_inline(
+    name="conv_transpose",
+    cpp_sources=conv_transpose_cpp_source,
+    cuda_sources=conv_transpose_source,
+    functions=["conv_transpose_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for subtraction of bias
+sub_bias_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void sub_bias_kernel(const float* input, const float* bias, float* output, int out_channels, int output_height, int output_width) {
+    int oc = blockIdx.y * blockDim.y + threadIdx.y;
+    int oh = blockIdx.z * blockDim.z + threadIdx.z;
+    int ow = blockIdx.w * blockDim.w + threadIdx.w;
+
+    if (oc >= out_channels || oh >= output_height || ow >= output_width) {
+        return;
+    }
+
+    int idx = oc * output_height * output_width + oh * output_width + ow;
+    output[idx] = input[idx] - bias[oc];
+}
+
+torch::Tensor sub_bias_cuda(torch::Tensor input, torch::Tensor bias, int out_channels, int output_height, int output_width) {
+    auto output = input.clone();
+
+    dim3 threads_per_block(8, 8, 8);
+    dim3 blocks_per_grid((output_width + threads_per_block.x - 1) / threads_per_block.x,
+                          (output_height + threads_per_block.y - 1) / threads_per_block.y,
+                          (out_channels + threads_per_block.z - 1) / threads_per_block.z);
+
+    sub_bias_kernel<<<blocks_per_grid, threads_per_block>>>(input.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<float>(), out_channels, output_height, output_width);
+
+    return output;
+}
+"""
+
+sub_bias_cpp_source = (
+    "torch::Tensor sub_bias_cuda(torch::Tensor input, torch::Tensor bias, int out_channels, int output_height, int output_width);"
+)
+
+# Compile the inline CUDA code for subtraction of bias
+sub_bias = load_inline(
+    name="sub_bias",
+    cpp_sources=sub_bias_cpp_source,
+    cuda_sources=sub_bias_source,
+    functions=["sub_bias_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for tanh activation
+tanh_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void tanh_kernel(const float* input, float* output, int elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < elements) {
+        output[idx] = tanh(input[idx]);
+    }
+}
+
+torch::Tensor tanh_cuda(torch::Tensor input) {
+    auto output = input.clone();
+
+    const int block_size = 256;
+    const int num_blocks = (input.numel() + block_size - 1) / block_size;
+
+    tanh_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), input.numel());
+
+    return output;
+}
+"""
+
+tanh_cpp_source = (
+    "torch::Tensor tanh_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for tanh activation
+tanh = load_inline(
+    name="tanh",
+    cpp_sources=tanh_cpp_source,
+    cuda_sources=tanh_source,
+    functions=["tanh_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = conv_transpose
+        self.sub_bias = sub_bias
+        self.tanh = tanh
+
+    def forward(self, x):
+        x = self.conv_transpose.conv_transpose_cuda(x, self.weight, in_channels, out_channels, kernel_size, stride, padding, x.size(2), x.size(3))
+        x = self.sub_bias.sub_bias_cuda(x, self.bias, out_channels, x.size(2), x.size(3))
+        x = self.tanh.tanh_cuda(x)
+        return x
+
+    def init_weights(self, weight, bias):
+        self.weight = weight
+        self.bias = bias

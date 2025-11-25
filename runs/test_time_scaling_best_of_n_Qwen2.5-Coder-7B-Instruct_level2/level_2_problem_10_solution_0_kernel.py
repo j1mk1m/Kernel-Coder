@@ -1,0 +1,84 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for transposed convolution
+conv_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Kernel implementation goes here
+"""
+
+conv_transpose_cpp_source = (
+    "torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::IntArrayRef stride, torch::IntArrayRef padding);"
+)
+
+conv_transpose = load_inline(
+    name="conv_transpose",
+    cpp_sources=conv_transpose_cpp_source,
+    cuda_sources=conv_transpose_source,
+    functions=["conv_transpose_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Custom CUDA kernel for max pooling
+maxpool_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Kernel implementation goes here
+"""
+
+maxpool_cpp_source = (
+    "torch::Tensor maxpool_cuda(torch::Tensor input, torch::IntArrayRef kernel_size, torch::IntArrayRef stride);"
+)
+
+maxpool = load_inline(
+    name="maxpool",
+    cpp_sources=maxpool_cpp_source,
+    cuda_sources=maxpool_source,
+    functions=["maxpool_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Custom CUDA kernel for hardtanh activation
+hardtanh_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Kernel implementation goes here
+"""
+
+hardtanh_cpp_source = (
+    "torch::Tensor hardtanh_cuda(torch::Tensor input, double min_val, double max_val);"
+)
+
+hardtanh = load_inline(
+    name="hardtanh",
+    cpp_sources=hardtanh_cpp_source,
+    cuda_sources=hardtanh_source,
+    functions=["hardtanh_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, maxpool_kernel_size, maxpool_stride, hardtanh_min, hardtanh_max):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = conv_transpose
+        self.maxpool = maxpool
+        self.hardtanh = hardtanh
+
+    def forward(self, x):
+        x = self.conv_transpose.conv_transpose_cuda(x, weight, bias, stride, padding)
+        x = self.maxpool.maxpool_cuda(x, kernel_size, stride)
+        x = self.hardtanh.hardtanh_cuda(x, hardtanh_min, hardtanh_max)
+        x = torch.mean(x, dim=(2, 3), keepdim=True)
+        x = torch.tanh(x)
+        return x

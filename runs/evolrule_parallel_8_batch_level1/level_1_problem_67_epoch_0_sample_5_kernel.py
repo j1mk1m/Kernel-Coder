@@ -1,0 +1,120 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom 1D Convolution CUDA Kernel Implementation
+conv1d_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+template <typename scalar_t>
+__global__ void conv1d_kernel(const scalar_t* __restrict__ input,
+                             const scalar_t* __restrict__ weight,
+                             scalar_t* __restrict__ output,
+                             int batch_size,
+                             int in_channels,
+                             int out_channels,
+                             int input_length,
+                             int kernel_size,
+                             int stride,
+                             int padding,
+                             int dilation,
+                             int groups) {
+
+    const int output_length = (input_length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    const int out_channel_per_group = out_channels / groups;
+    const int group_id = blockIdx.z;
+
+    // Output element indices
+    const int b = blockIdx.x + blockIdx.y * gridDim.x;
+    const int out_channel = blockIdx.y % out_channel_per_group + group_id * out_channel_per_group;
+    const int out_pos = threadIdx.x;
+
+    if (out_pos >= output_length) return;
+
+    scalar_t sum = 0;
+    for (int k = 0; k < kernel_size; k++) {
+        const int in_channel = threadIdx.y + group_id * out_channel_per_group;
+        const int in_pos = out_pos * stride + k * dilation - padding;
+        if (in_pos >= 0 && in_pos < input_length) {
+            sum += input[b * in_channels * input_length + in_channel * input_length + in_pos] *
+                   weight[out_channel * kernel_size * in_channels_per_group + k * in_channels_per_group + threadIdx.y];
+        }
+    }
+
+    atomicAdd(&output[get_output_index(b, out_channel, out_pos, out_channels, output_length)], sum);
+}
+
+// Helper function to compute output index (simplified for brevity)
+inline int get_output_index(int b, int c, int pos, int channels, int length) {
+    return b * channels * length + c * length + pos;
+}
+
+torch::Tensor conv1d_cuda(torch::Tensor input, torch::Tensor weight, int stride, int padding, int dilation, int groups) {
+    const int batch_size = input.size(0);
+    const int in_channels = input.size(1);
+    const int input_length = input.size(2);
+    const int out_channels = weight.size(0);
+    const int kernel_size = weight.size(2);
+    const int in_channels_per_group = in_channels / groups;
+    const int output_length = (input_length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+    auto output = torch::zeros({batch_size, out_channels, output_length}, input.options());
+
+    dim3 threads(32, in_channels_per_group); // Threads per block
+    dim3 blocks(batch_size, out_channels / groups, groups); // Blocks per grid
+
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "conv1d_cuda", ([&] {
+        conv1d_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size, in_channels, out_channels, input_length,
+            kernel_size, stride, padding, dilation, groups);
+    }));
+
+    return output;
+}
+"""
+
+# Inline CPP source for compilation
+conv1d_cuda_header = """
+torch::Tensor conv1d_cuda(torch::Tensor input, torch::Tensor weight, int stride, int padding, int dilation, int groups);
+"""
+
+# Compile the CUDA kernel
+conv1d_cuda = load_inline(
+    name="conv1d_cuda",
+    cuda_sources=conv1d_source,
+    cpp_sources=conv1d_header,
+    functions=["conv1d_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=False):
+        super(ModelNew, self).__init__()
+        self.conv1d = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
+        # Register the custom CUDA function
+        self.custom_conv = conv1d_cuda
+
+    def forward(self, x):
+        # Move tensors to CUDA
+        x = x.cuda()
+        weight = self.conv1d.weight.cuda()
+        # Extract parameters
+        stride = self.conv1d.stride[0]
+        padding = self.conv1d.padding[0]
+        dilation = self.conv1d.dilation[0]
+        groups = self.conv1d.groups
+        # Call custom CUDA kernel
+        return self.custom_conv(x, weight, stride, padding, dilation, groups)
+
+# Update input functions to ensure CUDA compatibility
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, length).cuda()
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]

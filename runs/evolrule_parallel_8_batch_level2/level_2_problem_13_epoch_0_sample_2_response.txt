@@ -1,0 +1,989 @@
+The code must be written in the format of the above example. The example uses the load_inline function to compile the kernels. Your code should follow the same structure. I will copy your code into a file and run it, so it must be syntactically correct. You can choose any operators to replace with custom CUDA kernels. 
+
+The user will import the ModelNew class and call forward on the inputs given by get_inputs(). So your code must have a class named ModelNew with __init__ and forward methods, and must define get_inputs and get_init_inputs in the same way as the original code. 
+
+The input tensors must be in the same format as the original code. The output must match numerically with the original code. 
+
+The goal is to maximize the speedup compared to the original code. Please make the fastest possible code. 
+
+The user will run the code on an NVIDIA A100 GPU. 
+
+Do not write any code that requires additional dependencies beyond PyTorch. 
+
+Make sure that the code is compatible with PyTorch 2.0.1. 
+
+Your code will be tested by creating an instance of ModelNew, sending inputs to the GPU, and calling forward(). The inputs are generated via get_inputs(). 
+
+You may also replace the parameters passed to get_init_inputs() with your own, but the function signature must remain the same. 
+
+Please make sure that the code is correct. 
+
+Please avoid using any PyTorch native extensions that are not part of the standard library.
+
+Okay, let's tackle optimizing the given Model with custom CUDA kernels. The original model has several operations, and I need to figure out which ones can be accelerated with fused kernels. The user wants maximum speedup on an A100 GPU.
+
+First, looking at the forward pass steps:
+
+1. **ConvTranspose3d**: This is a 3D transposed convolution. Implementing this in a custom kernel might be complex, but perhaps it's better to leave it as is since PyTorch's implementation is optimized. Maybe not the first target for optimization unless we can fuse it with another op.
+
+2. **Mean Pooling over depth**: The mean operation across the depth dimension (dim=2). This could be done in a custom kernel, especially if we can combine it with subsequent steps.
+
+3. **Addition (bias add)**: This is an element-wise addition with a broadcasted bias tensor. Combining this with the mean pooling and maybe the softmax could save time.
+
+4. **Softmax over channels (dim=1)**: The standard softmax. Online softmax or combining with other operations might help. Since softmax is over channels, maybe fuse with the bias add and mean pooling?
+
+5. **Tanh activation**: Another element-wise operation. If we can combine this with the previous steps, it could save time.
+
+6. **Scaling**: A simple element-wise multiplication with a scalar. Again, possible to fuse.
+
+The key is to fuse as many of these steps as possible into a single kernel to minimize memory transfers and kernel launch overheads.
+
+Let me consider fusing the mean pooling, bias addition, softmax, tanh, and scaling into a single kernel. The convolution is a separate step, but perhaps its output can be fed directly into the fused kernel without intermediate storage.
+
+Wait, the convolution's output is used in the mean pooling. So first, after the transposed convolution, we need to compute the mean over depth. Let's see:
+
+- After the conv_transpose, the shape is (B, C, D, H, W). The mean over D gives (B, C, 1, H, W). Then adding the bias (which is (1, C, 1, 1, 1)), so broadcasted over all dimensions except C. Then softmax over channels (dim=1), then tanh, then scaling.
+
+Hmm, maybe we can combine the mean pooling, bias add, softmax, tanh, and scaling into a single kernel. Let's think about the steps:
+
+1. Compute the mean over the depth dimension (dim=2). For each element in the resulting tensor (after mean), it's the average of all D elements along that dimension.
+
+2. Add the bias (per channel, so same for all spatial positions).
+
+3. Apply softmax over the channels (dim=1). Wait, the softmax is along the channel dimension, which is dim=1 here (since the tensor after mean is (B, C, 1, H, W)). The softmax would require normalizing over C for each position.
+
+4. Then tanh activation.
+
+5. Multiply by the scaling factor.
+
+Fusing all these steps into a single kernel would be ideal. Let's see:
+
+- For each spatial position (x,y), and each channel, compute the mean over depth (D elements). Then add bias, apply softmax across channels, then tanh, then scale.
+
+But the softmax requires the sum of exponentials across all channels. That complicates things because each thread would need to know the sum across all channels for their position. So maybe this can't be done in a straightforward way. Alternatively, perhaps the softmax can be computed efficiently in a way that's compatible with the other steps.
+
+Alternatively, maybe we can do the following steps in a kernel:
+
+- For each spatial location (x,y), and each channel:
+
+   a. Compute the mean over D: sum over D and divide by D.
+
+   b. Add the bias (which is per-channel, so stored in a 1xCx1x1x1 tensor).
+
+   c. Store intermediate results.
+
+But then the softmax requires across channels, so for each (batch, x, y), we need to compute the sum of exps across all C channels. That would require a reduction over C for each spatial position. That could be done with a separate kernel, but that might not save much time.
+
+Alternatively, let's see if we can compute the mean, add bias, compute the exponentials, sum across channels, then normalize, then apply tanh and scaling in one step.
+
+Wait, let's break down the operations step by step:
+
+Original steps after convolution:
+
+1. Mean over depth (D):
+
+   x_mean = x.mean(dim=2, keepdim=True) → shape (B, C, 1, H, W)
+
+2. Add bias: x_mean + self.bias → since self.bias is (1, C, 1, 1, 1), it's added to each spatial position.
+
+3. Softmax over channels (dim=1):
+
+   x_softmax = torch.softmax(x + bias, dim=1)
+
+4. tanh(x_softmax)
+
+5. Scale by factor.
+
+The softmax is over dim=1 (channels), so for each position (B, 1, H, W), we need to compute the softmax across the C channels.
+
+Hmm. The problem is that the softmax requires a global operation over all channels for each spatial position. So that might require some synchronization between threads. Maybe a better approach is to compute the softmax in a separate kernel, but fused with other steps.
+
+Alternatively, perhaps the entire sequence can be expressed in a single kernel by structuring threads appropriately.
+
+Let's think of a CUDA kernel that processes each (B, C, H, W) element (since after mean pooling, D is 1):
+
+The input after convolution is (B, C, D, H, W). The mean over D reduces to (B, C, 1, H, W). So the effective dimensions after that are (B, C, H, W) (since 1 in depth is kept but doesn't affect the spatial dimensions). Wait, no, the mean over D would give a tensor of (B, C, 1, H, W). So when we add the bias (which is (1, C, 1, 1, 1)), it becomes (B, C, 1, H, W). Then the softmax is over dim=1 (channels), so each position (B, 1, H, W) has a channel vector of length C.
+
+The idea is to process each (B, H, W) position's C channels in parallel.
+
+Let me structure the kernel as follows:
+
+- Each thread block processes a batch element and spatial position (H, W). Since H and W are large (128 each in the example), we can have a grid of blocks each handling a (H, W) tile.
+
+- Within each block, each thread handles a channel (since C is 64, which is manageable).
+
+Wait, but H and W are 128 each, so 128x128 = 16384 spatial positions. That's a lot for a grid. Alternatively, maybe split into blocks that handle a small region of HxW, with threads handling channels. Hmm, maybe better to have each thread process a single (B, C, H, W) element, but need to compute the softmax which requires the sum over all C.
+
+Alternatively, here's a possible approach for the fused kernel:
+
+The kernel will process all channels for a given batch, H, W position.
+
+For each such position (B, H, W):
+
+1. Compute the mean over D (depth) dimension. Since the convolution output is (B, C, D, H, W), the mean over D would be sum over the D dimension divided by D.
+
+Wait, but in the current setup, the input to this kernel would be the output of the transposed convolution. So maybe the fused kernel needs to include the mean pooling step as well?
+
+Wait, actually, the mean pooling is part of the steps that can be fused. So perhaps the fused kernel can take the convolution output and process everything in one go.
+
+Wait, the original steps are:
+
+x = conv_transpose(x) → (B, C, D, H, W)
+
+x = x.mean(dim=2, keepdim=True) → (B, C, 1, H, W)
+
+Then, the rest.
+
+So, the fused kernel would need to:
+
+- Take the original x (after conv_transpose) as input.
+
+- For each spatial position (B, C, H, W), compute the mean over D (the depth dimension).
+
+Wait, but the mean over D is (sum over D elements) / D.
+
+So for each (B, C, H, W), the mean over D would be the average of the D elements in the depth direction.
+
+But the convolution's output is (B, C, D, H, W), so the depth is the third dimension (axis 2). To compute the mean over axis 2, for each (C, H, W) in each batch, we have to sum over D elements (axis 2) and divide by D.
+
+So for each (B, C, H, W), the value is mean over D of x[B, C, d, H, W] for d from 0 to D-1.
+
+Once that mean is computed, then the bias (which is (1,C,1,1,1)) is added. Then, the softmax over channels (axis 1), then tanh, then scaling.
+
+Therefore, the fused kernel needs to:
+
+1. For each (B, C, H, W):
+
+   a. Compute mean over D.
+
+   b. Add bias (which is per-channel, so only depends on C).
+
+   c. Keep track of the intermediate value (before softmax).
+
+2. Then compute the softmax across all channels for each (B, H, W) group.
+
+The problem is step 2c requires the sum over all channels for each (B, H, W) position to compute the denominator in the softmax.
+
+This suggests that the kernel needs to handle both the per-channel computations and the cross-channel reductions.
+
+Perhaps the approach is:
+
+- Process in a way where each block is responsible for a (B, H, W) position, and each thread in the block handles a channel.
+
+- For each block (B, H, W):
+
+   a. Each thread (for a channel C) loads the mean over D for that (B, C, H, W) position (step 1a).
+
+   b. Add the bias (step 1b) for their channel.
+
+   c. Compute exp of the intermediate value (since softmax requires exponents).
+
+   d. Sum all the exponentials across all channels (using a reduction within the block).
+
+   e. Divide each channel's exp by the sum (softmax).
+
+   f. Apply tanh and scaling.
+
+This would require that each block can handle all C channels, which is 64 in the given parameters (out_channels=64). That's manageable with a thread block of 64 or 128 threads.
+
+Let me outline the steps in code:
+
+The kernel would be structured as follows:
+
+__global__ void fused_kernel(...){
+
+   for each B in batches (probably fixed in this kernel since we can launch per batch? Or handle all batches in different blocks)
+
+   For each thread in the block:
+
+      channel = threadIdx.x
+
+      if (channel >= C) continue;
+
+      // Compute the mean over D for (B, channel, H, W)
+
+      sum = 0.0f;
+
+      for (d in 0..D-1):
+
+          sum += x[B][channel][d][H][W]
+
+      mean_val = sum / D;
+
+      // add bias
+
+      mean_val += bias[channel]; // since bias is per channel
+
+      // compute exp for softmax numerator
+
+      exp_val = exp(mean_val);
+
+      // Now, need to compute sum of exp_val across all channels in this (B,H,W)
+
+      // Use a block reduction to compute the total sum
+
+      // Then, each thread has the exp_val and the total sum.
+
+      // Then compute softmax: exp_val / sum
+
+      // Then apply tanh and scaling.
+
+      result = tanh(exp_val / sum) * scaling_factor;
+
+      // store the result in the output tensor at (B, channel, 1, H, W)
+
+}
+
+But the problem is how to handle the block reduction for the sum.
+
+Alternatively, using shared memory to accumulate the sum of exponents for each (B,H,W) block.
+
+Let me think of the block setup:
+
+Each block handles one (B, H, W) position.
+
+Each block has C threads (since channels are 64, and threads per block can be 64 or 128).
+
+The steps would be:
+
+1. Each thread in the block (thread index = c) loads the value for channel c at (B, H, W) after computing the mean over D.
+
+Wait, actually, the input tensor is (B, C, D, H, W), so to compute the mean over D for channel c, position (H, W):
+
+The value is sum_{d=0}^{D-1} x[B][c][d][H][W] / D.
+
+To compute that, each thread (c) can loop over all D elements in the depth dimension, sum them, then divide by D.
+
+But for large D (like 32 in the example), this might be slow. However, if D is 32, then each thread would have to loop 32 times. Maybe that's manageable.
+
+Alternatively, if D is a multiple of the threads, but probably not. Let's proceed.
+
+So, for each thread (c):
+
+sum = 0.0f;
+
+for (d=0; d < D; d++) {
+
+   sum += x[B][c][d][H][W]
+
+}
+
+mean_val = sum / D;
+
+Then add the bias: mean_val += bias[c]
+
+Then compute exp_val = exp(mean_val)
+
+Then, need to compute the sum of all exp_val across all channels (c=0..C-1).
+
+To do this, the threads in the block can perform a reduction in shared memory:
+
+- Allocate a shared array of size C (or at least enough to hold the intermediate sums).
+
+- Each thread writes its exp_val into shared memory.
+
+- Then perform a parallel reduction in shared memory to compute the total.
+
+- Once the total is known, each thread can compute its own softmax value (exp_val / total).
+
+- Then apply tanh and scaling.
+
+This seems feasible.
+
+The block's shared memory would need to hold at least C floats for the exp values, plus some space for the reduction. Since C is 64, that's 256 bytes (64 floats), which is manageable.
+
+So the kernel structure would look something like:
+
+__global__ void fused_kernel(
+
+    const float* input,    // shape (B, C, D, H, W)
+
+    const float* bias,     // shape (C,)
+
+    float* output,         // shape (B, C, 1, H, W)
+
+    int B, int C, int D, int H, int W,
+
+    float scaling_factor) {
+
+    // Each block handles one (b, h, w) position.
+
+    // blockIdx.x: index for (b * H * W + h * W + w)
+
+    // Or use 3D grid: blockIdx.x = b, blockIdx.y = h, blockIdx.z = w
+
+    // Let's use a 3D grid where each block is responsible for a (b, h, w).
+
+    int b = blockIdx.x;
+
+    int h = blockIdx.y;
+
+    int w = blockIdx.z;
+
+    // Check if within bounds.
+
+    if (b >= B || h >= H || w >= W) return;
+
+    // Each thread in the block handles a channel.
+
+    int c = threadIdx.x;
+
+    if (c >= C) return;
+
+    // Compute mean over D for channel c at (b, c, h, w)
+
+    float sum = 0.0f;
+
+    for (int d = 0; d < D; ++d) {
+
+        // input is stored in (B, C, D, H, W) order?
+
+        // Need to compute the index properly.
+
+        // Assuming input is stored in row-major order:
+
+        // input[b][c][d][h][w] ?
+
+        // The actual memory layout is contiguous in the order of the dimensions.
+
+        // So the index is:
+
+        // idx = b * (C*D*H*W) + c * (D*H*W) + d * (H*W) + h * W + w;
+
+        // But to compute that, need the strides. Alternatively, use pointer arithmetic.
+
+        // For simplicity, let's compute the offset as:
+
+        int offset = b * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+
+        sum += input[offset];
+
+    }
+
+    float mean_val = sum / D;
+
+    // Add bias (bias is 1D array, so bias[c])
+
+    mean_val += bias[c];
+
+    // Compute exp for softmax numerator
+
+    float exp_val = exp(mean_val);
+
+    // Now, need to compute the sum of exp_val across all channels.
+
+    // Use shared memory for reduction.
+
+    __shared__ float s_exp[C]; // size must be at least C.
+
+    s_exp[c] = exp_val;
+
+    __syncthreads();
+
+    // Perform reduction in shared memory.
+
+    // Let's use a parallel reduction approach.
+
+    // Each thread contributes to the sum.
+
+    // For simplicity, assuming C is a power of two (if not, need to handle edge cases)
+
+    // But since C is 64, which is 2^6, that's okay.
+
+    for (int s = 1; s < C; s *= 2) {
+
+        if (threadIdx.x < C - s && threadIdx.x % (2*s) == 0) {
+
+            int idx = threadIdx.x;
+
+            s_exp[idx] += s_exp[idx + s];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    // The sum is now in s_exp[0]
+
+    float total = s_exp[0];
+
+    __syncthreads();
+
+    // Compute softmax
+
+    float softmax_val = exp_val / total;
+
+    // Apply tanh and scaling.
+
+    float result = tanhf(softmax_val) * scaling_factor;
+
+    // Write to output.
+
+    // Output is (B, C, 1, H, W), so the index is:
+
+    // output[b][c][0][h][w]
+
+    int out_offset = b * C * 1 * H * W + c * 1 * H * W + 0 * H * W + h * W + w;
+
+    output[out_offset] = result;
+
+}
+
+Wait, but this approach has a problem: the reduction loop is done in the shared memory, but each thread can only access their own lane's data. Wait, actually, in the code above, the reduction is done by each thread contributing, but in the way I wrote it, the threads are not all participating in the reduction steps. Wait, perhaps the reduction should be done in a way that all threads participate.
+
+Alternatively, perhaps better to use a more efficient reduction method. Let me think again.
+
+Alternatively, after all threads have written their exp_val into s_exp[c], then each thread can participate in the reduction:
+
+The code for reduction:
+
+    // Each thread is part of the reduction.
+
+    for (int s = 1; s < C; s *= 2) {
+
+        if (threadIdx.x < C && (threadIdx.x % (2*s)) == 0) {
+
+            int idx = threadIdx.x;
+
+            s_exp[idx] += s_exp[idx + s];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    // After this, the total is in s_exp[0].
+
+But this requires that the number of threads is at least C, but in our case the block size is C, so threadIdx.x ranges up to C-1, so it should work.
+
+Wait, but when s reaches C/2, then threads with index up to C/2 would be involved.
+
+Alternatively, perhaps a better approach is to use a block size of 256 threads, but given C is 64, that might be overkill. Let's see.
+
+Alternatively, assuming that the block size is exactly C, so each thread can handle a channel.
+
+But in CUDA, the maximum block size is 1024, so 64 is okay.
+
+Another point: the grid dimensions are set up as B x H x W, which for B=16, H=128, W=128, would be 16*128*128 = 262,144 blocks. That's a lot, but each block is small.
+
+Alternatively, we can have a grid where blockIdx.x is b, blockIdx.y is h, and blockIdx.z is w, but that's 3D grid with dimensions B x H x W. That might be acceptable.
+
+Now, for the kernel launch:
+
+The number of blocks would be B * H * W.
+
+The block size is C (since each block has a thread per channel).
+
+Wait, but if C=64, then block size is 64, which is okay.
+
+Now, for the input tensor's memory layout: it's important to correctly compute the offset. The user's code uses PyTorch tensors, so the input is a 5D tensor (B, C, D, H, W). The strides would be in the order of B, C, D, H, W. So the offset calculation in the code above is correct, but perhaps it's better to use PyTorch's pointer arithmetic.
+
+Wait, in the kernel code, the input is a const float*, so we have to compute the correct index based on the dimensions.
+
+Wait, perhaps the dimensions need to be passed as parameters, and the input is a flattened array, so the indices need to be computed correctly.
+
+Alternatively, perhaps the kernel can be written using the input's strides, but that's complicated.
+
+Alternatively, assuming that the input tensor is contiguous and in the order (B, C, D, H, W), then the offset for a given (b, c, d, h, w) is:
+
+offset = (b * C + c) * D * H * W + d * H * W + h * W + w
+
+Wait, let me re-calculate:
+
+Total elements per B is C*D*H*W.
+
+So for a given b, the start is b * C*D*H*W.
+
+Within that, for channel c: c * D*H*W.
+
+Then for depth d: d * H*W.
+
+Then for height h: h * W.
+
+Then width w.
+
+So total offset: b*(C*D*H*W) + c*(D*H*W) + d*(H*W) + h*W + w.
+
+Yes, so the calculation in the kernel is correct.
+
+Now, in the kernel, after computing the mean, adding the bias, and the exponent, then the reduction.
+
+Once the reduction is done, each thread (c) can compute its result and write it to the output tensor.
+
+The output is a tensor of shape (B, C, 1, H, W), so the output's offset for (b,c,0,h,w) is similar, but without the D dimension:
+
+output_offset = (b * C + c) * 1 * H * W + 0 * H * W + h * W + w = same as (b * C + c) * H * W + h * W + w.
+
+Wait, yes, because the third dimension is 1, so the 0 is just an offset of 0.
+
+So the code for writing the result is okay.
+
+Now, the kernel parameters would be:
+
+input: the output of the convolution (shape (B,C,D,H,W))
+
+bias: a 1D tensor of size C (the self.bias parameter)
+
+output: the final result after all steps (shape (B,C,1,H,W))
+
+B, C, D, H, W are dimensions passed as integers.
+
+scaling_factor is a float.
+
+Now, let's think about the PyTorch code structure.
+
+The original model uses:
+
+self.conv_transpose = nn.ConvTranspose3d(...)
+
+Then, the forward path is:
+
+x = self.conv_transpose(x) → shape (B, C, D, H, W)
+
+Then, the rest of the steps are fused into the CUDA kernel.
+
+Therefore, in the new ModelNew class:
+
+- The ConvTranspose3d is kept as is.
+
+- The fused kernel is called after the convolution.
+
+So the forward method would be:
+
+def forward(self, x):
+
+    x = self.conv_transpose(x)
+
+    # call fused kernel here
+
+    # need to pass the bias and scaling factor
+
+    return self.fused_op(x, self.bias, self.scaling_factor)
+
+But in the code, the fused kernel must be implemented with the custom CUDA code.
+
+Therefore, the steps to implement:
+
+1. Write the CUDA code for the fused kernel as above.
+
+2. Expose this as a PyTorch function using load_inline.
+
+Now, let's structure the code.
+
+First, the CUDA kernel code:
+
+The kernel is called 'fused_kernel' and requires the parameters listed above.
+
+The Python wrapper function would take the input tensor, bias tensor, scaling factor, and the dimensions.
+
+Wait, but the dimensions can be inferred from the input tensor. For example:
+
+B = input.size(0)
+
+C = input.size(1)
+
+D = input.size(2)
+
+H = input.size(3)
+
+W = input.size(4)
+
+Thus, the wrapper function can compute these dimensions from the input tensor.
+
+Alternatively, the kernel can be launched with these dimensions computed in the wrapper.
+
+Therefore, the wrapper function in Python would be something like:
+
+def fused_op_cuda(input, bias, scaling_factor):
+
+    # Get dimensions
+
+    B, C, D, H, W = input.shape
+
+    # Output tensor has shape (B, C, 1, H, W)
+
+    output = torch.empty((B, C, 1, H, W), device=input.device, dtype=input.dtype)
+
+    # Launch kernel
+
+    threads_per_block = C  # since each block processes a channel per thread
+
+    # blocks are B*H*W, since each block handles a (b, h, w)
+
+    blocks = (B * H * W, )
+
+    # Wait, but in the kernel, the grid is 3D (B, H, W). Hmm, perhaps better to use a 1D grid where blockIdx.x = b * H * W + h * W + w ?
+
+    # Alternatively, compute grid as (B, H, W)
+
+    # In CUDA, the grid can be 3D, so:
+
+    # dim3 blocks(B, H, W)
+
+    # dim3 threads(threads_per_block)
+
+    # So in the Python wrapper:
+
+    # We need to pass the grid and block dimensions correctly.
+
+    # However, in the load_inline approach, the kernel launch is done via the wrapper function.
+
+    # So in the C++ code, the function would have to compute the grid and block dimensions.
+
+    # Alternatively, the kernel can be launched via the wrapper function in the C++ code.
+
+    # This is getting a bit complicated. Let me see.
+
+Wait, perhaps in the C++ wrapper, the function can calculate the grid and block dimensions.
+
+Alternatively, the kernel can be written to use a 3D grid and 1D block.
+
+Wait, in the kernel code above, the block is 1D (with threads_per_block = C), and the grid is 3D (B, H, W). So in the kernel:
+
+blockDim.x = C
+
+gridDim.x = B
+
+gridDim.y = H
+
+gridDim.z = W
+
+Wait no, the grid is specified as (B, H, W), and each block's blockIdx is (b, h, w).
+
+Therefore, in the wrapper function, the grid dimensions are (B, H, W), and block dimensions are (C, 1, 1).
+
+Wait, no, the block dimensions are set via the threads parameter. Since the block is 1D (only threadIdx.x is used), the block dimensions should be (C, 1, 1), but in CUDA, the block dimensions are specified as a dim3 (threadsPerBlock.x, y, z). So in the C++ code, when launching the kernel, we need to set:
+
+dim3 threadsPerBlock(C, 1, 1);
+
+dim3 blocks(B, H, W);
+
+Then, the kernel is launched with:
+
+fused_kernel<<<blocks, threadsPerBlock>>>(...);
+
+Therefore, in the C++ wrapper function:
+
+torch::Tensor fused_op_cuda(torch::Tensor input, torch::Tensor bias, float scaling_factor) {
+
+    // Check that the inputs are on the same device and contiguous.
+
+    CHECK(input.is_contiguous());
+
+    CHECK(bias.is_contiguous());
+
+    // Get dimensions
+
+    int B = input.size(0);
+
+    int C = input.size(1);
+
+    int D = input.size(2);
+
+    int H = input.size(3);
+
+    int W = input.size(4);
+
+    // Output tensor
+
+    auto output = torch::empty({B, C, 1, H, W}, input.options());
+
+    // Launch kernel
+
+    dim3 threadsPerBlock(C);
+
+    dim3 blocks(B, H, W);
+
+    fused_kernel<<<blocks, threadsPerBlock>>>(
+
+        input.data_ptr<float>(),
+
+        bias.data_ptr<float>(),
+
+        output.data_ptr<float>(),
+
+        B, C, D, H, W,
+
+        scaling_factor
+
+    );
+
+    // Check for errors
+
+    // ... (error checking is optional but good practice)
+
+    return output;
+
+}
+
+Wait, but in the kernel's parameters, the order must match exactly. Let me check the kernel's parameter list:
+
+__global__ void fused_kernel(
+
+    const float* input,
+
+    const float* bias,
+
+    float* output,
+
+    int B, int C, int D, int H, int W,
+
+    float scaling_factor) {
+
+So the wrapper passes all those parameters in order.
+
+Now, in the Python code, the fused_op_cuda function is exposed via the load_inline.
+
+Putting this all together, the code would look like this:
+
+First, define the CUDA source code for the kernel and the wrapper.
+
+Then, compile it using load_inline.
+
+Now, in the Python code:
+
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA code.
+
+fused_op_source = """
+
+#include <torch/extension.h>
+
+#include <math.h>
+
+#include <cuda_runtime.h>
+
+__global__ void fused_kernel(
+
+    const float* input,
+
+    const float* bias,
+
+    float* output,
+
+    int B, int C, int D, int H, int W,
+
+    float scaling_factor) {
+
+    int b = blockIdx.x;
+
+    int h = blockIdx.y;
+
+    int w = blockIdx.z;
+
+    if (b >= B || h >= H || w >= W) return;
+
+    int c = threadIdx.x;
+
+    if (c >= C) return;
+
+    // Compute the mean over depth (axis=2)
+
+    float sum = 0.0f;
+
+    for (int d = 0; d < D; ++d) {
+
+        // Compute the input index:
+
+        // input is (B, C, D, H, W)
+
+        int offset = b * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+
+        sum += input[offset];
+
+    }
+
+    float mean_val = sum / D;
+
+    // Add bias
+
+    mean_val += bias[c];
+
+    // Compute exp for softmax
+
+    float exp_val = exp(mean_val);
+
+    // Use shared memory to compute the sum of exp across channels
+
+    extern __shared__ float s_exp[];
+
+    s_exp[c] = exp_val;
+
+    __syncthreads();
+
+    // Reduction in shared memory
+
+    for (int s = 1; s < C; s *= 2) {
+
+        if (threadIdx.x < C - s && (threadIdx.x % (2 * s)) == 0) {
+
+            s_exp[threadIdx.x] += s_exp[threadIdx.x + s];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    // Total sum is in s_exp[0]
+
+    float total = s_exp[0];
+
+    __syncthreads();
+
+    float softmax_val = exp_val / total;
+
+    // Apply tanh and scaling
+
+    float result = tanhf(softmax_val) * scaling_factor;
+
+    // Write output
+
+    int out_offset = b * C * 1 * H * W + c * 1 * H * W + 0 * H * W + h * W + w;
+
+    output[out_offset] = result;
+
+}
+
+// Wrapper function
+
+torch::Tensor fused_op_cuda(torch::Tensor input, torch::Tensor bias, float scaling_factor) {
+
+    // Check input dimensions and contiguity
+
+    if (input.dim() != 5) {
+
+        TORCH_CHECK(false, "Input must be 5D tensor (B, C, D, H, W)");
+
+    }
+
+    if (!input.is_contiguous() || !bias.is_contiguous()) {
+
+        TORCH_CHECK(false, "Tensors must be contiguous");
+
+    }
+
+    int B = input.size(0);
+
+    int C = input.size(1);
+
+    int D = input.size(2);
+
+    int H = input.size(3);
+
+    int W = input.size(4);
+
+    // Output shape is (B, C, 1, H, W)
+
+    auto output = torch::empty({B, C, 1, H, W}, input.options());
+
+    // Launch kernel
+
+    dim3 threadsPerBlock(C);
+
+    dim3 blocks(B, H, W);
+
+    // The shared memory needed: C floats (for s_exp) + some for reduction.
+
+    // The shared memory size is C * sizeof(float)
+
+    fused_kernel<<<blocks, threadsPerBlock, C * sizeof(float)>>>(
+
+        input.data_ptr<float>(),
+
+        bias.data_ptr<float>(),
+
+        output.data_ptr<float>(),
+
+        B, C, D, H, W,
+
+        scaling_factor
+
+    );
+
+    // Check for errors
+
+    cudaError_t err = cudaGetLastError();
+
+    if (err != cudaSuccess) {
+
+        std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
+
+        throw std::runtime_error("CUDA error in fused_kernel");
+
+    }
+
+    return output;
+
+}
+
+"""
+
+fused_op_cpp_source = "torch::Tensor fused_op_cuda(torch::Tensor input, torch::Tensor bias, float scaling_factor);"
+
+# Compile the fused op.
+
+fused_op = load_inline(
+
+    name="fused_op",
+
+    cpp_sources=fused_op_cpp_source,
+
+    cuda_sources=fused_op_source,
+
+    functions=["fused_op_cuda"],
+
+    verbose=True,
+
+    extra_cflags=["-std=c++14"],  # Needed for some compilers
+
+    extra_cuda_cflags=["-std=c++14"],
+
+    extra_ldflags=[""],
+
+)
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scaling_factor):
+
+        super().__init__()
+
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+
+        self.bias = nn.Parameter(torch.randn(1, out_channels, 1, 1, 1))
+
+        self.scaling_factor = scaling_factor
+
+        self.fused_op = fused_op  # The loaded module
+
+    def forward(self, x):
+
+        x = self.conv_transpose(x)
+
+        # Call the fused kernel.
+
+        # The fused_op_cuda expects input, bias, and scaling_factor.
+
+        # Note: the bias in the model is a 5D tensor (1, C, 1, 1, 1), but the kernel expects a 1D bias (size C).
+
+        # So need to extract the 1D bias from the parameter.
+
+        # Since self.bias has shape (1, C, 1, 1, 1), we can squeeze it.
+
+        bias_1d = self.bias.view(-1)  # This will be a 1D tensor of size C.
+
+        output = self.fused_op.fused_op_cuda(x, bias_1d, self.scaling_factor)
+
+        return output
+
+Wait, in the fused kernel, the bias is expected to be a 1D tensor of size C. The self.bias in the model is stored as a 5D tensor (1, C, 1, 1, 1). To get a 1D tensor, we can use view(-1) or squeeze. So that's correct.
+
+Now, also need to make sure that the input to the fused kernel is contiguous. Since PyTorch's convolutions return contiguous tensors, but perhaps better to call .contiguous() just in case.
+
+Alternatively, in the wrapper function, it checks for contiguous, so

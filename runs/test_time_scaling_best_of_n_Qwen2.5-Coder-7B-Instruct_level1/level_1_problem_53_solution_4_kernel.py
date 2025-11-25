@@ -1,0 +1,69 @@
+import torch
+import torch.nn as nn
+import torch.cuda.stream as stream
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for min reduction
+min_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void min_reduction_kernel(const float* input, float* output, int numel) {
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < numel) {
+        sdata[tid] = input[i];
+    } else {
+        sdata[tid] = INFINITY; // Initialize with infinity for non-existent elements
+    }
+
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmin(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[blockIdx.x] = sdata[0];
+    }
+}
+"""
+
+min_reduction_cpp_source = (
+    "void min_reduction_cuda(const torch::Tensor& input, torch::Tensor& output);"
+)
+
+# Compile the inline CUDA code for min reduction
+min_reduction = load_inline(
+    name="min_reduction",
+    cpp_sources=min_reduction_cpp_source,
+    cuda_sources=min_reduction_source,
+    functions=["min_reduction_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, dim1, dim2 = x.shape
+        reduced_shape = (batch_size, dim1)
+        output = torch.zeros(reduced_shape, device=x.device)
+
+        threads_per_block = 256
+        blocks_per_grid = (reduced_shape[0] * reduced_shape[1] + threads_per_block - 1) // threads_per_block
+
+        with stream.Stream() as s:
+            min_reduction_cuda(x.contiguous().view(-1), output)
+
+        return output.view(reduced_shape)

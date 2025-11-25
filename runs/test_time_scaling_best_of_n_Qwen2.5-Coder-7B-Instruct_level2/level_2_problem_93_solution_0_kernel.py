@@ -1,0 +1,64 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+transposed_convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void transposed_convolution_kernel(float* input, float* weight, float* output, int batch_size, int in_channels, int out_channels, int height, int width, int kernel_size, int stride) {
+    // Implement the transposed convolution operation here
+    // This is just a placeholder for the actual implementation
+}
+
+torch::Tensor transposed_convolution_cuda(torch::Tensor input, torch::Tensor weight, int stride) {
+    // Implement the transposed convolution operation here
+    // This is just a placeholder for the actual implementation
+    return torch::zeros_like(input);
+}
+"""
+
+transposed_convolution_cpp_source = (
+    "torch::Tensor transposed_convolution_cuda(torch::Tensor input, torch::Tensor weight, int stride);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+transposed_convolution = load_inline(
+    name="transposed_convolution",
+    cpp_sources=transposed_convolution_cpp_source,
+    cuda_sources=transposed_convolution_source,
+    functions=["transposed_convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, add_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.transposed_convolution = transposed_convolution
+        self.add_value = add_value
+        self.multiply_value = multiply_value
+
+    def forward(self, x):
+        x = self.transposed_convolution.transposed_convolution_cuda(x, self.weight, stride=self.stride)
+        x = x + self.add_value
+        x = torch.min(x, torch.tensor(0.0, device=x.device))
+        x = torch.nn.functional.gelu(x)
+        x = x * self.multiply_value
+        return x
+
+# Initialize the model with the provided inputs
+in_channels, out_channels, kernel_size, stride, add_value, multiply_value = get_init_inputs()
+model_new = ModelNew(in_channels, out_channels, kernel_size, stride, add_value, multiply_value)
+
+# Get the input data
+input_data = get_inputs()[0]
+
+# Forward pass through the model
+output = model_new(input_data)
+
+print(output.shape)

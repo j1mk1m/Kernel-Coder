@@ -1,0 +1,12 @@
+def test_model():
+    model = Model(*get_init_inputs()).cuda()
+    model_new = ModelNew(*get_init_inputs()).cuda()
+
+    inputs = get_inputs()[0].cuda()
+    outputs = model(inputs)
+    outputs_new = model_new(inputs)
+
+    assert torch.allclose(outputs, outputs_new, atol=1e-6), "The outputs do not match."
+    print("Test passed.")
+
+test_model()

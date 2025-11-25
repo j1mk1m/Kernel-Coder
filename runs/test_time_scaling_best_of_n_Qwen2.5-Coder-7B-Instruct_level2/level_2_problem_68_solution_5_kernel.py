@@ -1,0 +1,70 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_min_subtract_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_min_subtract_kernel(const float* A, const float* B, float* C, const float* min_val, const float* sub_val, int rows, int cols, int inner_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < rows && col < cols) {
+        float sum = 0.0f;
+        for (int k = 0; k < inner_dim; ++k) {
+            sum += A[row * inner_dim + k] * B[k * cols + col];
+        }
+        C[row * cols + col] = fmin(sum, *min_val);
+        C[row * cols + col] -= *sub_val;
+    }
+}
+
+torch::Tensor matmul_min_subtract_cuda(torch::Tensor A, torch::Tensor B, torch::Tensor min_val, torch::Tensor sub_val) {
+    auto rows = A.size(0);
+    auto cols = B.size(1);
+    auto inner_dim = A.size(1);
+    auto out = torch::zeros({rows, cols}, A.options());
+
+    const int block_size = 256;
+    const int num_blocks_x = (cols + block_size - 1) / block_size;
+    const int num_blocks_y = (rows + block_size - 1) / block_size;
+
+    matmul_min_subtract_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(A.data_ptr<float>(), B.data_ptr<float>(), out.data_ptr<float>(), min_val.data_ptr<float>(), sub_val.data_ptr<float>(), rows, cols, inner_dim);
+
+    return out;
+}
+"""
+
+matmul_min_subtract_cpp_source = (
+    "torch::Tensor matmul_min_subtract_cuda(torch::Tensor A, torch::Tensor B, torch::Tensor min_val, torch::Tensor sub_val);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul_min_subtract = load_inline(
+    name="matmul_min_subtract",
+    cpp_sources=matmul_min_subtract_cpp_source,
+    cuda_sources=matmul_min_subtract_source,
+    functions=["matmul_min_subtract_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that uses a custom CUDA kernel for matrix multiplication, minimum, and subtraction.
+    """
+    def __init__(self, in_features, out_features, constant):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.constant = nn.Parameter(torch.tensor(constant))
+        self.matmul_min_subtract = matmul_min_subtract
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.matmul_min_subtract.matmul_min_subtract_cuda(x, x.new_zeros(x.size()), self.constant.unsqueeze(0), self.constant.unsqueeze(0))
+        return x

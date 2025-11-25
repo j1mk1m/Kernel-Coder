@@ -1,0 +1,123 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define fused convolution, tanh, scaling, bias addition kernel
+fused_conv_kernel_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+#define CUDA_KERNEL_LOOP(i, n) for (int i = 0; i < (n); ++i)
+
+template <typename scalar_t>
+__global__ void fused_conv_tanh_scale_bias(
+    const torch::PackedTensorAccessor<scalar_t,4> input,
+    const torch::PackedTensorAccessor<scalar_t,4> weight,
+    const torch::PackedTensorAccessor<scalar_t,1> bias,
+    torch::PackedTensorAccessor<scalar_t,4> output,
+    const int out_channels, const int in_channels,
+    const int kernel_size, const int height, const int width,
+    const int out_height, const int out_width,
+    const float scaling_factor) {
+
+    const int B = blockIdx.z;
+    const int C = blockIdx.y * blockDim.z + threadIdx.z;
+    const int Y = blockIdx.x * blockDim.y + threadIdx.y;
+    const int X = threadIdx.x;
+
+    if (C >= out_channels || Y >= out_height || X >= out_width) return;
+
+    scalar_t sum = 0;
+    for (int c = 0; c < in_channels; ++c) {
+        for (int ky = 0; ky < kernel_size; ++ky) {
+            for (int kx = 0; kx < kernel_size; ++kx) {
+                int y_in = Y * stride_y + ky - pad_y;
+                int x_in = X * stride_x + kx - pad_x;
+                if (y_in >=0 && y_in < height && x_in >=0 && x_in < width) {
+                    sum += weight[C][c][ky][kx] * input[B][c][y_in][x_in];
+                }
+            }
+        }
+    }
+
+    sum = tanh(sum + bias[C]);
+    sum *= scaling_factor;
+    output[B][C][Y][X] = sum;
+}
+
+torch::Tensor fused_conv_tanh_scale_bias_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int kernel_size,
+    float scaling_factor,
+    int padding=0,
+    int stride=1) {
+
+    // Calculate output dimensions
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+    int out_channels = weight.size(0);
+    int out_height = (height + 2 * padding - kernel_size) / stride + 1;
+    int out_width = (width + 2 * padding - kernel_size) / stride + 1;
+
+    auto output = torch::empty({batch_size, out_channels, out_height, out_width}, input.options());
+
+    dim3 threads(32, 8, 1);
+    dim3 blocks(out_width, (out_height + threads.y - 1)/threads.y, batch_size);
+
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "fused_conv_tanh_scale_bias_cuda", ([&] {
+        fused_conv_tanh_scale_bias<scalar_t><<<blocks, threads>>>(
+            input.packed_accessor<scalar_t,4>(),
+            weight.packed_accessor<scalar_t,4>(),
+            bias.packed_accessor<scalar_t,1>(),
+            output.packed_accessor<scalar_t,4>(),
+            out_channels, in_channels,
+            kernel_size, height, width,
+            out_height, out_width,
+            scaling_factor);
+    }));
+
+    return output;
+}
+"""
+
+fused_conv_cpp_source = """
+torch::Tensor fused_conv_tanh_scale_bias_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int kernel_size,
+    float scaling_factor,
+    int padding=0,
+    int stride=1);
+"""
+
+# Compile fused kernel
+fused_conv = load_inline(
+    name="fused_conv",
+    cpp_sources=fused_conv_cpp_source,
+    cuda_sources=fused_conv_kernel_source,
+    functions=["fused_conv_tanh_scale_bias_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size))
+        self.bias = nn.Parameter(torch.randn(bias_shape[0]))  # Adjusted to 1D bias
+        self.max_pool = nn.MaxPool2d(pool_kernel_size)
+        self.fused_conv = fused_conv
+        self.kernel_size = kernel_size
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        # Fused convolution, tanh, scaling, bias
+        x = self.fused_conv.fused_conv_tanh_scale_bias_cuda(
+            x, self.weight, self.bias, self.kernel_size, self.scaling_factor)
+        # Max-pooling remains separate as it's already optimized
+        return self.max_pool(x)

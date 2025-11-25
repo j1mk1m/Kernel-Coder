@@ -1,0 +1,30 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from depthwise_convolution import depthwise_convolution_cuda
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(in_channels, kernel_size, kernel_size))
+        self.stride = stride
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return depthwise_convolution_cuda(x, self.weight, self.stride, self.padding)
+
+# Test code
+batch_size = 16
+in_channels = 64
+kernel_size = 3
+width = 512
+height = 512
+stride = 1
+padding = 0
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, height, width).cuda()
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, kernel_size, stride, padding]

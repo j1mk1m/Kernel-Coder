@@ -1,0 +1,54 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for max pooling
+max_pooling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the max pooling logic here
+"""
+
+max_pooling_cpp_source = (
+    "torch::Tensor max_pooling_cuda(torch::Tensor x, int kernel_size, int stride, int padding, int dilation);"
+)
+
+# Compile the inline CUDA code for max pooling
+max_pooling = load_inline(
+    name="max_pooling",
+    cpp_sources=max_pooling_cpp_source,
+    cuda_sources=max_pooling_source,
+    functions=["max_pooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return max_pooling.max_pooling_cuda(x, self.kernel_size, self.stride, self.padding, self.dilation)
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 32
+    channels = 64
+    height = 512
+    width = 512
+    kernel_size = 4
+    stride = 1
+    padding = 1
+    dilation = 1
+
+    x = torch.rand(batch_size, channels, height, width)
+    model_new = ModelNew(kernel_size, stride, padding, dilation)
+    output = model_new(x)
+    print(output.shape)

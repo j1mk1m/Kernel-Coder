@@ -1,0 +1,674 @@
+First, I need to analyze the given architecture to identify which operators can benefit from custom CUDA kernels. The model has two linear layers with sigmoid activation and a final logsumexp. The main operations here are matrix multiplications (linear layers), element-wise sigmoid, and the logsumexp reduction.
+
+Looking at the operations:
+
+1. **Linear Layers (Gemm):** The forward passes for linear layers involve matrix multiplications (x @ weight^T) plus a bias addition. These are compute-intensive, especially with large dimensions like 2048x4096 and 4096x1024. However, PyTorch's native linear layers already use highly optimized CUDA kernels, so replacing them might not yield significant gains. But perhaps combining them with subsequent activation functions (e.g., Sigmoid) into a fused kernel could reduce memory traffic and kernel launch overhead.
+
+2. **Sigmoid Activation:** Element-wise operations like sigmoid can be implemented in a custom kernel for better memory access patterns or fused with the preceding matrix multiplication to avoid intermediate storage of the output.
+
+3. **LogSumExp:** The final logsumexp operation is a reduction over a dimension. PyTorch's implementation is optimized, but for large tensors, a custom kernel might offer better performance by combining the exp, sum, and log steps in a single kernel, potentially with better parallelism.
+
+Given that the batch size is 16384 and the hidden layer is 4096 units, the intermediate tensors are large (16384x4096 and 16384x1024). The sigmoid and logsumexp are good candidates for optimization because their element-wise nature can be efficiently parallelized with minimal computation per element. The linear layers are already optimized, but fusing them with sigmoid might save time.
+
+### Approach:
+1. **Fuse Linear1 + Sigmoid into a single kernel.** This avoids the need to store the intermediate tensor before applying sigmoid, saving memory bandwidth and kernel launches.
+2. **Optimize LogSumExp with a custom CUDA kernel.** Since it's a reduction, a custom kernel can handle the parallel reduction efficiently.
+
+### Steps to Implement:
+
+#### 1. Fusing Linear and Sigmoid:
+The fused kernel would compute x = (x @ weight1 + bias1) followed by applying sigmoid in the same kernel. This reduces the number of memory accesses and kernel launches.
+
+**Kernel Design:**
+- The matrix multiplication (GEMM) part can be implemented using CUDA, but it's known that PyTorch's implementation is highly optimized. However, fusing with sigmoid might still save time. Alternatively, use cuBLAS for GEMM and then apply sigmoid in-place in a custom kernel. But to fully fuse, we need to handle both steps in one kernel.
+
+Wait, but implementing a GEMM from scratch is not efficient. Since cuBLAS is already optimized, perhaps it's better to use cuBLAS for the matrix multiply and then apply sigmoid in a custom kernel. However, fusing the two steps (matrix multiply and sigmoid) into a single kernel might not be straightforward. Alternatively, after the matrix multiplication, apply the sigmoid in a custom element-wise kernel.
+
+Wait, perhaps the first linear layer can be left as is, but the element-wise sigmoid can be replaced by a custom CUDA kernel. Let's check:
+
+The sigmoid function is straightforward: out[i] = 1 / (1 + exp(-x[i])). A custom kernel could compute this in parallel. Since PyTorch's sigmoid is already efficient, but for very large tensors (16384 x 4096 = ~67 million elements), even a small optimization might help.
+
+Similarly, the second linear layer (linear2) can be left as is, but again, perhaps the second linear's output can be fused with the logsumexp? Not sure. Let's focus on the sigmoid and logsumexp first.
+
+#### 2. Optimizing LogSumExp:
+The logsumexp operation is computed as:
+
+log( sum( exp(x) ) )
+
+The steps are: exponentiate each element, sum over the specified dimension, then take the log. 
+
+Implementing this in a custom kernel can be done by:
+
+- For each element, compute exp(x_i)
+- Sum all exp(x_i) along the specified dimension (dim=1 here)
+- Take the log of the sum, then return the result.
+
+The critical part is the reduction over dim=1 (rows). Since the input is (batch_size, output_size), the reduction over dim=1 would produce a (batch_size,) tensor.
+
+Implementing this reduction efficiently with CUDA requires handling the summation in parallel. The standard approach is to use a parallel reduction kernel. However, PyTorch's implementation is already optimized, but perhaps a custom kernel can have better performance, especially when the tensor is on the GPU and we can avoid data transfers.
+
+Alternatively, we can write a kernel that combines the exp and sum steps into a single kernel, then compute the log. However, the log is a trivial operation on the reduced sum.
+
+### Implementation Plan:
+
+1. **Sigmoid Custom Kernel:**
+   - Create a CUDA kernel that applies the sigmoid function to each element of the input tensor.
+   - This might be redundant if PyTorch's implementation is already optimal, but let's proceed.
+
+2. **LogSumExp Custom Kernel:**
+   - Implement a CUDA kernel that computes the exp of each element, sums along dim=1, then takes the log of the sum.
+   - The kernel will need to handle the reduction efficiently. For large tensors, a block-wise reduction might be necessary.
+
+### Potential Issues:
+
+- **Fusion of Linear and Sigmoid:** Since the linear layer involves a matrix multiplication which is best done via cuBLAS, perhaps the most effective way is to let PyTorch handle the GEMM and then apply a custom sigmoid kernel. However, this would still require a kernel launch for the sigmoid, but perhaps it's faster than PyTorch's implementation. Alternatively, PyTorch's sigmoid is already element-wise and optimized, so maybe no gain here. Need to verify.
+
+Wait, checking PyTorch's sigmoid implementation: It's an element-wise operation, so a custom kernel may not provide a speedup. So perhaps focusing on the LogSumExp is better.
+
+- **LogSumExp:** Implementing the custom kernel for this operation is more promising because the reduction can be optimized for the specific tensor shape.
+
+Let me proceed with writing the code for the LogSumExp first.
+
+### Custom LogSumExp Kernel:
+
+The steps are:
+
+1. Compute exp(x_i) for each element in the input tensor.
+2. Sum these exponentials along the specified dimension (dim=1).
+3. Take the log of each sum.
+
+The input is a 2D tensor (B, C). We need to sum along dim=1 (C), resulting in (B,).
+
+The CUDA kernel for the exponential sum can be structured as follows:
+
+- For each element in the tensor, compute exp(x) and store it in a temporary array (or directly accumulate in shared memory for the reduction).
+- Use parallel reduction techniques to compute the sum along each row.
+
+The kernel can be designed to process each row in a block, with each thread handling a segment of the row.
+
+Alternatively, use atomicAdd for the reduction, but that might not be efficient. A better approach is to use a block-wise reduction.
+
+Let's structure it as follows:
+
+Kernel Structure for LogSumExp:
+
+Each thread block handles a row (since dim=1 is the columns). For each row, the block's threads will process the elements of the row and compute the sum.
+
+- For each row (each row is of length C = output_size = 1024):
+   - Assign each thread a chunk of the row's elements.
+   - Each thread computes the sum of its chunk.
+   - Use shared memory to perform a parallel reduction within the block to get the total sum for the row.
+   - Store the sum in a temporary array.
+- After all rows are processed, compute the log of each sum.
+
+But the exponential and log can be part of the same kernel.
+
+Alternatively, combine the exp and sum steps:
+
+The kernel can compute exp(x[i]) and accumulate the sum per row.
+
+Here's the plan for the kernel:
+
+```cpp
+__global__ void logsumexp_kernel(
+    const float* input, float* output, int batch_size, int channels) {
+    // Each block handles a row (since we are summing over dim=1)
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    // Each thread handles a part of the row
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        float val = exp(input[row * channels + i]);
+        sum += val;
+    }
+
+    // Use shared memory for block reduction
+    __shared__ float shared[256]; // assuming max threads per block is 256
+    int tid = threadIdx.x;
+    shared[tid] = sum;
+    __syncthreads();
+
+    // Perform reduction in shared memory
+    for (int s = blockDim.x/2; s > 0; s >>=1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum = shared[0];
+        output[row] = log(total_sum);
+    }
+}
+```
+
+This kernel assumes that each block is assigned to a row. The number of threads per block should be chosen such that all elements in the row can be processed. For channels=1024, a block size of 256 would require 4 iterations (since 256*4=1024). The shared memory size needs to be at least the block size (so 256 here).
+
+This kernel should be called with:
+
+- gridDim = batch_size
+- blockDim = min(256, channels) or some optimal value.
+
+Wait, but the block size must divide the number of channels? Not exactly. The loop runs from threadIdx.x to channels, stepping by blockDim.x. So for channels=1024 and block size=256, each thread processes 4 elements (1024 / 256 = 4). That's okay.
+
+Now, the CUDA kernel code needs to be wrapped in a function.
+
+The code for the LogSumExp custom kernel would look like this.
+
+Additionally, the Sigmoid custom kernel can be written as:
+
+```cpp
+__global__ void sigmoid_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx];
+        output[idx] = 1.0f / (1.0f + expf(-x));
+    }
+}
+```
+
+However, as mentioned earlier, PyTorch's implementation might already be as fast or faster.
+
+But let's proceed to implement both and see.
+
+### Fusing Linear1 + Sigmoid:
+
+The first linear layer is x = linear1(x) which is x = x @ weight1.T + bias1.
+
+The fused kernel would combine the matrix multiply with sigmoid.
+
+But implementing a GEMM in CUDA is non-trivial unless we use cuBLAS. Since cuBLAS is already optimized, perhaps the best approach is to let PyTorch handle the matrix multiply and then apply the sigmoid via a custom kernel.
+
+Alternatively, if the weight and bias are stored in the model, perhaps we can call the cuBLAS GEMM in the custom kernel, then apply sigmoid in place.
+
+But in PyTorch, the Linear layer's forward is already using optimized cuBLAS, so replacing it might not be beneficial unless we can fuse with the next operation.
+
+Since the Linear layer's forward is x = weight * x + bias (assuming the input is batch x in_features, weight is out_features x in_features, so matmul is done with x @ weight.T), perhaps the best is to keep the Linear layers as-is and replace the sigmoid and logsumexp with custom kernels.
+
+Alternatively, fusing the first Linear + Sigmoid might save some time, but it's a bit more involved.
+
+Let me outline the code step by step:
+
+First, the ModelNew class will replace the sigmoid and logsumexp with custom CUDA functions.
+
+The code structure would be:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom kernels for LogSumExp and Sigmoid
+
+logsumexp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void logsumexp_forward_kernel(
+    const float* input, float* output, int batch_size, int channels) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        float val = exp(input[row * channels + i]);
+        sum += val;
+    }
+
+    // Shared memory reduction
+    __shared__ float shared[256];  // Assuming blockDim.x <= 256
+    int tid = threadIdx.x;
+    shared[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[row] = log(shared[0]);
+    }
+}
+
+torch::Tensor logsumexp_forward_cuda(torch::Tensor input) {
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    auto output = torch::empty({batch_size}, input.options());
+
+    const int block_size = 256;
+    const dim3 grid(batch_size);
+    const dim3 block(block_size);
+
+    logsumexp_forward_kernel<<<grid, block>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels);
+
+    return output;
+}
+"""
+
+sigmoid_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void sigmoid_forward_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx];
+        output[idx] = 1.0f / (1.0f + expf(-x));
+    }
+}
+
+torch::Tensor sigmoid_forward_cuda(torch::Tensor input) {
+    int size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    sigmoid_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+# Compile the CUDA kernels
+logsumexp = load_inline(
+    name="logsumexp",
+    cuda_sources=logsumexp_source,
+    functions=["logsumexp_forward_cuda"],
+    verbose=True
+)
+
+sigmoid = load_inline(
+    name="sigmoid",
+    cuda_sources=sigmoid_source,
+    functions=["sigmoid_forward_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(ModelNew, self).__init__()
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, output_size)
+        self.sigmoid = sigmoid
+        self.logsumexp = logsumexp
+
+    def forward(self, x):
+        x = self.linear1(x)
+        # Apply custom sigmoid
+        x = self.sigmoid.sigmoid_forward_cuda(x)
+        x = self.linear2(x)
+        # Apply custom logsumexp
+        x = self.logsumexp.logsumexp_forward_cuda(x)
+        return x
+
+def get_init_inputs():
+    return [input_size, hidden_size, output_size]
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+```
+
+Wait, but the input to get_inputs() must be on the GPU. The original get_inputs() returns tensors on CPU. The user's original code might have them on CPU, but in the problem statement, the example uses .cuda(). Let me check the given architecture:
+
+In the given code:
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, output_size]
+
+But in the example, the user's get_inputs in their example returns .cuda() tensors. The problem says to write code that uses custom CUDA kernels, so the input tensors should be on the GPU. Hence, in the new code, the get_inputs() should return CUDA tensors. So in the new code, get_inputs() should have .cuda().
+
+However, the user's original get_inputs() does not have .cuda(), so the ModelNew's forward must handle inputs on CPU? Or perhaps the user expects the inputs to be on CUDA? Since the problem example uses .cuda(), maybe the new code should do the same.
+
+Hence, in the generated code, the get_inputs() function should generate CUDA tensors.
+
+Therefore, the new code's get_inputs() should be:
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+
+But the problem says to not output testing code, so maybe the user's existing get_inputs() is to be modified? The problem states: "Please generate real code, NOT pseudocode, make sure the code compiles and is fully functional. Do not output testing code." So perhaps the code for the model is sufficient, and the get_inputs() is part of the provided code, so we just need to adjust it in the new code.
+
+Wait, looking at the problem's given architecture:
+
+The original code has:
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, output_size]
+
+The problem says to output the new architecture (ModelNew) and also the get_init_inputs and get_inputs functions? The example shows that the new architecture includes the ModelNew class and the get_init_inputs and get_inputs functions.
+
+Wait in the example provided by the user, the original code had get_inputs and get_init_inputs, and the new code also included them. So in the answer, the new code should include the get_inputs and get_init_inputs functions with CUDA tensors.
+
+Hence, in the final code:
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+
+def get_init_inputs():
+    return [input_size, hidden_size, output_size]
+
+Therefore, integrating all this into the code.
+
+Another point: the sigmoid custom kernel might not be necessary, but to follow the user's example, let's proceed.
+
+Wait, but in the code above, the sigmoid is applied via a custom kernel. However, the PyTorch's sigmoid is already optimized. Let's check whether replacing it is beneficial. For large tensors, a custom kernel could be comparable, but perhaps the PyTorch's implementation is better. To be safe, let's proceed with the code as written, but maybe only the logsumexp is necessary.
+
+Alternatively, the user might prefer to focus on the logsumexp.
+
+But since the problem allows replacing any operators, even if the gain is small, I'll proceed as outlined.
+
+Now, checking the code for possible errors:
+
+In the logsumexp kernel:
+
+- The shared memory array size is 256, but the block size (threads per block) can be up to 256 (since block_size is 256). Therefore, for a block of 256 threads, the shared array is sufficient. If the block size were larger, this would be a problem, but we set it to 256.
+
+In the LogSumExp kernel, the grid is set to batch_size, which is 16384. This may exceed the maximum grid dimensions allowed by CUDA (which is typically 65535 per dimension, so 16384 is okay). 
+
+Another point: when using shared memory, the kernel requires that the block size is a divisor of the channels? Not necessarily, since the loop is using threadIdx.x with stride blockDim.x. 
+
+Testing the code for channels=1024 and block size=256: each thread in the block will process 1024 / 256 = 4 elements. 
+
+The shared memory reduction step should work as written.
+
+Potential issues:
+
+- If the input is not contiguous, the kernel may access memory in a non-optimal way. To ensure the input is contiguous, the code should check. The PyTorch tensor's data_ptr() requires the tensor to be contiguous. So in the logsumexp_forward_cuda function, we can ensure that the input is contiguous:
+
+input = input.contiguous()
+
+Similarly for the sigmoid.
+
+### Final Code:
+
+Putting all together, here is the code with the custom LogSumExp and Sigmoid kernels:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom LogSumExp CUDA kernel
+logsumexp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void logsumexp_forward_kernel(
+    const float* input, float* output, int batch_size, int channels) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        float val = exp(input[row * channels + i]);
+        sum += val;
+    }
+
+    // Shared memory reduction
+    __shared__ float shared[256];  // Assuming blockDim.x <= 256
+    int tid = threadIdx.x;
+    shared[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[row] = std::log(shared[0]);
+    }
+}
+
+torch::Tensor logsumexp_forward_cuda(torch::Tensor input) {
+    input = input.contiguous();
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    auto output = torch::empty({batch_size}, input.options());
+
+    const int block_size = 256;
+    const dim3 grid(batch_size);
+    const dim3 block(block_size);
+
+    logsumexp_forward_kernel<<<grid, block>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels);
+
+    return output;
+}
+"""
+
+# Custom Sigmoid CUDA kernel
+sigmoid_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void sigmoid_forward_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx];
+        output[idx] = 1.0f / (1.0f + expf(-x));
+    }
+}
+
+torch::Tensor sigmoid_forward_cuda(torch::Tensor input) {
+    input = input.contiguous();
+    int size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    sigmoid_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+# Compile the custom kernels
+logsumexp = load_inline(
+    name="logsumexp",
+    cuda_sources=logsumexp_source,
+    functions=["logsumexp_forward_cuda"],
+    verbose=True
+)
+
+sigmoid = load_inline(
+    name="sigmoid",
+    cuda_sources=sigmoid_source,
+    functions=["sigmoid_forward_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(ModelNew, self).__init__()
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, output_size)
+        self.sigmoid = sigmoid
+        self.logsumexp = logsumexp
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.sigmoid.sigmoid_forward_cuda(x)
+        x = self.linear2(x)
+        x = self.logsumexp.logsumexp_forward_cuda(x)
+        return x
+
+def get_init_inputs():
+    return [input_size, hidden_size, output_size]
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+```
+
+Wait, but in the original code, the batch_size, input_size, etc., are defined outside the functions. The new code must include those variables. Since the original code has:
+
+batch_size = 16384
+input_size = 2048
+hidden_size = 4096
+output_size = 1024
+
+These variables are needed in get_init_inputs and get_inputs. So in the new code, they should be defined at the top, as in the original.
+
+Therefore, the final code should have those variables defined:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+batch_size = 16384
+input_size = 2048
+hidden_size = 4096
+output_size = 1024
+
+# ... rest of the code ...
+```
+
+So adding those definitions at the top.
+
+Thus, the complete code is as follows.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+batch_size = 16384
+input_size = 2048
+hidden_size = 4096
+output_size = 1024
+
+# Custom LogSumExp CUDA kernel
+logsumexp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void logsumexp_forward_kernel(
+    const float* input, float* output, int batch_size, int channels) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        float val = exp(input[row * channels + i]);
+        sum += val;
+    }
+
+    // Shared memory reduction
+    __shared__ float shared[256];  // Assuming blockDim.x <= 256
+    int tid = threadIdx.x;
+    shared[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[row] = std::log(shared[0]);
+    }
+}
+
+torch::Tensor logsumexp_forward_cuda(torch::Tensor input) {
+    input = input.contiguous();
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    auto output = torch::empty({batch_size}, input.options());
+
+    const int block_size = 256;
+    const dim3 grid(batch_size);
+    const dim3 block(block_size);
+
+    logsumexp_forward_kernel<<<grid, block>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels);
+
+    return output;
+}
+"""
+
+# Custom Sigmoid CUDA kernel
+sigmoid_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void sigmoid_forward_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx];
+        output[idx] = 1.0f / (1.0f + expf(-x));
+    }
+}
+
+torch::Tensor sigmoid_forward_cuda(torch::Tensor input) {
+    input = input.contiguous();
+    int size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    sigmoid_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+# Compile the custom kernels
+logsumexp = load_inline(
+    name="logsumexp",
+    cuda_sources=logsumexp_source,
+    functions=["logsumexp_forward_cuda"],
+    verbose=True
+)
+
+sigmoid = load_inline(
+    name="sigmoid",
+    cuda_sources=sigmoid_source,
+    functions=["sigmoid_forward_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(ModelNew, self).__init__()
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, output_size)
+        self.sigmoid = sigmoid
+        self.logsumexp = logsumexp
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.sigmoid.sigmoid_forward_cuda(x)
+        x = self.linear2(x)
+        x = self.logsumexp.logsumexp_forward_cuda(x)
+        return x
+
+def get_init_inputs():
+    return [input_size, hidden_size, output_size]
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+```

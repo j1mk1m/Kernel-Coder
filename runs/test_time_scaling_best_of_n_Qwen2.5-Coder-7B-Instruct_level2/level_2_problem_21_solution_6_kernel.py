@@ -1,0 +1,90 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_kernel(const float* input, const float* weight, float* output, int input_height, int input_width, int input_channels, int kernel_size, int stride) {
+    int batch_idx = blockIdx.z;
+    int channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (channel_idx >= input_channels || row_idx >= input_height || batch_idx >= input_batch) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int k = 0; k < kernel_size; ++k) {
+        for (int l = 0; l < kernel_size; ++l) {
+            int input_row = row_idx * stride + k;
+            int input_col = (row_idx * stride + l) % input_width;
+            int input_idx = batch_idx * input_channels * input_height * input_width + channel_idx * input_height * input_width + input_row * input_width + input_col;
+            int weight_idx = channel_idx * kernel_size * kernel_size + k * kernel_size + l;
+            sum += input[input_idx] * weight[weight_idx];
+        }
+    }
+    int output_idx = batch_idx * output_channels * output_height * output_width + channel_idx * output_height * output_width + row_idx * output_width;
+    output[output_idx] = sum;
+}
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, int stride) {
+    auto input_batch = input.size(0);
+    auto input_channels = input.size(1);
+    auto input_height = input.size(2);
+    auto input_width = input.size(3);
+    auto output_channels = weight.size(0);
+    auto kernel_size = weight.size(2);
+    auto output_height = (input_height + stride - 1) / stride;
+    auto output_width = (input_width + stride - 1) / stride;
+
+    auto output = torch::zeros({input_batch, output_channels, output_height, output_width}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks_x = (output_width + block_size - 1) / block_size;
+    const int num_blocks_y = (output_height + block_size - 1) / block_size;
+    const int num_blocks_z = input_batch;
+
+    convolution_kernel<<<num_blocks_z, num_blocks_y * num_blocks_x, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), input_height, input_width, input_channels, kernel_size, stride);
+
+    return output;
+}
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, int stride);"
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA operators for convolution, bias addition, scaling, sigmoid, and group normalization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x, self.weight, 1)  # Assuming stride of 1 for simplicity
+        x = x + self.bias
+        x = x * self.scale
+        x = torch.sigmoid(x)
+        x = self.group_norm(x)
+        return x

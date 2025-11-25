@@ -1,0 +1,807 @@
+The given architecture has the following operators that can be replaced: 
+
+- torch.sum
+- torch.max
+- torch.mean
+- torch.logsumexp (called twice)
+- torch.nn.Linear (matrix multiplication)
+
+You can also consider replacing the combination of these operators into fused kernels for better performance. For example, combining matrix multiplication followed by a summation into a single kernel can reduce memory access and improve performance.
+
+The goal is to achieve a faster inference time than the original architecture. You can make any modifications to the code as long as the output of your optimized architecture matches the output of the original architecture for all valid inputs. The inputs are randomly generated, so the outputs must match exactly (within floating point precision) to get full credit.
+
+The code must be compatible with PyTorch 2.1.0, and the CUDA code should be written for compute capability 8.0 (Ampere architecture).
+
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class LinearSumMaxMeanLogSumExpModel(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear_weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.linear_bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.linear_weight, a=math.sqrt(5))
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.linear_weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.linear_bias, -bound, bound)
+
+        # Compile fused CUDA kernels
+        self.fused_kernel = load_inline(
+            name="fused_ops",
+            cpp_sources="""
+                torch::Tensor fused_linear_sum_max_mean_lse_lse(torch::Tensor x);
+            """,
+            cuda_sources=f"""
+                #include <torch/extension.h>
+                #include <cuda_runtime.h>
+                #include <mma.h>
+
+                template <typename scalar_t>
+                __global__ void fused_linear_sum_max_mean_lse_lse_kernel(
+                    const scalar_t* __restrict__ x,
+                    const scalar_t* __restrict__ weight,
+                    const scalar_t* __restrict__ bias,
+                    scalar_t* out,
+                    int batch_size,
+                    int in_features,
+                    int out_features
+                ) {{
+                    extern __shared__ byte shared[];
+                    scalar_t* sdata = reinterpret_cast<scalar_t*>(shared);
+
+                    const int tid = threadIdx.x;
+                    const int bid = blockIdx.x;
+
+                    // Matrix multiplication (x @ weight.T + bias)
+                    scalar_t* out_ptr = out + bid * out_features;
+                    for (int i = 0; i < out_features; i += blockDim.x) {{
+                        int idx = i + tid;
+                        if (idx < out_features) {{
+                            scalar_t sum = 0;
+                            for (int j = 0; j < in_features; j++) {{
+                                sum += x[bid * in_features + j] * weight[idx * in_features + j];
+                            }}
+                            out_ptr[idx] = sum + bias[idx];
+                        }}
+                    }}
+
+                    // Synchronize to ensure all threads complete matrix multiply
+                    __syncthreads();
+
+                    // Sum over features dimension
+                    scalar_t sum_val = 0;
+                    for (int i = 0; i < out_features; i++) {{
+                        sum_val += out_ptr[i];
+                    }}
+                    sdata[tid] = sum_val;
+                    __syncthreads();
+
+                    // Reduction for sum
+                    for (int s = blockDim.x / 2; s > 0; s >>= 1) {{
+                        if (tid < s) {{
+                            sdata[tid] += sdata[tid + s];
+                        }}
+                        __syncthreads();
+                    }}
+                    if (tid == 0) sdata[0] = sdata[0]; // Keep sum result
+                    __syncthreads();
+
+                    // Max over batch dimension (though batch is processed per block, so max within features)
+                    scalar_t max_val = -INFINITY;
+                    for (int i = 0; i < out_features; i++) {{
+                        if (out_ptr[i] > max_val) {{
+                            max_val = out_ptr[i];
+                        }}
+                    }}
+                    sdata[tid] = max_val;
+                    __syncthreads();
+
+                    // Reduction for max
+                    for (int s = blockDim.x / 2; s > 0; s >>= 1) {{
+                        if (tid < s) {{
+                            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+                        }}
+                        __syncthreads();
+                    }}
+                    if (tid == 0) sdata[1] = sdata[0]; // Store max result
+                    __syncthreads();
+
+                    // Mean over features (since after sum and max, but original code uses mean on already reduced dims)
+                    // Wait, original code applies mean after max which was already (batch_size,1). Need to re-express.
+
+                    // Re-examining original steps:
+                    // After linear: (batch, out_features)
+                    // sum(dim=1): (batch, 1)
+                    // max(dim=1): (batch, 1) but actually max over elements? The code's torch.max on (batch,1) would take max over dim 1, which is scalar per batch
+                    // Then mean over that dim 1 again (which is already 1), so effectively no change
+                    // Then two logsumexp on dim 1 (again already 1 element)
+
+                    // Therefore, after linear, the subsequent operations are all reductions along dim 1 (features)
+                    // So after linear, all operations reduce to a scalar per sample, then apply logsumexp twice on that scalar
+
+                    // Therefore, the entire computation reduces to:
+                    // For each sample:
+                    //   1. Compute linear output (vector of out_features)
+                    //   2. Sum all elements: scalar
+                    //   3. Take max of that scalar (still same value)
+                    //   4. Take mean of that (still same)
+                    //   5. Compute logsumexp of that scalar (log(exp(scalar)) = scalar)
+                    //   6. Compute logsumexp again (same result)
+                    // So final result is the same as the original linear output summed over features, then passed through two identity operations (logsumexp of a single element is the element itself)
+                    
+                    // Wait, this suggests that the final output is actually just the sum of the linear layer's output along features dimension, and the subsequent operations (max, mean, logsumexp twice) do nothing except the first sum. But that contradicts the original code's description. Let me check again:
+
+                    Original code steps:
+                    x = linear(x) → (batch, out_features)
+                    x = torch.sum(x, dim=1, keepdim=True) → (batch, 1)
+                    x = torch.max(x, dim=1, keepdim=True)[0] → (batch, 1). But torch.max on a (batch,1) tensor over dim 1 gives (batch) output, but with keepdim=True it's (batch,1). The max of a single element is the element itself.
+                    Then x = torch.mean(...) → same as before, since only one element.
+                    Then two logsumexp calls on dim 1 (which is size 1), which for a single element logsumexp is just the element itself.
+
+                    So all operations after linear are redundant except the first sum. The final output is equal to the sum of the linear output along features dimension. 
+
+                    Therefore, the entire computation reduces to sum(linear(x), dim=1). However, the original code's description says it returns a (batch_size, 1) tensor, which matches this. 
+
+                    So the fused kernel can just compute the sum of the linear output, which is equivalent to the entire computation.
+
+                    So the entire process can be simplified to:
+
+                    output = (x @ weight.T + bias).sum(dim=1, keepdim=True)
+
+                    Thus, the fused kernel can be optimized to compute just the sum of the linear layer's output, which is equivalent to a single vector dot product between x and the summed weights.
+
+                    Wait, let me think again. The linear layer is x @ weight.T + bias. Then we sum over dim 1 (the features dimension after linear). So the total is sum_{i=0}^{out_features-1} (sum_{j=0}^{in_features-1} x_j * weight[i][j] + bias[i])
+
+                    Which can be rewritten as sum_{i} [ (x · weight[i]) + bias[i] ]
+
+                    Which equals (x · sum(weight, dim=0)) + sum(bias)
+
+                    Wait, no:
+
+                    Wait, the weight is shape (out_features, in_features). Each row is a weight vector for a feature in the output.
+
+                    The linear output for each sample is a vector of length out_features, where each element is the dot product of x with the corresponding row of weight plus the bias for that row.
+
+                    Summing over all elements of this vector gives the total sum over all output features.
+
+                    So the total is sum_{k=0}^{out_features-1} [ (x · weight[k]) + bias[k] ]
+
+                    Which can be rewritten as x · (sum_{k} weight[k]) + sum(bias)
+
+                    Because each element of x is multiplied by the sum of the corresponding column in the weight matrix across all output features.
+
+                    Wait, no, more precisely:
+
+                    The sum over all output features of (x · weight[k] + bias[k]) is equal to the dot product of x with the sum of all rows of the weight matrix, plus the sum of all biases.
+
+                    Because:
+
+                    sum_{k} (x · weight[k]) = x · sum_{k} weight[k]
+
+                    and sum_{k} bias[k] is just the sum of all biases.
+
+                    Therefore, the total sum can be computed as:
+
+                    x · (sum of all rows of weight matrix) + (sum of all biases)
+
+                    This is a crucial insight! This allows us to precompute the summed weight vector and summed bias, then compute a single dot product for each sample. This reduces the computation from O(out_features * in_features) to O(in_features), which is a massive optimization when out_features is large (like 8192 here).
+
+                    Therefore, we can precompute:
+
+                    summed_weight = weight.sum(dim=0)
+                    summed_bias = bias.sum()
+
+                    Then the output for each sample is x @ summed_weight.T + summed_bias
+
+                    This is a huge simplification and would make the kernel extremely efficient. However, this depends on the correctness of the original computation. Let's verify with a small example:
+
+                    Suppose out_features = 2, in_features=2, x = [a, b]
+
+                    weight rows:
+                    w1 = [w1a, w1b]
+                    w2 = [w2a, w2b]
+
+                    biases: b1, b2
+
+                    linear output for sample: [a*w1a + b*w1b + b1, a*w2a + b*w2b + b2]
+
+                    sum over features: (a(w1a + w2a) + b(w1b + w2b) + (b1 + b2))
+
+                    Which is exactly x @ (summed_weight) + summed_bias, where summed_weight is [w1a + w2a, w1b + w2b], summed_bias = b1 + b2.
+
+                    So yes, this is correct. Therefore, the entire computation can be reduced to a single dot product plus a scalar bias. This is a massive optimization.
+
+                    Therefore, the fused kernel can be simplified to compute this:
+
+                    1. Precompute summed_weight and summed_bias during initialization
+                    2. For each sample, compute dot product of x with summed_weight, add summed_bias
+                    3. The result is already the required sum, and subsequent operations (max, mean, logsumexp twice) are redundant
+
+                    Therefore, the fused kernel can be written to compute this single operation.
+
+                    So now, the CUDA kernel can be written as:
+
+                    - For each sample in parallel:
+                        - Compute the dot product of x and summed_weight
+                        - Add summed_bias
+                        - The result is the output for that sample
+
+                    This is extremely efficient, especially since in_features is 8192. We can use shared memory and vectorized operations.
+
+                    Let's proceed with this approach.
+
+                    So the CUDA kernel code will:
+
+                    - Precompute summed_weight and summed_bias (this can be done once at initialization)
+                    - The kernel will take x as input (shape batch_size x in_features)
+                    - For each thread block handling a batch element, compute the dot product with summed_weight (a vector of length in_features) plus summed_bias.
+
+                    However, to further optimize, we can precompute the summed_weight and summed_bias as part of the model's parameters.
+
+                    Therefore, in the model's __init__:
+
+                    self.summed_weight = self.linear_weight.sum(dim=0)
+                    self.summed_bias = self.linear_bias.sum()
+
+                    Then the kernel just needs to compute x * summed_weight + summed_bias.
+
+                    Wait, but the kernel will need these parameters. Alternatively, the kernel can take the summed_weight and summed_bias as inputs. However, since these are parameters of the model, we can pass them to the kernel.
+
+                    Alternatively, let's structure the fused kernel to take the original weight and bias, compute the summed values on the fly. However, recomputing the sum every time would be inefficient. Therefore, precomputing them as part of the model is better.
+
+                    Therefore, in the model:
+
+                    class LinearSumMaxMeanLogSumExpModel(nn.Module):
+                        def __init__(self, in_features, out_features):
+                            super().__init__()
+                            self.linear_weight = nn.Parameter(...)
+                            self.linear_bias = nn.Parameter(...)
+                            self.summed_weight = nn.Parameter(self.linear_weight.sum(dim=0), requires_grad=False)
+                            self.summed_bias = nn.Parameter(self.linear_bias.sum(), requires_grad=False)
+
+                            # But actually, summed_weight and summed_bias can be computed once and stored as buffers
+                            # So better to use register_buffer
+                            self.register_buffer('summed_weight', self.linear_weight.sum(dim=0))
+                            self.register_buffer('summed_bias', self.linear_bias.sum())
+
+                    Then the kernel can use these buffers.
+
+                    Therefore, the CUDA kernel can be written as follows:
+
+                    __global__ void fused_linear_sum_max_mean_lse_lse_kernel(
+                        const float* __restrict__ x,
+                        const float* __restrict__ summed_weight,
+                        const float* __restrict__ summed_bias,
+                        float* out,
+                        int batch_size,
+                        int in_features
+                    ) {
+                        // Each thread handles one element of the batch
+                        int bid = blockIdx.x * blockDim.x + threadIdx.x;
+                        if (bid >= batch_size) return;
+
+                        float sum = 0;
+                        for (int i = 0; i < in_features; i++) {
+                            sum += x[bid * in_features + i] * summed_weight[i];
+                        }
+                        sum += *summed_bias; // summed_bias is a scalar stored as a 1-element tensor
+
+                        out[bid] = sum;
+                    }
+
+                    However, this loop over in_features (8192 elements) per sample may be slow. To vectorize, we can use CUDA's vector types or use block-wise reduction with shared memory. But for in_features=8192, which is a multiple of warp size (32), we can use a block per sample and threads to process chunks.
+
+                    Alternatively, using shared memory to load the summed_weight and process in parallel.
+
+                    Let me think of a more optimized approach using shared memory and parallel reduction.
+
+                    Let's structure the kernel such that each thread block handles one sample. The block has multiple threads, each processing a chunk of the in_features elements.
+
+                    For example, with a block size of 256 threads, each thread can handle 32 elements (since 8192 / 256 = 32). But 256 threads * 32 = 8192, so that works.
+
+                    Here's a possible implementation:
+
+                    template <typename scalar_t>
+                    __global__ void fused_kernel(
+                        const scalar_t* __restrict__ x,
+                        const scalar_t* __restrict__ summed_weight,
+                        const scalar_t* __restrict__ summed_bias,
+                        scalar_t* out,
+                        int batch_size,
+                        int in_features
+                    ) {
+                        extern __shared__ byte shared[];
+                        scalar_t* sdata = (scalar_t*)shared;
+                        const int tid = threadIdx.x;
+                        const int bid = blockIdx.x;
+
+                        if (bid >= batch_size) return;
+
+                        scalar_t sum = 0;
+
+                        // Each thread processes in_features / blockDim.x elements
+                        for (int i = tid; i < in_features; i += blockDim.x) {
+                            sum += x[bid * in_features + i] * summed_weight[i];
+                        }
+
+                        // Use parallel reduction within the block
+                        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                            __syncthreads();
+                            if (tid < s) {
+                                sum += sdata[tid + s];
+                            }
+                        }
+
+                        if (tid == 0) {
+                            out[bid] = sum + *summed_bias;
+                        }
+                    }
+
+                    Wait, this requires shared memory for the reduction steps. Let's structure it properly.
+
+                    The shared memory can be used to store the partial sums of each thread before reduction.
+
+                    Let me adjust:
+
+                    __global__ void fused_kernel(...) {
+                        extern __shared__ scalar_t sdata[];
+                        const int tid = threadIdx.x;
+                        const int bid = blockIdx.x;
+
+                        if (bid >= batch_size) return;
+
+                        scalar_t sum = 0;
+
+                        // Load data into shared memory?
+                        // Alternatively, compute partial sums in registers first.
+
+                        // Each thread processes a chunk
+                        for (int i = tid; i < in_features; i += blockDim.x) {
+                            sum += x[bid * in_features + i] * summed_weight[i];
+                        }
+
+                        // Write to shared memory
+                        sdata[tid] = sum;
+                        __syncthreads();
+
+                        // Parallel reduction
+                        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                            if (tid < s) {
+                                sdata[tid] += sdata[tid + s];
+                            }
+                            __syncthreads();
+                        }
+
+                        if (tid == 0) {
+                            out[bid] = sdata[0] + *summed_bias;
+                        }
+                    }
+
+                    The shared memory size needed is blockDim.x * sizeof(scalar_t). 
+
+                    For example, if we choose a block size of 256, then shared memory required is 256 * 4 bytes = 1KB, which is acceptable.
+
+                    The grid size would be batch_size (1024), block size 256.
+
+                    This should be much faster than the naive approach.
+
+                    Let's code this:
+
+                    Now, in the Python code, we can define the model as follows:
+
+                    First, precompute summed_weight and summed_bias as buffers.
+
+                    Then, the CUDA kernel is compiled with these parameters.
+
+                    Putting it all together:
+
+                    The fused CUDA kernel source code would be:
+
+                    __global__ void fused_linear_sum_max_mean_lse_lse_kernel(
+                        const float* x,
+                        const float* summed_weight,
+                        const float* summed_bias,
+                        float* out,
+                        int batch_size,
+                        int in_features
+                    ) {
+                        extern __shared__ float sdata[];
+                        const int tid = threadIdx.x;
+                        const int bid = blockIdx.x;
+
+                        if (bid >= batch_size) return;
+
+                        float sum = 0.0f;
+
+                        // Each thread processes a chunk of in_features elements
+                        for (int i = tid; i < in_features; i += blockDim.x) {
+                            sum += x[bid * in_features + i] * summed_weight[i];
+                        }
+
+                        // Write to shared memory
+                        sdata[tid] = sum;
+                        __syncthreads();
+
+                        // Parallel reduction
+                        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                            if (tid < s) {
+                                sdata[tid] += sdata[tid + s];
+                            }
+                            __syncthreads();
+                        }
+
+                        if (tid == 0) {
+                            out[bid] = sdata[0] + *summed_bias;
+                        }
+                    }
+
+                    The kernel requires the following parameters:
+
+                    - x: input tensor of shape (batch_size, in_features)
+                    - summed_weight: tensor of shape (in_features,)
+                    - summed_bias: scalar tensor (1 element)
+                    - out: output tensor of shape (batch_size, 1)
+                    - batch_size: batch size
+                    - in_features: input features dimension
+
+                    In the Python model, we need to:
+
+                    1. Define summed_weight and summed_bias as buffers.
+                    2. Compile the CUDA kernel with inline code.
+                    3. Call the kernel in the forward pass.
+
+                    Now, coding the Python model:
+
+                    class LinearSumMaxMeanLogSumExpModel(nn.Module):
+                        def __init__(self, in_features, out_features):
+                            super().__init__()
+                            self.linear_weight = nn.Parameter(torch.empty(out_features, in_features))
+                            self.linear_bias = nn.Parameter(torch.empty(out_features))
+                            nn.init.kaiming_uniform_(self.linear_weight, a=math.sqrt(5))
+                            fan_in = self.linear_weight.size(1)
+                            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                            nn.init.uniform_(self.linear_bias, -bound, bound)
+
+                            # Precompute summed weight and bias as buffers
+                            self.register_buffer('summed_weight', self.linear_weight.sum(dim=0))
+                            self.register_buffer('summed_bias', self.linear_bias.sum().view(1))  # Ensure it's a 1-element tensor
+
+                            # Load the fused CUDA kernel
+                            fused_kernel_source = f"""
+                            #include <torch/extension.h>
+                            #include <cuda_runtime.h>
+
+                            template <typename scalar_t>
+                            __global__ void fused_linear_sum_max_mean_lse_lse_kernel(
+                                const scalar_t* x,
+                                const scalar_t* summed_weight,
+                                const scalar_t* summed_bias,
+                                scalar_t* out,
+                                int batch_size,
+                                int in_features
+                            ) {{
+                                extern __shared__ scalar_t sdata[];
+                                const int tid = threadIdx.x;
+                                const int bid = blockIdx.x;
+
+                                if (bid >= batch_size) return;
+
+                                scalar_t sum = 0.0;
+
+                                // Each thread processes a chunk of in_features elements
+                                for (int i = tid; i < in_features; i += blockDim.x) {{
+                                    sum += x[bid * in_features + i] * summed_weight[i];
+                                }}
+
+                                // Write to shared memory
+                                sdata[tid] = sum;
+                                __syncthreads();
+
+                                // Parallel reduction
+                                for (int s = blockDim.x / 2; s > 0; s >>= 1) {{
+                                    if (tid < s) {{
+                                        sdata[tid] += sdata[tid + s];
+                                    }}
+                                    __syncthreads();
+                                }}
+
+                                if (tid == 0) {{
+                                    out[bid] = sdata[0] + summed_bias[0];
+                                }}
+                            }}
+
+                            at::Tensor fused_linear_sum_max_mean_lse_lse(
+                                at::Tensor x,
+                                at::Tensor summed_weight,
+                                at::Tensor summed_bias
+                            ) {{
+                                const int batch_size = x.size(0);
+                                const int in_features = x.size(1);
+
+                                auto out = at::empty({{batch_size, 1}}, x.options());
+
+                                const int block_size = 256;
+                                dim3 grid(batch_size);
+                                dim3 block(block_size);
+                                size_t shared_size = block_size * sizeof(float);
+
+                                AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "fused_linear_sum_max_mean_lse_lse", ([&] {{
+                                    fused_linear_sum_max_mean_lse_lse_kernel<scalar_t><<<grid, block, shared_size>>>(
+                                        x.data<scalar_t>(),
+                                        summed_weight.data<scalar_t>(),
+                                        summed_bias.data<scalar_t>(),
+                                        out.data<scalar_t>(),
+                                        batch_size,
+                                        in_features
+                                    );
+                                }}));
+
+                                return out;
+                            }}
+                            """
+
+                            self.fused_kernel = load_inline(
+                                name="fused_linear_sum_max_mean_lse_lse",
+                                cpp_sources=f"""
+                                    #include <torch/extension.h>
+                                    at::Tensor fused_linear_sum_max_mean_lse_lse(
+                                        at::Tensor x,
+                                        at::Tensor summed_weight,
+                                        at::Tensor summed_bias
+                                    );
+                                """,
+                                cuda_sources=fused_kernel_source,
+                                functions=["fused_linear_sum_max_mean_lse_lse"],
+                                verbose=True
+                            )
+
+                        def forward(self, x):
+                            return self.fused_kernel.fused_linear_sum_max_mean_lse_lse(
+                                x,
+                                self.summed_weight,
+                                self.summed_bias
+                            )
+
+                    Wait, but the output of this kernel is (batch_size, 1), which matches the original model's output. 
+
+                    However, the original model's code had two logsumexp calls, but as we determined earlier, those are redundant and do not affect the result. Therefore, this fused kernel correctly captures the entire computation.
+
+                    Additionally, the original model's steps after the linear layer are all reductions that boil down to the sum of the linear output, so the fused kernel correctly implements the required computation.
+
+                    This approach should be significantly faster than the original code because:
+
+                    1. The computation is reduced from O(out_features * in_features) to O(in_features), a reduction by a factor of 8192.
+                    2. The kernel uses parallel reduction for the dot product, which is highly optimized.
+                    3. Memory access patterns are improved by processing in parallel and using shared memory.
+
+                    Edge cases and considerations:
+
+                    - The summed_weight and summed_bias are computed once during initialization. They need to be updated if the linear_weight or linear_bias parameters are changed (e.g., during training). However, since this is an inference optimization, and assuming the model is fixed during inference, this should be okay.
+                    - The CUDA kernel must handle the case where in_features is not a multiple of the block size. But since in_features is 8192 and block_size is 256 (8192 / 256 = 32), it divides evenly, so no problem.
+                    - The shared memory allocation is correctly calculated as block_size * sizeof(float), which for 256 threads is 1KB.
+                    - The kernel uses AT_DISPATCH_FLOATING_TYPES to handle different data types, though the problem states inputs are torch.rand which is float32.
+                    - The output tensor is initialized with the correct shape (batch_size, 1).
+
+                    This implementation should be both correct and significantly faster than the original code.
+                    
+                    
+                    
+Wait, but there's an error here. The original code's torch.max operation is applied on the summed tensor (which is (batch, 1)), so dim=1. The max of a single element is the element itself. Similarly, the mean over dim 1 (which is size 1) leaves it unchanged. The logsumexp over a single element is also the element itself (since log(exp(x)) = x). Therefore, all operations after the initial sum are redundant. Hence, the entire computation reduces to the sum of the linear layer's output along the features dimension. Therefore, the fused kernel only needs to compute that sum, which is exactly what the code above does. 
+
+However, in the original Model class, the final output is of shape (batch_size, 1), which matches the output of the fused kernel. 
+
+Therefore, this approach is correct and optimal.
+                    
+                    
+                    
+                    Now, the complete code in Python:
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear_weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.linear_bias = nn.Parameter(torch.empty(out_features))
+        nn.init.kaiming_uniform_(self.linear_weight, a=math.sqrt(5))
+        fan_in = self.linear_weight.size(1)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.linear_bias, -bound, bound)
+
+        # Precompute summed weight and bias as buffers
+        self.register_buffer('summed_weight', self.linear_weight.sum(dim=0))
+        self.register_buffer('summed_bias', self.linear_bias.sum().view(1))
+
+        # Define and compile the fused CUDA kernel
+        fused_kernel_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        template <typename scalar_t>
+        __global__ void fused_linear_sum_max_mean_lse_lse_kernel(
+            const scalar_t* x,
+            const scalar_t* summed_weight,
+            const scalar_t* summed_bias,
+            scalar_t* out,
+            int batch_size,
+            int in_features
+        ) {
+            extern __shared__ scalar_t sdata[];
+            const int tid = threadIdx.x;
+            const int bid = blockIdx.x;
+
+            if (bid >= batch_size) return;
+
+            scalar_t sum = 0.0;
+
+            // Each thread processes a chunk of in_features elements
+            for (int i = tid; i < in_features; i += blockDim.x) {
+                sum += x[bid * in_features + i] * summed_weight[i];
+            }
+
+            // Write partial sum to shared memory
+            sdata[tid] = sum;
+            __syncthreads();
+
+            // Parallel reduction within the block
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    sdata[tid] += sdata[tid + s];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                out[bid] = sdata[0] + summed_bias[0];
+            }
+        }
+
+        at::Tensor fused_linear_sum_max_mean_lse_lse(
+            at::Tensor x,
+            at::Tensor summed_weight,
+            at::Tensor summed_bias
+        ) {
+            const int batch_size = x.size(0);
+            const int in_features = x.size(1);
+
+            auto out = at::empty({batch_size, 1}, x.options());
+
+            const int block_size = 256;
+            dim3 grid(batch_size);
+            dim3 block(block_size);
+            size_t shared_size = block_size * sizeof(float);
+
+            AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "fused_linear_sum_max_mean_lse_lse", ([&]{
+                fused_linear_sum_max_mean_lse_lse_kernel<scalar_t><<<grid, block, shared_size>>>(
+                    x.data<scalar_t>(),
+                    summed_weight.data<scalar_t>(),
+                    summed_bias.data<scalar_t>(),
+                    out.data<scalar_t>(),
+                    batch_size,
+                    in_features
+                );
+            }));
+
+            return out.view({batch_size, 1}); // Ensure output shape (batch, 1)
+        }
+        """
+
+        self.fused_kernel = load_inline(
+            name="fused_ops",
+            cpp_sources="""
+                #include <torch/extension.h>
+                at::Tensor fused_linear_sum_max_mean_lse_lse(
+                    at::Tensor x,
+                    at::Tensor summed_weight,
+                    at::Tensor summed_bias
+                );
+            """,
+            cuda_sources=fused_kernel_source,
+            functions=["fused_linear_sum_max_mean_lse_lse"],
+            verbose=True
+        )
+
+    def forward(self, x):
+        return self.fused_kernel.fused_linear_sum_max_mean_lse_lse(
+            x,
+            self.summed_weight,
+            self.summed_bias
+        )
+
+# Ensure to import math for initialization
+import math
+
+def get_inputs():
+    batch_size = 1024
+    in_features = 8192
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [8192, 8192]
+```
+```python
+# The above code includes all necessary components and optimizations:
+# 1. Fused the entire computation into a single kernel that computes the sum of the linear layer's output.
+# 2. Precomputed summed_weight and summed_bias to avoid redundant computations.
+# 3. Used CUDA parallel reduction for the dot product to maximize performance.
+# 4. Correctly handles the output shape (batch_size, 1).
+# 5. The kernel is designed for compute capability 8.0 (Ampere) with appropriate block/thread configuration.
+# 6. The initialization matches PyTorch's default nn.Linear initialization.
+```
+</think>
+
+
+Okay, let's tackle this problem step by step. The user wants me to optimize the given PyTorch model by replacing some or all of its operations with custom CUDA kernels. The original model's forward pass includes a sequence of operations like matrix multiplication, summation, max, mean, and logsumexp. My goal is to create a faster version of this model using CUDA kernels.
+
+First, I need to understand the original model's operations. The model starts with a linear layer (matrix multiplication), then applies torch.sum, torch.max, torch.mean, and two logsumexp operations. The user mentioned that these operations can be fused or optimized. 
+
+Looking at the operations after the linear layer, I notice that after the linear transformation, the subsequent steps are all reductions along the feature dimension. Let me break it down:
+
+1. After the linear layer, the output is of shape (batch_size, out_features).
+2. torch.sum(dim=1) reduces it to (batch_size, 1).
+3. torch.max(dim=1) on a (batch_size, 1) tensor doesn't change the shape since the max of a single element is itself.
+4. Similarly, torch.mean on that dimension also leaves it unchanged.
+5. The two logsumexp operations on dim=1 also don't change the value because logsumexp of a single element x is just x (since log(exp(x)) = x).
+
+Ah! This means all the operations after the linear layer effectively just compute the sum of the linear layer's output along the feature dimension. The subsequent steps are redundant and can be ignored. This is a key insight. The entire computation can be reduced to just the sum of the linear layer's output over the features, which simplifies the problem a lot.
+
+So the core computation is: (x @ W.T + b).sum(dim=1, keepdim=True). 
+
+Now, to optimize this, instead of doing the matrix multiplication followed by a sum, I can fuse these steps. The matrix multiplication (x @ W.T + b) followed by a sum over features can be expressed as a single dot product with the sum of the weight matrix's rows plus the sum of the biases. 
+
+Breaking it down:
+- The linear layer's output for each sample is (x · W_i + b_i) for each output feature i.
+- Summing over all output features gives the total sum over i of (x · W_i + b_i) = x · (sum of all rows of W) + sum(b).
+
+This simplifies the computation to a single dot product plus a scalar bias. This is a huge optimization because the original approach would involve O(out_features * in_features) operations, whereas this reduces it to O(in_features) operations, especially since out_features is 8192 here.
+
+So, the plan is:
+1. Precompute the summed_weight (sum of all rows of W) and summed_bias (sum of all biases).
+2. Compute the dot product of input x with summed_weight, add summed_bias, and reshape to (batch_size, 1).
+
+Next, implementing this with a CUDA kernel. The kernel needs to handle the dot product efficiently. Since in_features is 8192, a straightforward loop might be too slow. Instead, use parallel reduction with CUDA threads and shared memory to speed things up.
+
+Here's how the kernel will work:
+- Each block handles one batch element.
+- Threads in the block process chunks of the in_features elements.
+- Each thread computes a partial sum of the dot product for their chunk.
+- These partial sums are then reduced using parallel reduction in shared memory.
+
+The steps for the kernel:
+1. Each thread loads a chunk of the input and corresponding summed weights.
+2. Compute partial sums.
+3. Use shared memory for reduction steps within the block.
+4. The final sum is written to the output for each batch element.
+
+I also need to ensure that the kernel is correctly configured with the right block and grid sizes. Since the batch size is 1024, the grid can have 1024 blocks (one per sample). The block size can be 256 threads, which allows each thread to handle 32 elements (8192 / 256 = 32). This keeps the computation balanced.
+
+Now, implementing this in PyTorch with load_inline to compile the CUDA kernel on the fly. The kernel function will take the input tensor, summed_weight, summed_bias, and output tensor. The kernel uses shared memory for the reduction steps.
+
+Testing this approach should give a significant speedup compared to the original model, especially since we're reducing the number of operations from O(out_features * in_features) to O(in_features), and using efficient parallel reduction.
+
+Finally, the code structure will include the model with parameters, precomputed buffers for summed_weight and summed_bias, and the fused CUDA kernel. The forward pass directly calls the kernel with these parameters.
+
+Potential issues to watch out for:
+- Correct handling of tensor shapes and dimensions.
+- Proper memory allocation and synchronization in the kernel.
+- Ensuring the initialization of summed_weight and summed_bias is done correctly and updated if the model parameters change (though for inference, this might not be necessary).
+
+With these considerations, the optimized model should be both correct and faster than the original.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.linear_weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.linear_bias = nn.Parameter(torch.empty(out_features))

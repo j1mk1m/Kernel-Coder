@@ -1,0 +1,19 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Your CUDA source code goes here
+# ...
+
+# Compile the inline CUDA code
+# ...
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, scale_shape=(1,)):
+        super(ModelNew, self).__init__()
+        # ...
+    
+    def forward(self, x):
+        # ...
+        return x

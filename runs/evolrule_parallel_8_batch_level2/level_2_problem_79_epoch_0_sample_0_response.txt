@@ -1,0 +1,911 @@
+The new ModelNew architecture must retain the original computational graph. That is, it must compute the same thing, but with possibly faster operators. The operators to be replaced must be those that can be sped up, and the rest can be kept as PyTorch builtins. 
+
+You may make the following assumptions: 
+
+- The input tensor dimensions are fixed as per the given get_inputs() function. You can hardcode any tensor dimension if needed. 
+
+- The model is only ever run on an A100 GPU. 
+
+- The model is run in a PyTorch version that supports the latest features (say, 2.3.0). 
+
+- The user will not call .to() or change the device. The model and inputs are already on the GPU (e.g. .cuda() has been called). 
+
+- The model is run in inference mode only (no gradient needed). 
+
+- The model is only run on inputs of the given shape (no need to handle different input shapes). 
+
+- The model is run with a batch size of exactly 128. 
+
+- The model will not be scripted or traced. 
+
+- The model is run with all operator inputs and outputs on the same device (no need to handle device transfers). 
+
+- The model is run with all tensors in float32. 
+
+- The multiplier parameter is a learnable parameter, so it must remain a nn.Parameter and be part of the model's state_dict. 
+
+- The clamp_min and clamp_max are fixed constants provided at initialization, so you can hardcode them if you want (they don't need to be part of the computation graph). 
+
+- The model will not be parallelized across multiple GPUs. 
+
+- The code must be compatible with Python 3.8+. 
+
+- The code must not use any third-party dependencies beyond PyTorch. 
+
+- The code must not use any deprecated PyTorch features. 
+
+- The code must use the latest programming practices (e.g., TRT-style kernels, CUTLASS, etc., if applicable). 
+
+- You can assume that the input tensor is contiguous and in the correct format. 
+
+- You can assume that all tensors involved are in CUDA and pinned memory. 
+
+- You can make any other reasonable assumptions to simplify the problem, as long as they are not contradictory to the problem statement. 
+
+You must replace at least one operator with a custom CUDA kernel. 
+
+You may choose to replace multiple operators or fuse multiple operators into a single kernel. For example, replacing the multiplication by self.multiplier, instance norm, clamp, and subsequent multiplication into a single fused kernel would be a good idea. 
+
+The fused kernel approach would involve taking the output of the convolution, then performing all the element-wise operations (multiply, instance norm, clamp, multiply) in a single kernel, which would save kernel launch overhead and memory bandwidth. 
+
+The instance norm computation is: 
+
+    instance_norm(x) = (x - mean) / sqrt(var + eps), where mean and var are computed per sample per channel. 
+
+However, since the user specified that the model is run in inference mode only, we can precompute the mean and variance if needed, but in reality, instance norm in inference would use running stats, but since it's a nn.InstanceNorm3d layer, during inference, it uses the statistics computed during training (unless track_running_stats is False). However, the problem statement doesn't mention anything about training, so we can assume that the instance norm is in eval mode and uses the running mean and var. However, the given code doesn't set track_running_stats, so by default, InstanceNorm3d has track_running_stats=True, so during inference, it uses the stored running_mean and running_var. 
+
+Wait, actually, in PyTorch's nn.InstanceNorm3d, the default is track_running_stats=True. However, when in eval mode, it uses the running_mean and running_var. However, in the given code, the model is initialized without specifying track_running_stats, so the default is True. 
+
+Therefore, the instance norm during inference would require accessing the running_mean and running_var, which are buffers in the model. Therefore, in a custom kernel, we would need to include these parameters. 
+
+Alternatively, perhaps we can fuse the operations after the convolution into a single kernel. Let's see the sequence of operations after the convolution:
+
+1. Multiply by self.multiplier (element-wise multiplication, since multiplier is shape (out_channels, 1, 1, 1))
+
+2. Apply instance norm: which requires computing mean and variance per channel per sample, subtract mean, divide by sqrt(var + eps), then affine transform (if InstanceNorm has affine=True). Wait, the default for InstanceNorm3d is affine=True, so there are also gamma and beta parameters. Wait, let me check the parameters of the InstanceNorm3d:
+
+The given code initializes self.instance_norm = nn.InstanceNorm3d(out_channels). The default parameters for InstanceNorm3d are: 
+
+- affine: bool = False. Wait, actually, checking the PyTorch documentation:
+
+nn.InstanceNorm3d(num_features, eps=1e-05, momentum=0.1, affine=False, track_running_stats=False)
+
+Wait, no. Wait, according to PyTorch's documentation (https://pytorch.org/docs/stable/generated/torch.nn.InstanceNorm3d.html), the default for affine is False. So the instance norm does not have learnable affine parameters (gamma and beta). Therefore, the instance norm is just (x - mean)/(sqrt(var + eps)), without any scaling or shifting. 
+
+Wait, but the user's code uses nn.InstanceNorm3d(out_channels), so if the default is affine=False, then there are no learnable parameters, only the running_mean and running_var (if track_running_stats is True). 
+
+Wait, the user's code does not set track_running_stats, so the default is track_running_stats=False. Wait, no, let me check again. 
+
+Wait, the parameters for InstanceNorm3d are:
+
+- num_features: C from an expected input of size (N, C, D, H, W)
+
+- eps: a value added to the denominator for numerical stability.
+
+- momentum: value used for the running_mean and running_var computation. Can be set to None for cumulative moving average (i.e., running_mean = momentum * running_mean + (1 - momentum) * sample_mean). Default: 0.1
+
+- affine: a boolean value that when set to True, this module has learnable affine parameters. Default: False
+
+- track_running_stats: a boolean value that when set to True, this module tracks the running mean and variance. Default: False
+
+Wait, so the default for track_running_stats is False. Therefore, the instance norm layer in the given code does NOT track running stats. Therefore, during evaluation, instance norm is computed as (x - mean)/(sqrt(var + eps)), without any stored running stats. Because track_running_stats is False, so there are no running_mean and running_var buffers. 
+
+Therefore, during inference, the instance norm is computed per batch. 
+
+Therefore, the instance norm computation is:
+
+For each sample in the batch, for each channel, compute the mean and variance over the spatial dimensions (depth, height, width). Then subtract the mean, divide by sqrt(var + eps). 
+
+Therefore, this involves per-channel mean and variance computation, which is a reduction over the spatial dimensions. 
+
+This is a more complex operation. 
+
+Therefore, the sequence after the convolution is:
+
+x = conv(x)
+
+x = x * self.multiplier (element-wise multiplication along the channel dimension)
+
+x = instance_norm(x) (which requires computing mean/var over spatial dimensions per channel per sample)
+
+x = torch.clamp(x, min, max)
+
+x = x * self.multiplier (element-wise multiplication again)
+
+x = torch.max(x, dim=1)[0]
+
+Therefore, the steps after convolution are several element-wise operations, instance norm, clamp, and max.
+
+The challenge is to fuse some of these steps into a single CUDA kernel to reduce kernel launches and memory copies. 
+
+Let's consider which operators can be fused. 
+
+First, the element-wise multiplications by self.multiplier occur twice. Since self.multiplier is a parameter of shape (out_channels, 1, 1, 1), the first multiplication is x (shape [batch, out_channels, D, H, W]) multiplied by a tensor of shape (out_channels, 1, 1, 1), which is a broadcasted multiplication along the channel dimension. 
+
+The second multiplication is the same: after the instance norm and clamp, again multiply by self.multiplier. 
+
+These multiplications are straightforward element-wise operations. 
+
+The instance norm is more involved: requires computing mean and var for each channel in each sample. 
+
+Clamping is also straightforward: clamping each element between min and max. 
+
+The final operation is taking the max over dimension 1 (the channel dimension). 
+
+Therefore, the operations after convolution are: 
+
+multiply1 → instance norm → clamp → multiply2 → max.
+
+The idea would be to fuse as many of these steps as possible into a single kernel. 
+
+However, instance norm requires per-channel statistics (mean and var) computed over the spatial dimensions. So that might require some intermediate steps. 
+
+Alternatively, perhaps the entire sequence can be expressed in a single kernel. Let's think:
+
+Starting from the output of the convolution, the steps are:
+
+1. Multiply by multiplier (element-wise along channels)
+
+2. Compute instance norm: for each sample, each channel, compute mean and var over (depth, height, width). Then subtract mean, divide by sqrt(var + eps). 
+
+3. Clamp the result between clamp_min and clamp_max.
+
+4. Multiply by multiplier again (element-wise along channels)
+
+5. Take max over channels (dim=1)
+
+The question is: can we perform all of these steps in a single kernel, or do we have to break it into parts?
+
+The first and second multiplications can be done in a single pass, but the instance norm requires first computing the mean and variance, which is a reduction. 
+
+Therefore, it's challenging to fuse the instance norm into a kernel that also does the other operations, because the mean and variance computation is a reduction step that requires a pass over the data. 
+
+Alternatively, perhaps we can perform the element-wise operations before and after the instance norm in a way that can be combined with the instance norm's computation. 
+
+Alternatively, perhaps we can first compute the instance norm and then the other operations. 
+
+Alternatively, maybe we can combine the two multiplications with the instance norm's computation. 
+
+Alternatively, perhaps the two multiplications can be combined with the clamp and the final max. 
+
+Alternatively, perhaps the two multipliers can be combined: since the first multiplication is x * m, then after some operations, then multiply again by m, so the total would be x * m * ... * m = x * m^2 ... but that might not help. 
+
+Alternatively, the instance norm's computation can be modified by the multiplier: since the first multiplication is x * m, then when computing instance norm, it would be (x*m - mean_xm) / sqrt(var_xm + eps). 
+
+However, that might not lead to any simplification. 
+
+Alternatively, let's see the steps:
+
+Let me denote:
+
+After convolution: x_conv
+
+Multiply by m: x1 = x_conv * m
+
+Compute instance norm on x1: x2 = (x1 - mean_x1) / sqrt(var_x1 + eps)
+
+Clamp: x3 = clamp(x2, min, max)
+
+Multiply by m again: x4 = x3 * m
+
+Max over channels: x5 = max(x4, dim=1)
+
+The question is whether any of these steps can be combined. 
+
+The instance norm is the most computationally intensive step here, as it requires reductions. 
+
+The element-wise operations (multiply, clamp, multiply) could be done in a single kernel, but the instance norm is a reduction and would require separate handling. 
+
+Therefore, perhaps the best approach is to fuse the two multiplies and the clamp into a single kernel, and leave the instance norm as a separate kernel (but maybe optimized), and the final max as a PyTorch op. 
+
+Alternatively, the instance norm could be replaced with a custom kernel for better performance. 
+
+Alternatively, the entire sequence from x_conv to x4 (before the max) could be done in a single kernel. 
+
+Let me think step by step.
+
+First, the element-wise operations:
+
+Multiply by m (element-wise), then instance norm, then clamp, then multiply by m again.
+
+Instance norm requires for each channel in each sample:
+
+Compute mean and var over the spatial dimensions. 
+
+The problem is that mean and var computation is a reduction operation that requires summing over all spatial elements. So this is a global operation per channel. 
+
+Therefore, it's challenging to combine this with the other element-wise operations in a single kernel, because the reduction step requires a separate pass. 
+
+However, perhaps we can first compute the instance norm using a custom kernel, then apply the other element-wise operations in a fused kernel. 
+
+Alternatively, maybe we can compute the instance norm in a way that incorporates the multipliers. 
+
+Alternatively, we can first compute the instance norm, then multiply and clamp, etc. 
+
+Alternatively, let's see the order:
+
+The instance norm is in the middle, so it's necessary to process that step before the second multiplication and clamp. 
+
+Alternatively, perhaps the two multipliers can be factored out. For example, the first multiplication is x * m, and the second is (after instance norm and clamp) multiplied again by m. So the total would be x * m * (instance norm term) * m, but this might not help. 
+
+Alternatively, perhaps the instance norm can be re-expressed in terms of x_conv:
+
+Let me see:
+
+After first multiplication: x1 = x_conv * m
+
+Then instance norm on x1: 
+
+mean_x1 = mean(x1 over spatial dims)
+
+var_x1 = var(x1 over spatial dims)
+
+x2 = (x1 - mean_x1) / sqrt(var_x1 + eps)
+
+Then clamp(x2, min, max)
+
+Then multiply by m again: x3 = clamp(...) * m
+
+Then max over channels. 
+
+Therefore, the instance norm's computation is critical here. 
+
+So, to optimize this, the first step is to see if we can replace the instance norm with a custom kernel for better performance. 
+
+The PyTorch implementation of instance norm might have some overhead, so a custom kernel might be faster. 
+
+Additionally, perhaps we can fuse the first multiplication (x * m) into the instance norm computation. 
+
+Alternatively, we can first compute the instance norm, then the element-wise operations. 
+
+Let's consider writing a custom instance norm kernel. 
+
+First, let's think about the instance norm computation for a single sample and channel. 
+
+Given a 3D tensor (depth, height, width), for each element, compute the mean and variance over all elements in that 3D tensor. 
+
+Mean is sum / (D*H*W)
+
+Variance is sum_squared / (D*H*W) - mean^2 
+
+Then, (x - mean)/sqrt(var + eps) 
+
+So for each channel and each sample, we need to compute these per the spatial dimensions. 
+
+The challenge is that for a batch of size 128, with out_channels=16, each channel in each sample requires its own mean and variance. 
+
+Therefore, the instance norm requires O(N * C * D * H * W) operations for the reductions, but the actual implementation can be optimized. 
+
+Perhaps a custom kernel can compute the mean and var for each channel in parallel across the batch. 
+
+Alternatively, the instance norm can be implemented in a kernel where each thread block handles a single (sample, channel), and computes the mean and variance for that channel in that sample. 
+
+This is feasible. 
+
+Once we have that, then the subsequent element-wise operations can be done in a kernel. 
+
+Alternatively, we can first write a custom instance norm kernel, and then see if the other operations can be fused with it. 
+
+Alternatively, perhaps the entire sequence from x_conv to x4 can be expressed in a single kernel, with the instance norm's mean and variance computed on the fly. 
+
+However, that might be complex. 
+
+Let me first outline possible steps:
+
+Option 1: Replace the instance norm with a custom kernel. 
+
+Option 2: Fuse the two multipliers and the clamp into a single kernel. 
+
+Option 3: Combine instance norm with some of the element-wise operations. 
+
+Option 4: Combine all steps after convolution into a single fused kernel. 
+
+Let me first try Option 1: Replace the instance norm with a custom kernel. 
+
+First, let's consider the parameters and inputs. 
+
+The instance norm layer in PyTorch is given as nn.InstanceNorm3d(out_channels). The default parameters are: 
+
+- affine: False (so no gamma/beta parameters)
+
+- track_running_stats: False (so no running_mean/running_var)
+
+Therefore, during inference, the instance norm is computed as (x - mean)/(sqrt(var + eps)), with eps=1e-5 (default). 
+
+The code for instance norm is:
+
+def instance_norm(x):
+
+    N, C, D, H, W = x.shape
+
+    mean = x.mean(dim=(2,3,4), keepdim=True)
+
+    var = x.var(dim=(2,3,4), unbiased=False, keepdim=True)
+
+    x_normed = (x - mean) / torch.sqrt(var + 1e-5)
+
+    return x_normed
+
+Therefore, in a custom kernel, we need to compute mean and var for each (N,C) over the spatial dimensions. 
+
+The kernel needs to process each sample and channel. 
+
+Let's think of the data layout. 
+
+Assuming the input is in contiguous memory, stored in NCDHW order. 
+
+For each sample in N, and each channel in C, we need to compute the mean and var over D, H, W. 
+
+The plan for the kernel:
+
+For each (n, c):
+
+    compute the mean and var of the 3D tensor x[n,c,:,:,:]
+
+To compute this efficiently, we can have each thread block handle a single (n,c), and each thread in the block processes a portion of the D, H, W elements. 
+
+The steps for each block would be:
+
+1. Compute the total number of elements in the 3D spatial dimensions: size = D * H * W
+
+2. Each thread reads a portion of the elements, computes partial sum and partial sum of squares.
+
+3. Use reduction within the block to compute the total sum and sum of squares.
+
+4. Compute mean = sum / size
+
+5. Compute var = (sum_squares / size) - mean^2 
+
+6. Then, compute the normalized values (x - mean)/sqrt(var + eps) for each element in the spatial dimensions. 
+
+This can be implemented in a CUDA kernel. 
+
+The challenge is to implement this efficiently. 
+
+Let me outline the CUDA kernel structure:
+
+We can have a grid of blocks, where each block corresponds to a (n, c) pair. 
+
+The block size can be, say, 256 threads. 
+
+Each thread in the block processes a chunk of the spatial elements. 
+
+The steps:
+
+- Each block processes a (n,c) slice.
+
+- The spatial elements are D x H x W.
+
+- Each thread in the block processes (spatial_element_id = threadIdx.x + blockDim.x * blockIdx.x) but this might not be the best way. 
+
+Alternatively, each block is responsible for a single (n,c) pair, and the threads in the block process the spatial elements. 
+
+First, compute the spatial size: 
+
+dim = D * H * W 
+
+Each thread processes a few elements. 
+
+First, we can have each thread process a chunk of elements:
+
+for i in 0 ... dim:
+
+    if i < dim:
+
+        val = x[n,c,i// (H*W), (i//W)%H, i%W]
+
+        sum += val 
+
+        sum_squares += val * val 
+
+But this might have memory access issues. 
+
+Alternatively, to coalesce memory accesses, we can process elements in a way that threads access contiguous memory. 
+
+Alternatively, we can use a parallel reduction approach. 
+
+First, each thread loads a chunk of the spatial data, computes partial sums. 
+
+Then, perform a block-wide reduction to get the total sum and sum_squares. 
+
+Once the total sum and sum_squares are known, the mean and variance can be computed, and then the normalized values can be written back. 
+
+The kernel would need to handle the computation of mean and variance first, then the normalization. 
+
+However, this requires that for each (n,c), the mean and variance are computed before the normalization can proceed. 
+
+This can be done in two stages:
+
+1. Compute the mean and var for all (n,c) pairs.
+
+2. Normalize each element using the precomputed means and vars. 
+
+This would require two kernel launches, but perhaps can be done in a single kernel by using shared memory to store the partial sums and then compute the final mean and var. 
+
+Alternatively, the entire process can be done in a single kernel. 
+
+The outline of the kernel would be:
+
+For each block (handling (n,c)):
+
+    Compute spatial_size = D * H * W 
+
+    Initialize shared memory for partial sums. 
+
+    Each thread processes a few elements in the spatial dimensions, accumulating the sum and sum_squares into shared memory. 
+
+    After reduction, compute mean and var. 
+
+    Then, write the mean and var to a buffer. 
+
+Wait, but we need to have all the means and vars computed before proceeding to the normalization step. 
+
+Alternatively, in a single kernel, after computing the mean and var for a (n,c), we can immediately apply the normalization to the elements. 
+
+Wait, but since the normalization requires the mean and var, which are scalars per (n,c), once they are computed, the normalization can proceed. 
+
+Therefore, the kernel can be structured as follows:
+
+Each block is responsible for a (n,c) pair. 
+
+Inside the block:
+
+1. Compute spatial_size = D * H * W 
+
+2. Each thread reads a portion of the spatial elements, computes partial sums into shared memory. 
+
+3. Perform a block-wide reduction to get total_sum and total_sum_squares. 
+
+4. Compute mean = total_sum / spatial_size 
+
+   var = (total_sum_squares / spatial_size) - mean * mean 
+
+5. Compute inv_std = 1.0 / sqrt(var + eps) 
+
+6. Then, each thread processes each spatial element, applying (x - mean) * inv_std 
+
+Therefore, the entire process is done in a single kernel launch. 
+
+The key points are:
+
+- Each block handles a (n,c) pair. 
+
+- The spatial elements are processed in parallel. 
+
+- Reduction is done via shared memory. 
+
+This should be feasible. 
+
+Now, considering the dimensions:
+
+The input tensor has shape (batch_size=128, out_channels=16, D=16, H=32, W=32). 
+
+Therefore, for each (n,c), the spatial size is 16*32*32 = 16384 elements. 
+
+The block size can be chosen to handle this. 
+
+Let me think about how to structure the threads. 
+
+Suppose each block has 256 threads. 
+
+Each thread can process 16384 / 256 = 64 elements. 
+
+Each thread can loop over their assigned elements, accumulating the sum and sum_squares. 
+
+Alternatively, use a tiled approach. 
+
+But regardless, with 256 threads, each thread can handle 64 elements, which is manageable. 
+
+Therefore, the instance norm kernel is feasible. 
+
+Once that is done, the subsequent element-wise operations can be handled in another kernel. 
+
+Alternatively, after the instance norm, the first multiplication is already done before the instance norm (Wait no, the first multiplication is before instance norm). 
+
+Wait, in the original code, after the convolution, the first multiplication is by self.multiplier. 
+
+Wait the sequence is:
+
+conv -> multiply by multiplier (first) -> instance norm -> clamp -> multiply by multiplier (second) -> max 
+
+So the instance norm is after the first multiplication. 
+
+Therefore, the first multiplication must be done before the instance norm. 
+
+Therefore, the steps would be:
+
+1. Convolution (keep as PyTorch op, since it's a standard layer and likely optimized)
+
+2. Multiply by multiplier (element-wise) → this can be done in a custom kernel or as a PyTorch op (x * m). However, if we can fuse this with the instance norm, it would be better. 
+
+Wait, but if we first multiply by the multiplier, then compute instance norm, perhaps we can combine the multiply into the instance norm computation. 
+
+Alternatively, the instance norm's input is x * m, so if we can compute the instance norm directly on x * m, then we can do the multiply inside the instance norm kernel. 
+
+Therefore, the first multiplication can be incorporated into the instance norm kernel. 
+
+So instead of doing x * m first, then instance norm, we can have the instance norm kernel compute the instance norm of x * m directly. 
+
+This way, we can save a separate multiplication kernel. 
+
+Therefore, modifying the instance norm kernel to take an additional multiplier parameter. 
+
+The multiplier is a tensor of shape (out_channels, 1, 1, 1), so for each channel c, the multiplier is self.multiplier[c, 0, 0, 0]. 
+
+Therefore, in the instance norm kernel, for each (n,c), the input is x[n,c,d,h,w] * m[c], and then compute the instance norm on that. 
+
+This way, the first multiplication is done inside the instance norm kernel. 
+
+Therefore, the instance norm kernel can handle the first multiplication. 
+
+This reduces the number of operations and memory accesses. 
+
+Therefore, the steps would be:
+
+After convolution:
+
+x_conv → instance norm with multiplier (x_conv * m) → clamp → multiply by m again → max 
+
+So the first multiplication is incorporated into the instance norm computation, saving a separate step. 
+
+Therefore, the instance norm kernel can be designed to take the multiplier as an input parameter. 
+
+Similarly, the clamp and the second multiplication can be incorporated into a subsequent kernel. 
+
+Therefore, perhaps the following steps:
+
+1. Convolution (PyTorch op)
+
+2. Custom instance norm with multiplier (x_conv * m) → output is normalized 
+
+3. Clamp (element-wise) → output is clamped 
+
+4. Multiply by m again → output is x3 
+
+5. Max over channels (PyTorch op, but maybe can be done in a custom kernel for speed). 
+
+Alternatively, steps 3 and 4 can be fused into a single kernel. 
+
+Alternatively, steps 2, 3, and 4 can be fused into a single kernel. 
+
+Alternatively, let's see:
+
+After step 2 (instance norm with multiplier), we have the normalized x. 
+
+Then, we need to clamp, then multiply by m again. 
+
+These two steps can be done in a single kernel. 
+
+So, after the instance norm kernel, we have a tensor x2. 
+
+Then:
+
+x3 = clamp(x2, min, max) * m 
+
+Wait, but m is per channel. 
+
+Wait, the second multiplication is x3 = clamp(x2, min, max) * m. 
+
+But since m is of shape (out_channels, 1, 1, 1), the multiplication is per channel. 
+
+Therefore, in a kernel, for each element (n,c,d,h,w):
+
+val = x2[n,c,d,h,w]
+
+clamped = max(clamp_min, min(clamp_max, val))
+
+result = clamped * m[c]
+
+Therefore, this can be done in a single kernel. 
+
+Therefore, combining clamp and second multiply into one kernel. 
+
+Therefore, the plan is:
+
+- Replace the instance norm with a custom kernel that also handles the first multiply by m. 
+
+- Combine the clamp and second multiply into a single kernel. 
+
+- The final max can remain as a PyTorch op, but perhaps a custom kernel could do it faster. 
+
+Alternatively, the max can be done with PyTorch's max function, but if we want to optimize further, we can write a kernel for it. 
+
+Let me see the time involved in each step. 
+
+The convolution is likely the most time-consuming part, but since it's a standard PyTorch op, we can't change it. 
+
+The instance norm is the next candidate. 
+
+The element-wise operations (multiplies and clamp) are relatively cheap but can be fused for better performance. 
+
+The max over channels is a reduction and can be done with PyTorch's max, but a custom kernel might be faster. 
+
+Therefore, the main optimizations would be:
+
+1. Custom instance norm with first multiply. 
+
+2. Fused clamp and second multiply. 
+
+3. Custom max kernel. 
+
+Now, let's start coding. 
+
+First, let's handle the instance norm with first multiply. 
+
+The custom instance norm kernel needs to take as input:
+
+- The output of the convolution (x_conv)
+
+- The multiplier tensor (shape [out_channels, 1, 1, 1], but we can pass a 1D tensor of shape [out_channels])
+
+The output will be the normalized tensor (x_conv * m) after instance norm. 
+
+Wait, the multiplier is applied to x_conv before the instance norm. 
+
+Therefore, the kernel must multiply each element by m[c], where c is the channel. 
+
+Therefore, in the kernel, for each (n,c,d,h,w):
+
+value = x_conv[n,c,d,h,w] * m[c]
+
+Then compute instance norm on this value across the spatial dimensions. 
+
+Therefore, in the instance norm kernel, the first step is to apply the multiplier. 
+
+Now, let's write the CUDA kernel for the instance norm with first multiply. 
+
+The kernel will have to read the multiplier tensor. 
+
+First, let's write the CUDA code. 
+
+First, the instance norm with first multiply:
+
+Assuming the input is x_conv (shape [128, 16, 16, 32, 32])
+
+multiplier is a 1D tensor of shape [16]
+
+The output is of the same shape as x_conv. 
+
+The steps:
+
+For each (n,c):
+
+    m_c = multiplier[c]
+
+    compute the spatial elements (d,h,w) for x_conv[n,c,d,h,w] * m_c 
+
+    compute mean and var over these elements 
+
+    normalize each element: (value - mean)/(sqrt(var + eps))
+
+    store the result 
+
+Therefore, the CUDA kernel must handle this. 
+
+The kernel code could be structured as follows:
+
+__global__ void instance_norm_multiplier_kernel(
+    const float* x_data, 
+    const float* multiplier,
+    float* out_data,
+    int batch_size, 
+    int channels, 
+    int depth, 
+    int height, 
+    int width,
+    float eps
+) {
+
+    int n = blockIdx.x; // batch index
+    int c = blockIdx.y; // channel index
+
+    // Each block handles a (n,c) pair 
+
+    // Calculate spatial dimensions size
+    int spatial_size = depth * height * width;
+
+    // Shared memory for partial sums
+    extern __shared__ float shared[];
+
+    float* s_sum = shared;
+    float* s_sum_sq = shared + blockDim.x;
+
+    // Initialize shared memory
+    s_sum[threadIdx.x] = 0.0f;
+    s_sum_sq[threadIdx.x] = 0.0f;
+    __syncthreads();
+
+    // Load the multiplier for this channel
+    float m_c = multiplier[c];
+
+    // Each thread processes a chunk of the spatial elements
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        // Compute d, h, w from idx
+        int d = idx / (height * width);
+        int rem = idx % (height * width);
+        int h = rem / width;
+        int w = rem % width;
+
+        // Compute the value: x[n,c,d,h,w] * m_c
+        int offset = n * channels * depth * height * width +
+                     c * depth * height * width +
+                     d * height * width +
+                     h * width +
+                     w;
+
+        float val = x_data[offset] * m_c;
+
+        atomicAdd(&s_sum[threadIdx.x], val);
+        atomicAdd(&s_sum_sq[threadIdx.x], val * val);
+    }
+
+    __syncthreads();
+
+    // Block-wide reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + s];
+            s_sum_sq[threadIdx.x] += s_sum_sq[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float total_sum = s_sum[0];
+        float total_sum_sq = s_sum_sq[0];
+
+        float mean = total_sum / spatial_size;
+        float var = total_sum_sq / spatial_size - mean * mean;
+        float inv_std = 1.0f / sqrtf(var + eps);
+
+        // Now write the results back
+        for (int idx = 0; idx < spatial_size; ++idx) {
+            // Compute d, h, w from idx again
+            int d = idx / (height * width);
+            int rem = idx % (height * width);
+            int h = rem / width;
+            int w = rem % width;
+
+            int offset = n * channels * depth * height * width +
+                         c * depth * height * width +
+                         d * height * width +
+                         h * width +
+                         w;
+
+            float val = x_data[offset] * m_c; // recompute val here
+            float normalized = (val - mean) * inv_std;
+            out_data[offset] = normalized;
+        }
+    }
+    __syncthreads();
+}
+
+Wait, this has a problem. 
+
+The reduction is done correctly, but then in the final loop, each thread (when threadIdx.x ==0) is responsible for writing the entire spatial elements for their (n,c). 
+
+However, this would mean that for each (n,c) block, only one thread is doing the computation and writing, which could be slow. 
+
+Alternatively, after computing the mean and inv_std, the threads can work together to write the normalized values. 
+
+Let me revise the kernel:
+
+After computing the mean and inv_std, we can have all threads in the block participate in writing the normalized values. 
+
+So:
+
+After the reduction, if threadIdx.x ==0, compute mean and inv_std. 
+
+Then broadcast the mean and inv_std to all threads in the block. 
+
+Then, each thread can process a portion of the spatial elements. 
+
+This would be more efficient. 
+
+Modified kernel:
+
+__global__ void instance_norm_multiplier_kernel(
+    const float* x_data,
+    const float* multiplier,
+    float* out_data,
+    int batch_size,
+    int channels,
+    int depth,
+    int height,
+    int width,
+    float eps
+) {
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+
+    int spatial_size = depth * height * width;
+
+    extern __shared__ float shared[];
+    float* s_sum = shared;
+    float* s_sum_sq = shared + blockDim.x;
+
+    s_sum[threadIdx.x] = 0.0f;
+    s_sum_sq[threadIdx.x] = 0.0f;
+    __syncthreads();
+
+    float m_c = multiplier[c];
+
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        int d = idx / (height * width);
+        int rem = idx % (height * width);
+        int h = rem / width;
+        int w = rem % width;
+
+        int offset = n * channels * depth * height * width +
+                     c * depth * height * width +
+                     d * height * width +
+                     h * width +
+                     w;
+
+        float val = x_data[offset] * m_c;
+        atomicAdd(&s_sum[threadIdx.x], val);
+        atomicAdd(&s_sum_sq[threadIdx.x], val * val);
+    }
+
+    __syncthreads();
+
+    // Reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + s];
+            s_sum_sq[threadIdx.x] += s_sum_sq[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    float total_sum, total_sum_sq;
+    if (threadIdx.x == 0) {
+        total_sum = s_sum[0];
+        total_sum_sq = s_sum_sq[0];
+    }
+    __syncthreads();
+
+    // Broadcast the totals to all threads
+    total_sum = __shfl_sync(FULL_MASK, total_sum, 0);
+    total_sum_sq = __shfl_sync(FULL_MASK, total_sum_sq, 0);
+
+    float mean = total_sum / spatial_size;
+    float var = total_sum_sq / spatial_size - mean * mean;
+    float inv_std = 1.0f / sqrtf(var + eps);
+
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        int d = idx / (height * width);
+        int rem = idx % (height * width);
+        int h = rem / width;
+        int w = rem % width;
+
+        int offset = n * channels * depth * height * width +
+                     c * depth * height * width +
+                     d * height * width +
+                     h * width +
+                     w;
+
+        float val = x_data[offset] * m_c;
+        out_data[offset] = (val - mean) * inv_std;
+    }
+}
+
+This way, after computing the mean and inv_std, all threads participate in writing the normalized values. 
+
+The shared memory usage is 2 * blockDim.x floats, which for a block size of 256 would be 512 floats, which is manageable. 
+
+The block dimensions would be set such that each block corresponds to a (n,c) pair. 
+
+The grid dimensions would be:
+
+dim3 grid(batch_size, channels);
+
+The block size can be 256 threads. 
+
+But we need to ensure that the block size is sufficient to handle the spatial_size elements. 
+
+Wait, the spatial_size for each (n,c) is 16*32*32 = 16384 elements. 
+
+With a block size of 2

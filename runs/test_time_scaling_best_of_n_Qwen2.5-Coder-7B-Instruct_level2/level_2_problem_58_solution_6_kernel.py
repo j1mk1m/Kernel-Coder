@@ -1,0 +1,1 @@
+model_new = load(name="model_new", sources=["model_new.cu"])

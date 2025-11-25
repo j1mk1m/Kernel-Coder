@@ -1,0 +1,930 @@
+The ModelNew must have the same API and inputs/outputs as Model. The code must be compatible with PyTorch 2.0.1. You must replace the L1 normalization operation with a custom CUDA kernel. The code must be compatible with Python 3.8, CUDA 11.8 and PyTorch 2.0.1. When generating the kernel, avoid using any PyTorch built-in functions and use raw CUDA kernels. The kernel must be written in raw CUDA C++ code, not using ATen or TorchScript, except for the wrapper functions.
+
+
+
+Okay, let's tackle this problem. The task is to optimize the L1 normalization operation in the given PyTorch model using a custom CUDA kernel. The original model's forward method computes x divided by the mean of the absolute values of x along dimension 1, keeping the dimensions.
+
+First, I need to understand what L1 normalization entails. For each sample in the batch, we take the absolute values of all elements in that sample's vector (along dim=1), compute their mean, and then divide each element by that mean. So, the key steps are calculating the absolute values, their mean along the specified dimension, and then performing element-wise division.
+
+The current implementation uses PyTorch's built-in functions like torch.mean and torch.abs. To optimize, replacing these with a custom CUDA kernel can reduce overhead from multiple kernel launches and memory transfers. Also, combining these operations into a single kernel might improve performance by minimizing data movement and overlapping computation steps.
+
+The next step is to design the CUDA kernel. Let's break down the operations:
+
+1. **Compute the absolute values of each element in the input tensor.**
+2. **Sum these absolute values along dimension 1.**
+3. **Compute the mean by dividing the sum by the dimension size.**
+4. **Divide each element by the corresponding mean value.**
+
+However, in a single kernel, these steps can be done in a more efficient way. Let me think: For each element in the tensor, we can compute the absolute value, accumulate the sum along the specified dimension, then after obtaining the sums, compute the means, and finally perform the division. But how to handle this in a single kernel efficiently?
+
+Wait, maybe we can first calculate the sum along the dimension. Since the mean is sum divided by the size of the dimension, once we have the sum for each row (since dim=1 is the second dimension in a batch_size x dim tensor), we can compute the mean as sum / dim_size, then divide each element by this mean.
+
+The problem is that the sum is a reduction along dimension 1, which requires a per-row computation. The challenge is to compute this sum efficiently using CUDA threads and blocks.
+
+Let me outline the steps for the kernel:
+
+- Each thread processes a row (since the reduction is along dim 1). For a batch_size of 32768 and dim of 65535, each row has 65535 elements. But handling each row as a thread might be too much. Alternatively, use a block per row, with threads in the block processing elements of the row and doing a parallel reduction to compute the sum for that row.
+
+Wait, but the input tensor is of shape (batch_size, dim), so each row is a vector of length dim. For each row, we need to compute the sum of absolute values of its elements. Then, the mean is sum / dim. Then, each element in the row is divided by that mean.
+
+So the plan is:
+
+1. For each row (each sample in batch), compute the sum of absolute values of its elements.
+2. Divide each element by (sum / dim).
+
+So, the kernel can be split into two main parts: one for computing the sums, and another for the division. Alternatively, we can do it in a single kernel by first computing the sum, storing it in a buffer, then using that buffer to compute the normalized elements. However, doing this in a single kernel pass might be tricky. Alternatively, we can structure it as follows:
+
+First, compute the sum for each row. Then, compute the normalized values using those sums. But how to structure this in CUDA?
+
+Let me think of the kernel steps:
+
+- Each thread in a block is responsible for a row. Wait, but how to handle that. Alternatively, for each row, use a block of threads to compute the sum, then another kernel to perform the division. But that would require two separate kernels, which may be okay, but perhaps combining into one is better.
+
+Alternatively, let's structure it as follows:
+
+- Each block is responsible for a row (since the number of rows is batch_size, which is 32768). Each block will have enough threads to handle the elements of the row. For example, if dim is 65535, each block would need at least 65535 threads, which is way too many (max threads per block is 1024 in many setups). So that approach isn't feasible.
+
+Hmm, so maybe we need a different approach. Let me think of the problem in terms of shared memory for reduction. For each row (dim elements), we can have a block per row, and within the block, threads compute partial sums and reduce to get the total sum for that row. Since dim is 65535, which is a large number, the number of threads per block must be sufficient. Let's see:
+
+Suppose we use a block of 1024 threads per row. Each thread can process dim / 1024 elements. Wait, but 65535 divided by 1024 is about 64, so each thread would handle 64 elements. Then, each thread computes the sum of their assigned elements, and then perform a reduction within the block to get the total sum for the row. The block's threads can then write the final sum for the row to an array.
+
+So the first kernel (sum computation) would have as many blocks as the batch_size (32768). Each block has, say, 1024 threads. The block index corresponds to the row index. The threads in the block process elements of that row.
+
+Once the sum array is computed, the second kernel would compute each element of the output by dividing the input element's absolute value by (sum[row]/dim). Wait, but the input x is divided by the mean. The original formula is x / mean_abs. So the mean_abs is (sum_abs) / dim. Therefore, the normalized value for each element is (x_ij) / (sum_abs_row_i / dim). Which simplifies to (x_ij * dim) / sum_abs_row_i.
+
+Wait, but the original code is x / mean_abs. Since mean_abs is sum_abs / dim, then x divided by that is x * dim / sum_abs. So the actual computation per element is (x_ij * dim) / sum_abs_row_i.
+
+Therefore, the second kernel would need to take the original input, the sum array, and compute this for each element. 
+
+So the plan is:
+
+1. First kernel (sum_reduction): Compute for each row the sum of absolute values. Store in a 1D tensor of size batch_size.
+
+2. Second kernel (normalize): For each element, compute (x_ij * dim) / sum_abs_row_i.
+
+But since the sum_abs array is needed, we need to have that stored. So first, we launch the first kernel to compute the sums, then the second kernel uses those sums.
+
+Now, writing the CUDA kernels:
+
+First, the sum_reduction kernel:
+
+Each block handles one row. For a row of length dim, each thread in the block processes a chunk of elements. Let's see:
+
+Let block size be 256 (since 1024 might be too much, but let's see). The number of threads per block can be chosen as 256. The total elements per row is 65535, so each thread would process 65535 / 256 ≈ 256 elements per thread. That's manageable.
+
+Each thread would process a range of elements in the row, compute their absolute values, sum them, and then accumulate into shared memory.
+
+The steps for the sum_reduction kernel:
+
+- Each block (for a row) uses shared memory to store partial sums from each thread. Then, perform a block-wise reduction to get the total sum for the row.
+
+Wait, more precisely:
+
+In the kernel:
+
+for block in 0..batch_size-1 (each block represents a row):
+
+   row = blockIdx.x
+
+   sum = 0
+
+   for each element in the row (index j from 0 to dim-1):
+
+       if threadIdx.x == 0? Hmm, no. Each thread in the block processes a portion of the elements.
+
+Alternatively, the threads in the block process different elements:
+
+Each thread processes (dim / blockDim.x) elements. Since dim is 65535, which is not a multiple of 256, so need to handle that.
+
+Alternatively, each thread in the block can process an index j = threadIdx.x + blockIdx.x * blockDim.x. Wait, no. Wait, the row is fixed for the block. So the threads in the block are responsible for the elements of that row. So for each thread in the block (thread_id in 0..blockDim.x-1), their starting index in the row is thread_id * (dim / blockDim.x), and each thread processes a chunk of elements. But this might leave some elements unprocessed if dim is not divisible by blockDim.x. To handle that, we can loop over all elements in a way that each thread handles a contiguous chunk.
+
+Alternatively, use a for loop where each thread handles elements starting at their threadIdx.x, stepping by blockDim.x each time. This is a common approach for parallelizing over elements.
+
+So, for each thread in the block:
+
+for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+
+   element = x[row][i]
+
+   sum += abs(element)
+
+}
+
+Then, each thread contributes to the partial sum. After all threads have done this, we need to reduce the partial sums in the block to get the total sum for the row.
+
+This is done using shared memory. The block has a shared array of size blockDim.x (or some power of two), and each thread writes its partial sum into shared memory. Then perform a reduction in shared memory.
+
+Once the total is computed, the block writes the sum to the output array.
+
+Now, the code for sum_reduction kernel:
+
+The input is a tensor x of shape (batch_size, dim). The output is a tensor sums of shape (batch_size,).
+
+Similarly, for the normalize kernel:
+
+Each element of the output is computed as (x[i][j] * dim) / sums[i]
+
+But since division can be expensive, perhaps precompute 1/sums[i] and multiply, which might be faster.
+
+So first, compute inv_sums = 1.0 / sums, then the element is x[i][j] * dim * inv_sums[i]
+
+But in CUDA, to compute this for all elements, we can launch a kernel where each thread handles an element (i,j). So the grid size would be batch_size * dim, and each thread computes one element.
+
+Wait, but that's a lot of threads (32768 * 65535 ~ 2 billion threads). Which might be too much. So perhaps we need a different approach.
+
+Alternatively, the normalize kernel can process each row in a block. For each row (block), the threads compute the elements in that row.
+
+So for normalize kernel:
+
+Each block corresponds to a row (same as the sum kernel).
+
+Within the block, each thread computes a portion of the elements in the row.
+
+The steps:
+
+for block in 0..batch_size-1 (each row):
+
+   row = blockIdx.x
+
+   sum_row = sums[row]
+
+   inv = dim / sum_row  // because the mean is sum_row / dim, so 1/mean = dim / sum_row
+
+   for each element in the row (index j from 0 to dim-1):
+
+       element = x[row][j]
+
+       out[row][j] = element * inv
+
+Wait, but the original formula is x / mean. Since mean = sum_row / dim, so inv is dim / sum_row. Thus, x * inv is x/(mean).
+
+Yes. So the normalization is element-wise multiplication by inv, which is dim / sum_row.
+
+Therefore, the normalize kernel can be structured as each thread in the block processes a portion of the row's elements.
+
+So, the normalize kernel would be similar to the sum kernel in terms of block arrangement.
+
+Now, putting this together, the CUDA kernels need to be written.
+
+Now, the code structure in Python would involve defining these two kernels and then using them in the forward function.
+
+The steps in the Python code:
+
+1. Define the CUDA source code for the two kernels.
+
+2. Compile them using load_inline.
+
+3. In the ModelNew forward function, call the kernels.
+
+Now, let's think about the kernel code.
+
+First, the sum_reduction kernel:
+
+The input is a tensor x (float*), and the output is a tensor sums (float*).
+
+The kernel would be:
+
+__global__ void l1_norm_sum(const float* x, float* sums, int batch_size, int dim) {
+
+    int row = blockIdx.x; // each block is a row
+
+    if (row >= batch_size) return;
+
+    __shared__ float shared_partial[256]; // assuming block size 256, but needs to be a power of two?
+
+    int tid = threadIdx.x;
+
+    float sum = 0.0f;
+
+    for (int j = tid; j < dim; j += blockDim.x) {
+
+        float val = x[row * dim + j]; // assuming row-major storage
+
+        sum += fabsf(val);
+
+    }
+
+    // write to shared memory
+
+    shared_partial[tid] = sum;
+
+    __syncthreads();
+
+    // now perform block reduction
+
+    for (int s = blockDim.x/2; s > 0; s >>=1) {
+
+        if (tid < s) {
+
+            shared_partial[tid] += shared_partial[tid + s];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    if (tid == 0) {
+
+        sums[row] = shared_partial[0];
+
+    }
+
+}
+
+Wait, but the block size here is blockDim.x, which is the number of threads per block. The shared memory size must be at least blockDim.x. So, if the block size is 256, then shared_partial needs to be size 256. 
+
+The block size can be set as 256, so the shared memory array is 256 elements.
+
+The kernel function is called with block_size threads per block, and batch_size blocks.
+
+Now, the normalize kernel:
+
+__global__ void l1_norm_normalize(const float* x, float* out, const float* sums, int batch_size, int dim) {
+
+    int row = blockIdx.x;
+
+    if (row >= batch_size) return;
+
+    int tid = threadIdx.x;
+
+    float inv = dim / sums[row];
+
+    for (int j = tid; j < dim; j += blockDim.x) {
+
+        int idx = row * dim + j;
+
+        out[idx] = x[idx] * inv;
+
+    }
+
+}
+
+Wait, but here, the 'inv' is the same for all threads in the block. So each thread can compute inv once and then process their elements. Since inv is a scalar per row, it's okay to compute it once per thread? Wait no, actually, all threads in the block can compute inv once. Wait, but each thread in the block is processing different elements of the same row. So each thread can compute inv once, but since inv is the same for all elements in the row, it's better to compute it once per block. So, perhaps we can have the first thread compute inv and store it in shared memory, but that might complicate.
+
+Alternatively, let the first thread compute it and broadcast it via shared memory.
+
+Alternatively, each thread can compute it independently. Since sums[row] is the same for all threads in the block, each thread can read sums[row], compute inv, and proceed. But that would involve reading the same memory location multiple times, which might be okay because it's cached in L1/L2.
+
+Alternatively, to optimize, compute inv once per block:
+
+Use shared memory to store inv once.
+
+For example:
+
+__global__ void l1_norm_normalize(...){
+
+    int row = blockIdx.x;
+
+    if (row >= batch_size) return;
+
+    __shared__ float inv;
+
+    if (threadIdx.x ==0){
+
+        inv = dim / sums[row];
+
+    }
+
+    __syncthreads();
+
+    int tid = threadIdx.x;
+
+    for (int j = tid; j < dim; j += blockDim.x) {
+
+        int idx = row * dim + j;
+
+        out[idx] = x[idx] * inv;
+
+    }
+
+}
+
+This way, only one thread computes inv, and it's stored in shared memory, so all threads can access it. That would be better for memory access.
+
+This is better.
+
+Now, putting these into code.
+
+Now, the wrapper functions in C++.
+
+The sum function:
+
+torch::Tensor l1_norm_sum_cuda(torch::Tensor x, int batch_size, int dim) {
+
+    auto sums = torch::empty({batch_size}, x.options());
+
+    int block_size = 256;
+
+    int num_blocks = batch_size;
+
+    l1_norm_sum<<<num_blocks, block_size>>>(x.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+
+    return sums;
+
+}
+
+Similarly, the normalize function:
+
+torch::Tensor l1_norm_normalize_cuda(torch::Tensor x, torch::Tensor sums, int batch_size, int dim) {
+
+    auto out = torch::empty_like(x);
+
+    int block_size = 256;
+
+    int num_blocks = batch_size;
+
+    l1_norm_normalize<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+
+    return out;
+
+}
+
+Wait, but the 'dim' is a constant known at compile time? Or do we have to pass it as an argument? Since in the problem, dim is fixed as 65535, but the code must be general. However, the user's code defines the dim as 65535 in get_inputs(). But the ModelNew is supposed to work with any input, so the code must handle any batch_size and dim. So passing dim as an argument is correct.
+
+Now, putting this into the CUDA source code.
+
+The full CUDA source for both kernels:
+
+First, the headers:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+Then the kernels.
+
+The sum kernel:
+
+__global__ void l1_norm_sum(const float* x, float* sums, int batch_size, int dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    __shared__ float shared_partial[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+
+    for (int j = tid; j < dim; j += blockDim.x) {
+        float val = x[row * dim + j];
+        sum += fabsf(val);
+    }
+
+    shared_partial[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_partial[tid] += shared_partial[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sums[row] = shared_partial[0];
+    }
+}
+
+The normalize kernel:
+
+__global__ void l1_norm_normalize(const float* x, float* out, const float* sums, int batch_size, int dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    __shared__ float inv;
+    if (threadIdx.x == 0) {
+        inv = dim / sums[row];
+    }
+    __syncthreads();
+
+    int tid = threadIdx.x;
+    for (int j = tid; j < dim; j += blockDim.x) {
+        int idx = row * dim + j;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+Then the wrapper functions:
+
+torch::Tensor l1_norm_sum_cuda(torch::Tensor x, int batch_size, int dim) {
+    auto sums = torch::empty({batch_size}, x.options());
+    const int block_size = 256;
+    const int num_blocks = batch_size;
+    l1_norm_sum<<<num_blocks, block_size>>>(x.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+    return sums;
+}
+
+torch::Tensor l1_norm_normalize_cuda(torch::Tensor x, torch::Tensor sums, int batch_size, int dim) {
+    auto out = torch::empty_like(x);
+    const int block_size = 256;
+    const int num_blocks = batch_size;
+    l1_norm_normalize<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+    return out;
+}
+
+Now, in the Python code, we need to load these functions.
+
+The CPP sources would need the function declarations:
+
+extern "C" {
+    torch::Tensor l1_norm_sum_cuda(torch::Tensor x, int batch_size, int dim);
+    torch::Tensor l1_norm_normalize_cuda(torch::Tensor x, torch::Tensor sums, int batch_size, int dim);
+}
+
+Now, compiling this with load_inline.
+
+Putting this all together:
+
+The Python code would look like:
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA kernels
+cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void l1_norm_sum(const float* x, float* sums, int batch_size, int dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    __shared__ float shared_partial[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+
+    for (int j = tid; j < dim; j += blockDim.x) {
+        float val = x[row * dim + j];
+        sum += fabsf(val);
+    }
+
+    shared_partial[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_partial[tid] += shared_partial[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sums[row] = shared_partial[0];
+    }
+}
+
+__global__ void l1_norm_normalize(const float* x, float* out, const float* sums, int batch_size, int dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    __shared__ float inv;
+    if (threadIdx.x == 0) {
+        inv = dim / sums[row];
+    }
+    __syncthreads();
+
+    int tid = threadIdx.x;
+    for (int j = tid; j < dim; j += blockDim.x) {
+        int idx = row * dim + j;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+extern "C" {
+    torch::Tensor l1_norm_sum_cuda(torch::Tensor x, int batch_size, int dim) {
+        auto sums = torch::empty({batch_size}, x.options());
+        const int block_size = 256;
+        const int num_blocks = batch_size;
+        l1_norm_sum<<<num_blocks, block_size>>>(x.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+        return sums;
+    }
+
+    torch::Tensor l1_norm_normalize_cuda(torch::Tensor x, torch::Tensor sums, int batch_size, int dim) {
+        auto out = torch::empty_like(x);
+        const int block_size = 256;
+        const int num_blocks = batch_size;
+        l1_norm_normalize<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+        return out;
+    }
+}
+"""
+
+cpp_source = """
+extern "C" {
+    torch::Tensor l1_norm_sum_cuda(torch::Tensor x, int batch_size, int dim);
+    torch::Tensor l1_norm_normalize_cuda(torch::Tensor x, torch::Tensor sums, int batch_size, int dim);
+}
+"""
+
+# Compile the CUDA code
+l1_norm_cuda = load_inline(
+    name="l1_norm_cuda",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["l1_norm_sum_cuda", "l1_norm_normalize_cuda"],
+    verbose=True,
+    extra_cflags=["-std=c++14"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.cuda_kernels = l1_norm_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, dim = x.size()
+        # Ensure CUDA is used
+        x = x.cuda()
+        sums = self.cuda_kernels.l1_norm_sum_cuda(x, batch_size, dim)
+        return self.cuda_kernels.l1_norm_normalize_cuda(x, sums, batch_size, dim)
+
+Wait, but need to make sure that the inputs are on CUDA. Since the original get_inputs() uses .cuda(), so the input to forward is already on CUDA. But perhaps in case it's not, but the problem states to replace the L1 normalization with a CUDA kernel, so the input is assumed to be on GPU.
+
+Wait, in the original code, the get_inputs() returns tensors on CPU? No, looking at the original code:
+
+Original get_inputs() has:
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+Wait, the original code in the problem might not have .cuda() in get_inputs(). Wait, the user's code provided for the original Model has:
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+Wait, but in the example given in the problem (the first code block), the get_inputs() uses .cuda(). So perhaps the user's code for the Model (the one to be replaced) has the get_inputs() returning tensors on CPU. Wait, the problem says "You have complete freedom to choose the set of operators you want to replace. You may make the decision to replace some operators with custom CUDA kernels and leave others unchanged."
+
+Wait, but the problem's given architecture for the Model has get_inputs() returning tensors on CPU (since they are created with torch.rand and not moved to CUDA). However, the original example (the first one) had get_inputs() with .cuda(). But in the current problem's given code for the Model, the get_inputs() returns x as a CPU tensor. 
+
+However, the custom CUDA kernels require the input to be on the GPU. So in the forward function of ModelNew, we need to ensure that x is on the GPU. So in the forward function, we can move x to CUDA if it's not already there. 
+
+Alternatively, the code should handle it. Let's adjust the forward function:
+
+def forward(self, x: torch.Tensor) -> torch.Tensor:
+    if x.is_cuda:
+        device = x.get_device()
+    else:
+        x = x.cuda()
+        device = 0  # assuming a default device
+    batch_size, dim = x.size()
+    sums = self.cuda_kernels.l1_norm_sum_cuda(x, batch_size, dim)
+    out = self.cuda_kernels.l1_norm_normalize_cuda(x, sums, batch_size, dim)
+    return out
+
+But perhaps better to just call x.cuda() regardless. Or use .to(device) if necessary. But since the kernels are CUDA, the input must be on the GPU. So the forward function should ensure that x is on CUDA.
+
+Alternatively, in the code, since the kernels are designed for CUDA, the input x must be on CUDA. So the code in the forward function should check and move to CUDA if needed.
+
+Alternatively, the code can proceed as above, but in the given problem's example (the first one with the element-wise add), the model's forward function expects the inputs to be already on CUDA, as the get_inputs() function returns tensors on CUDA. 
+
+Wait, in the problem's given code for the L1 normalization Model:
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+So this returns a tensor on CPU. But the custom kernel requires CUDA. So in the ModelNew's forward function, we need to move the input to CUDA. 
+
+Therefore, in the forward function of ModelNew:
+
+def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # Move to CUDA
+    x_cuda = x.cuda()
+    batch_size, dim = x_cuda.size()
+    sums = self.cuda_kernels.l1_norm_sum_cuda(x_cuda, batch_size, dim)
+    out = self.cuda_kernels.l1_norm_normalize_cuda(x_cuda, sums, batch_size, dim)
+    return out  # return on CUDA, but maybe the user expects to stay on the same device as input? But since the problem states that the original model's inputs are CPU tensors (as per their get_inputs), but the optimized code must run on CUDA, but the outputs would be on CUDA. However, the original model's output is on CPU. Wait, this is a problem.
+
+Wait, the original Model's forward returns a tensor on CPU (since inputs are CPU tensors). But the new model's forward must have the same API and inputs/outputs. So if the original model's forward is called with a CPU tensor, the new model's forward must return a CPU tensor. But that's impossible because the CUDA kernels require the input to be on GPU. 
+
+Wait, this is a contradiction. So the problem must have an error here, but looking back:
+
+The problem says: "The ModelNew must have the same API and inputs/outputs as Model." So the inputs and outputs must be the same. The original Model's forward takes a tensor (presumably on CPU) and returns a tensor on CPU. But the new model uses CUDA kernels, so the inputs must be on the GPU. Therefore, the code must handle moving the input to CUDA and the output back to CPU. But that would involve data transfer overhead, which may negate the benefits of the CUDA kernel. 
+
+Alternatively, perhaps the original code's get_inputs() actually uses .cuda(). Looking back at the problem's provided code for the L1 normalization Model:
+
+The user's code provided is:
+
+class Model(nn.Module):
+    ...
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x / torch.mean(torch.abs(x), dim=1, keepdim=True)
+
+batch_size = 32768
+dim = 65535
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []
+
+Wait, the get_inputs() function returns a CPU tensor. So the Model's forward is called with a CPU tensor. The new ModelNew must also accept a CPU tensor and return a CPU tensor. But the kernels are on CUDA, so the data must be moved to CUDA, processed, then moved back. 
+
+That's necessary, but the problem says to replace the L1 normalization with custom CUDA kernels. Therefore, the code must move the data to CUDA, process, and move back.
+
+Hence, the forward function of ModelNew must:
+
+- Move the input to CUDA
+- Run the kernels
+- Move the output back to CPU (if necessary)
+
+But the output of the original Model is on CPU, so the new model must return a CPU tensor. 
+
+So in the code:
+
+def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # Move to CUDA
+    x_cuda = x.cuda()
+    batch_size, dim = x_cuda.size()
+    sums = self.cuda_kernels.l1_norm_sum_cuda(x_cuda, batch_size, dim)
+    out_cuda = self.cuda_kernels.l1_norm_normalize_cuda(x_cuda, sums, batch_size, dim)
+    return out_cuda.cpu()  # move back to CPU to match original Model's output
+
+But this involves a CPU to GPU and back transfer, which might add overhead, but it's required to maintain the same API. 
+
+Alternatively, maybe the problem expects that the inputs are already on GPU. Let me check the problem's initial example:
+
+In the first example given by the user (the element-wise add), the original Model's get_inputs() uses .cuda(). So perhaps in the current problem's Model code, the user made a mistake, but perhaps in the actual problem, the inputs are on GPU. Wait, no, the problem's code for the L1 Model shows get_inputs() without .cuda().
+
+Therefore, the ModelNew's forward must handle moving to CUDA and back. 
+
+Alternatively, perhaps the user expects that the inputs are on the same device as the kernel. But given the problem statement requires same inputs/outputs as the original model, including the device, then the code must do the transfers.
+
+Therefore, the forward function should:
+
+Move x to CUDA, process, then move back to CPU.
+
+Alternatively, if the problem allows, the ModelNew could have inputs and outputs on CUDA, but the original Model's inputs are CPU. So that's a conflict. 
+
+Hmm, this is a critical point. Let me re-read the problem statement:
+
+"The ModelNew must have the same API and inputs/outputs as Model."
+
+The original Model's forward function takes a tensor x (any device?), and returns a tensor of the same shape. The get_inputs() function in the original code creates a tensor on CPU. So the ModelNew must accept a CPU tensor and return a CPU tensor. Therefore, the code must handle moving the data to CUDA and back.
+
+Thus, the forward function must:
+
+x_cuda = x.cuda()
+...
+out_cuda = ...
+return out_cuda.cpu()
+
+This is necessary, even though it adds data transfer overhead. But the problem requires the same API, so it must be done.
+
+So, modifying the forward function accordingly.
+
+Now, putting all this into the code:
+
+The complete Python code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA kernels
+cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void l1_norm_sum(const float* x, float* sums, int batch_size, int dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    __shared__ float shared_partial[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+
+    for (int j = tid; j < dim; j += blockDim.x) {
+        float val = x[row * dim + j];
+        sum += fabsf(val);
+    }
+
+    shared_partial[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_partial[tid] += shared_partial[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sums[row] = shared_partial[0];
+    }
+}
+
+__global__ void l1_norm_normalize(const float* x, float* out, const float* sums, int batch_size, int dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    __shared__ float inv;
+    if (threadIdx.x == 0) {
+        inv = dim / sums[row];
+    }
+    __syncthreads();
+
+    int tid = threadIdx.x;
+    for (int j = tid; j < dim; j += blockDim.x) {
+        int idx = row * dim + j;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+extern "C" {
+    torch::Tensor l1_norm_sum_cuda(torch::Tensor x, int batch_size, int dim) {
+        auto sums = torch::empty({batch_size}, x.options());
+        const int block_size = 256;
+        const int num_blocks = batch_size;
+        l1_norm_sum<<<num_blocks, block_size>>>(x.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+        return sums;
+    }
+
+    torch::Tensor l1_norm_normalize_cuda(torch::Tensor x, torch::Tensor sums, int batch_size, int dim) {
+        auto out = torch::empty_like(x);
+        const int block_size = 256;
+        const int num_blocks = batch_size;
+        l1_norm_normalize<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+        return out;
+    }
+}
+"""
+
+cpp_source = """
+extern "C" {
+    torch::Tensor l1_norm_sum_cuda(torch::Tensor x, int batch_size, int dim);
+    torch::Tensor l1_norm_normalize_cuda(torch::Tensor x, torch::Tensor sums, int batch_size, int dim);
+}
+"""
+
+# Compile the CUDA code
+l1_norm_cuda = load_inline(
+    name="l1_norm_cuda",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["l1_norm_sum_cuda", "l1_norm_normalize_cuda"],
+    verbose=True,
+    extra_cflags=["-std=c++14"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.cuda_kernels = l1_norm_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Move input to CUDA
+        x_cuda = x.cuda()
+        batch_size, dim = x_cuda.size()
+        sums = self.cuda_kernels.l1_norm_sum_cuda(x_cuda, batch_size, dim)
+        out_cuda = self.cuda_kernels.l1_norm_normalize_cuda(x_cuda, sums, batch_size, dim)
+        # Move output back to CPU to match original model's output
+        return out_cuda.cpu()
+
+```
+
+Wait, but in the forward function, the input x is a tensor. After moving to CUDA, the code calls the kernels. The output is then moved back to CPU. That should work.
+
+Testing this code (though not possible here), but according to the problem's requirements, this should be correct.
+
+Now, check for possible errors:
+
+1. The shared_partial array in the sum kernel is size 256. The block size is 256. So that's okay.
+
+2. The normalization kernel uses inv = dim / sums[row], which is correct because mean = sum / dim → 1/mean = dim/sum.
+
+3. The CUDA kernels are properly wrapped and called with the correct parameters.
+
+4. The forward function moves the tensor to CUDA and back, ensuring API compatibility.
+
+Another thing to consider: the input's dimensionality. The original code uses x / torch.mean(..., dim=1, keepdim=True). The input is (batch_size, dim), and the output must have the same shape. The CUDA kernels handle this correctly because the normalization is per row (dim=1).
+
+Also, in the sum kernel, the indices are computed as row * dim + j. Assuming that the input tensor is in row-major order (which it is in PyTorch), so each row is contiguous in memory. So that's correct.
+
+Possible optimizations: The block size could be tuned. For example, using 512 threads per block if the hardware supports it, but 256 is a common choice and should be safe. Also, the reduction step in the sum kernel uses a standard block reduction approach.
+
+Another point: in the sum kernel, the for loop over j starts at tid and steps by blockDim.x. So all threads in the block cover all elements of the row. That's correct.
+
+Lastly, in the wrapper functions, the options() for the sums tensor are taken from x.options(), which ensures the same dtype and device (CUDA in this case). But when we call l1_norm_sum_cuda, the x_cuda is on CUDA, so sums is created on CUDA.
+
+The normalize kernel uses x_cuda, which is on CUDA, and the output is also on CUDA.
+
+Thus, the code should work.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA kernels
+cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void l1_norm_sum(const float* x, float* sums, int batch_size, int dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    __shared__ float shared_partial[256];
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+
+    for (int j = tid; j < dim; j += blockDim.x) {
+        float val = x[row * dim + j];
+        sum += fabsf(val);
+    }
+
+    shared_partial[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_partial[tid] += shared_partial[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sums[row] = shared_partial[0];
+    }
+}
+
+__global__ void l1_norm_normalize(const float* x, float* out, const float* sums, int batch_size, int dim) {
+    int row = blockIdx.x;
+    if (row >= batch_size) return;
+
+    __shared__ float inv;
+    if (threadIdx.x == 0) {
+        inv = dim / sums[row];
+    }
+    __syncthreads();
+
+    int tid = threadIdx.x;
+    for (int j = tid; j < dim; j += blockDim.x) {
+        int idx = row * dim + j;
+        out[idx] = x[idx] * inv;
+    }
+}
+
+extern "C" {
+    torch::Tensor l1_norm_sum_cuda(torch::Tensor x, int batch_size, int dim) {
+        auto sums = torch::empty({batch_size}, x.options());
+        const int block_size = 256;
+        const int num_blocks = batch_size;
+        l1_norm_sum<<<num_blocks, block_size>>>(x.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+        return sums;
+    }
+
+    torch::Tensor l1_norm_normalize_cuda(torch::Tensor x, torch::Tensor sums, int batch_size, int dim) {
+        auto out = torch::empty_like(x);
+        const int block_size = 256;
+        const int num_blocks = batch_size;
+        l1_norm_normalize<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), sums.data_ptr<float>(), batch_size, dim);
+        return out;
+    }
+}
+"""
+
+cpp_source = """
+extern "C" {
+    torch::Tensor l1_norm_sum_cuda(torch::Tensor x, int batch_size, int dim);
+    torch::Tensor l1_norm_normalize_cuda(torch::Tensor x, torch::Tensor sums, int batch_size, int dim);
+}
+"""
+
+# Compile the CUDA code
+l1_norm_cuda = load_inline(
+    name="l1_norm_cuda",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["l1_norm_sum_cuda", "l1_norm_normalize_cuda"],
+    verbose=True,
+    extra_cflags=["-std=c++14"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.cuda_kernels = l1_norm_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Move input to CUDA and process
+        x_cuda = x.cuda()
+        batch_size, dim = x_cuda.size()
+        sums = self.cuda_kernels.l1_norm_sum_cuda(x_cuda, batch_size, dim)
+        out_cuda = self.cuda_kernels.l1_norm_normalize_cuda(x_cuda, sums, batch_size, dim)
+        # Return result to CPU to match original API
+        return out_cuda.cpu()
+```

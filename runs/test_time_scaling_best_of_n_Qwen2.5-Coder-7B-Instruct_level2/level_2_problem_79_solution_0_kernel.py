@@ -1,0 +1,184 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D convolution
+conv3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement a simple 3D convolution kernel here
+__global__ void conv3d_kernel(...) {
+    // Kernel implementation goes here
+}
+
+torch::Tensor conv3d_cuda(torch::Tensor input, torch::Tensor weight, ...) {
+    // Launch the kernel and perform convolution
+    ...
+    return output;
+}
+"""
+
+conv3d_cpp_source = (
+    "torch::Tensor conv3d_cuda(torch::Tensor input, torch::Tensor weight, ...);"
+)
+
+# Compile the inline CUDA code for 3D convolution
+conv3d = load_inline(
+    name="conv3d",
+    cpp_sources=conv3d_cpp_source,
+    cuda_sources=conv3d_source,
+    functions=["conv3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for multiplication
+multiplication_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void multiplication_kernel(...) {
+    // Kernel implementation goes here
+}
+
+torch::Tensor multiplication_cuda(torch::Tensor a, torch::Tensor b) {
+    // Launch the kernel and perform multiplication
+    ...
+    return output;
+}
+"""
+
+multiplication_cpp_source = (
+    "torch::Tensor multiplication_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for multiplication
+multiplication = load_inline(
+    name="multiplication",
+    cpp_sources=multiplication_cpp_source,
+    cuda_sources=multiplication_source,
+    functions=["multiplication_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for instance normalization
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void instance_norm_kernel(...) {
+    // Kernel implementation goes here
+}
+
+torch::Tensor instance_norm_cuda(torch::Tensor input, ...) {
+    // Launch the kernel and perform instance normalization
+    ...
+    return output;
+}
+"""
+
+instance_norm_cpp_source = (
+    "torch::Tensor instance_norm_cuda(torch::Tensor input, ...);"
+)
+
+# Compile the inline CUDA code for instance normalization
+instance_norm = load_inline(
+    name="instance_norm",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for clamping
+clamping_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void clamping_kernel(...) {
+    // Kernel implementation goes here
+}
+
+torch::Tensor clamping_cuda(torch::Tensor input, float min_val, float max_val) {
+    // Launch the kernel and perform clamping
+    ...
+    return output;
+}
+"""
+
+clamping_cpp_source = (
+    "torch::Tensor clamping_cuda(torch::Tensor input, float min_val, float max_val);"
+)
+
+# Compile the inline CUDA code for clamping
+clamping = load_inline(
+    name="clamping",
+    cpp_sources=clamping_cpp_source,
+    cuda_sources=clamping_source,
+    functions=["clamping_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for max operation
+max_operation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void max_operation_kernel(...) {
+    // Kernel implementation goes here
+}
+
+torch::Tensor max_operation_cuda(torch::Tensor input) {
+    // Launch the kernel and perform max operation
+    ...
+    return output;
+}
+"""
+
+max_operation_cpp_source = (
+    "torch::Tensor max_operation_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for max operation
+max_operation = load_inline(
+    name="max_operation",
+    cpp_sources=max_operation_cpp_source,
+    cuda_sources=max_operation_source,
+    functions=["max_operation_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.conv = conv3d
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+        self.instance_norm = instance_norm
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+        self.multiplication = multiplication
+        self.max_operation = max_operation
+
+    def forward(self, x):
+        x = self.conv.conv3d_cuda(x, self.multiplier)
+        x = self.multiplication.multiplication_cuda(x, self.multiplier)
+        x = self.instance_norm.instance_norm_cuda(x)
+        x = self.clamping.clamping_cuda(x, self.clamp_min, self.clamp_max)
+        x = self.multiplication.multiplication_cuda(x, self.multiplier)
+        x = self.max_operation.max_operation_cuda(x)
+        return x

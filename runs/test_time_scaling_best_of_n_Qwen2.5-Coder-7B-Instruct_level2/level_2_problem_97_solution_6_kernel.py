@@ -1,0 +1,158 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 32;
+    dim3 grid((n + block_size - 1) / block_size, (m + block_size - 1) / block_size);
+    dim3 block(block_size, block_size);
+
+    matmul_kernel<<<grid, block>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for batch normalization
+bn_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bn_forward_kernel(const float* x, const float* mean, const float* var, const float* gamma, const float* beta, float* y, int n, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < n) {
+        float inv_var = 1.0f / sqrt(var[idx] + eps);
+        y[idx] = gamma[idx] * (x[idx] - mean[idx]) * inv_var + beta[idx];
+    }
+}
+
+torch::Tensor bn_forward_cuda(torch::Tensor x, torch::Tensor mean, torch::Tensor var, torch::Tensor gamma, torch::Tensor beta, float eps) {
+    auto n = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (n + block_size - 1) / block_size;
+
+    bn_forward_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(), y.data_ptr<float>(), n, eps);
+
+    return y;
+}
+"""
+
+bn_cpp_source = (
+    "torch::Tensor bn_forward_cuda(torch::Tensor x, torch::Tensor mean, torch::Tensor var, torch::Tensor gamma, torch::Tensor beta, float eps);"
+)
+
+# Compile the inline CUDA code for batch normalization
+bn = load_inline(
+    name="bn",
+    cpp_sources=bn_cpp_source,
+    cuda_sources=bn_source,
+    functions=["bn_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for fused division and Swish activation
+div_swish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void div_swish_kernel(const float* x, float* y, int n, float divide_value) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < n) {
+        y[idx] = x[idx] / divide_value * sigmoid(x[idx]);
+    }
+}
+
+float sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+torch::Tensor div_swish_cuda(torch::Tensor x, float divide_value) {
+    auto n = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (n + block_size - 1) / block_size;
+
+    div_swish_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), n, divide_value);
+
+    return y;
+}
+"""
+
+div_swish_cpp_source = (
+    "torch::Tensor div_swish_cuda(torch::Tensor x, float divide_value);"
+)
+
+# Compile the inline CUDA code for fused division and Swish activation
+div_swish = load_inline(
+    name="div_swish",
+    cpp_sources=div_swish_cpp_source,
+    cuda_sources=div_swish_source,
+    functions=["div_swish_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, bias_shape=(1,), divide_value=1.0):
+        super(ModelNew, self).__init__()
+        self.matmul = matmul
+        self.bn = bn
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.divide_value = divide_value
+
+    def forward(self, x):
+        x = self.matmul.matmul_cuda(x)
+        x_mean = x.mean(dim=0, keepdim=True)
+        x_var = x.var(dim=0, unbiased=False, keepdim=True)
+        x_bn = self.bn.bn_forward_cuda(x, x_mean, x_var, torch.ones_like(self.bias), self.bias, bn_eps)
+        x_div_swish = self.div_swish.div_swish_cuda(x_bn, self.divide_value)
+        return x_div_swish

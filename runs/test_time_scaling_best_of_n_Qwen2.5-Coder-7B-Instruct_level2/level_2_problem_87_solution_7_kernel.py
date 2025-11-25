@@ -1,0 +1,76 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Custom convolution kernel implementation here
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int padding, int stride, int dilation);"
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for Mish activation
+mish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Custom Mish activation kernel implementation here
+"""
+
+mish_cpp_source = (
+    "torch::Tensor mish_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for Mish activation
+mish = load_inline(
+    name="mish",
+    cpp_sources=mish_cpp_source,
+    cuda_sources=mish_source,
+    functions=["mish_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.subtract_value_1 = subtract_value_1
+        self.subtract_value_2 = subtract_value_2
+        self.mish = mish
+
+    def forward(self, x):
+        x = self.conv(x, self.weight, self.bias, padding=self.padding, stride=self.stride, dilation=self.dilation)
+        x = x - self.subtract_value_1
+        x = x - self.subtract_value_2
+        x = self.mish(x)
+        return x
+
+# Initialize weights and biases for the convolution layer
+model_new = ModelNew(in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2)
+model_new.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size))
+model_new.bias = nn.Parameter(torch.randn(out_channels))
+
+# Get inputs
+inputs = get_inputs()
+
+# Forward pass
+output = model_new(inputs[0])

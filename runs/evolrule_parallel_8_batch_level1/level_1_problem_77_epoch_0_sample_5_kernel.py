@@ -1,0 +1,1 @@
+if (has_bias) sum += bias_accessor[out_ch];

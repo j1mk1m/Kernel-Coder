@@ -1,0 +1,1 @@
+AttributeError: module 'torch' has no attribute 'min'

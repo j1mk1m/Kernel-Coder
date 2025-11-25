@@ -1,0 +1,79 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D convolution
+convolution_3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_3d_kernel(const float* input, const float* weight, float* output, int in_channels, int out_channels, int depth, int height, int width, int kernel_size) {
+    int batch_idx = blockIdx.z;
+    int out_channel_idx = blockIdx.y;
+    int out_depth_idx = blockIdx.x / (height * width);
+    int out_height_idx = (blockIdx.x % (height * width)) / width;
+    int out_width_idx = blockIdx.x % width;
+
+    int in_channel_idx = threadIdx.x / (kernel_size * kernel_size * kernel_size);
+    int in_depth_idx = (threadIdx.x % (kernel_size * kernel_size * kernel_size)) / (kernel_size * kernel_size);
+    int in_height_idx = ((threadIdx.x % (kernel_size * kernel_size * kernel_size)) % (kernel_size * kernel_size)) / kernel_size;
+    int in_width_idx = (threadIdx.x % (kernel_size * kernel_size * kernel_size)) % kernel_size;
+
+    float sum = 0.0f;
+    for (int i = 0; i < kernel_size; ++i) {
+        for (int j = 0; j < kernel_size; ++j) {
+            for (int k = 0; k < kernel_size; ++k) {
+                int in_d = out_depth_idx + in_depth_idx - kernel_size / 2 + i;
+                int in_h = out_height_idx + in_height_idx - kernel_size / 2 + j;
+                int in_w = out_width_idx + in_width_idx - kernel_size / 2 + k;
+                if (in_d >= 0 && in_d < depth && in_h >= 0 && in_h < height && in_w >= 0 && in_w < width) {
+                    sum += input[batch_idx * in_channels * depth * height * width + in_channel_idx * depth * height * width + in_d * height * width + in_h * width + in_w] *
+                           weight[out_channel_idx * in_channels * kernel_size * kernel_size * kernel_size + in_channel_idx * kernel_size * kernel_size * kernel_size + i * kernel_size * kernel_size + j * kernel_size + k];
+                }
+            }
+        }
+    }
+
+    atomicAdd(&output[batch_idx * out_channels * depth * height * width + out_channel_idx * depth * height * width + out_depth_idx * height * width + out_height_idx * width + out_width_idx], sum);
+}
+"""
+
+convolution_3d_cpp_source = (
+    "void convolution_3d_cuda(const float* input, const float* weight, float* output, int in_channels, int out_channels, int depth, int height, int width, int kernel_size);"
+)
+
+# Compile the inline CUDA code for 3D convolution
+convolution_3d = load_inline(
+    name="convolution_3d",
+    cpp_sources=convolution_3d_cpp_source,
+    cuda_sources=convolution_3d_source,
+    functions=["convolution_3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size, kernel_size))
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+        self.instance_norm = nn.InstanceNorm3d(out_channels)
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        batch_size, _, depth, height, width = x.size()
+        output = torch.zeros(batch_size, out_channels, depth, height, width).to(x.device)
+
+        convolution_3d_cuda(x.contiguous().data_ptr(), self.weight.contiguous().data_ptr(), output.contiguous().data_ptr(),
+                             in_channels, out_channels, depth, height, width, kernel_size)
+
+        x = output * self.multiplier
+        x = self.instance_norm(x)
+        x = torch.clamp(x, self.clamp_min, self.clamp_max)
+        x = x * self.multiplier
+        x = torch.max(x, dim=1)[0]
+        return x

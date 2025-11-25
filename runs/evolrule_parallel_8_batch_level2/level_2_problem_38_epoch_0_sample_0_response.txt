@@ -1,0 +1,918 @@
+I have to point out that the above architecture has multiple operations that may be slow on certain hardware, such as average pooling, 3D transposed convolution, clamping, spatial softmax, and multiplication by a scale. The user is suggesting to replace some of these with custom CUDA kernels. You need to choose which ones to replace to maximize performance. 
+
+First, I need to analyze which operators are the bottlenecks. The average pooling and 3D transposed convolution are likely the most computationally intensive parts. The clamping, softmax, and multiplication are also involved but might be less so.
+
+However, writing custom CUDA for all these might be too time-consuming. Maybe focus on the most impactful ones. The 3D transposed convolution is a big one. But implementing that from scratch is complex. Alternatively, maybe fuse multiple operations into a single kernel to reduce memory transfers and kernel launch overhead.
+
+Looking at the operations sequence:
+
+1. AvgPool3d
+2. ConvTranspose3d
+3. Clamp
+4. Softmax (spatial)
+5. Multiply by scale
+
+Perhaps fusing the clamp and softmax? Or combining the conv transpose with some of the following steps?
+
+Alternatively, maybe the spatial softmax and subsequent multiplication can be optimized.
+
+The spatial softmax involves flattening the spatial dimensions, applying softmax, then reshaping. The multiplication by scale is straightforward. Maybe combining these steps into a single kernel could save time.
+
+Also, the clamp is a simple element-wise operation. It could be combined with other element-wise steps.
+
+Alternatively, the 3D transposed convolution itself might benefit from a custom kernel if there's a way to optimize it for the specific parameters given. But writing a custom ConvTranspose3d is non-trivial.
+
+Perhaps the most feasible is to combine the clamp, softmax, and scaling into a single fused kernel. Let's look at their steps:
+
+After conv_transpose:
+
+- clamp: min and max
+- reshape to (b, c, -1)
+- softmax along the last dimension
+- reshape back
+- multiply by scale.
+
+These steps are all element-wise or can be vectorized. So perhaps a kernel that takes the output of conv_transpose, applies clamp, then computes the softmax, then multiplies by the scale, all in one pass.
+
+Wait, but softmax requires normalization over the spatial dimensions. The current code does:
+
+x = x.view(b, c, -1)  # flatten depth, height, width into one dimension
+x = torch.softmax(x, dim=2)  # softmax over the combined spatial dimensions
+x = x.view(...)
+
+So the softmax is applied across the spatial dimensions for each channel. The multiplication by scale is element-wise.
+
+If I can fuse the clamp, softmax, and scaling into a single kernel, that would reduce memory copies and kernel launches.
+
+Alternatively, perhaps combining the clamp with the softmax computation.
+
+First, let me think of the steps:
+
+The input after conv_transpose is of shape (b, c, d, h, w). The clamp is applied element-wise. Then, the spatial softmax requires:
+
+For each element in the spatial dimensions (d, h, w), for each channel and batch, compute the exponential of (clamped_x - max), sum over all spatial elements, then divide by the sum.
+
+The scale is then multiplied.
+
+This is a bit involved. Maybe a custom kernel can handle all these steps efficiently.
+
+Alternatively, the softmax can be optimized. The spatial softmax might be implemented more efficiently in a single kernel, especially since the dimensions are contiguous.
+
+Another point: the multiplication by the scale is a learnable parameter. Since it's a tensor of shape (1, c, 1, 1, 1), multiplying by it is equivalent to scaling each channel independently. So that's an element-wise multiplication with broadcasting.
+
+Putting all these together, perhaps a custom CUDA kernel that does:
+
+- clamp the input (element-wise)
+- compute the spatial softmax (across d, h, w for each channel)
+- multiply by the scale (element-wise)
+
+This would be a single kernel, which can process all these steps in parallel.
+
+The main challenges would be:
+
+1. Implementing the spatial softmax efficiently. The softmax requires computing the exponential, then the sum over the spatial dimensions, then dividing each element by the sum. The sum is a reduction over d, h, w. Since each channel is independent, this can be done per channel.
+
+2. Handling the clamp: element-wise min and max.
+
+3. The scale multiplication is straightforward.
+
+So, the plan is to write a fused kernel that takes the conv_transpose output, applies clamp, computes the spatial softmax, and then multiplies by the scale. This would save the intermediate memory copies and kernel launches.
+
+Now, the AvgPool3d and ConvTranspose3d are standard PyTorch operations. Unless there's a way to fuse them with subsequent operations or optimize their implementation, but writing a custom ConvTranspose3d is more complex. Since the user allows replacing some operators and leaving others, maybe the main gain is in the post-processing steps after the convolution.
+
+Therefore, the main target for optimization is the block of clamp, spatial softmax, and scaling.
+
+Now, let's structure the code.
+
+First, in the original ModelNew, after avg_pool and conv_transpose, we can replace the subsequent steps with a custom CUDA kernel.
+
+The steps to be replaced:
+
+x = torch.clamp(x, self.clamp_min, self.clamp_max)
+b, c, d, h, w = x.shape
+x = x.view(b, c, -1)                     # flatten spatial dims
+x = torch.softmax(x, dim=2)
+x = x.view(b, c, d, h, w)
+x = x * self.scale
+
+So, these steps can be replaced with a single custom CUDA kernel.
+
+Now, let's outline the CUDA kernel.
+
+The kernel needs to process each element, apply clamp, then compute the softmax over the spatial dimensions, and multiply by the scale.
+
+First, the input is a 5D tensor (b, c, d, h, w). The output is the same shape.
+
+The steps per channel and batch:
+
+For each element in the spatial dimensions (d, h, w):
+
+1. Clamp the value between clamp_min and clamp_max.
+
+Then compute the softmax over the spatial dimensions for each (batch, channel):
+
+- Compute the maximum value over the spatial dimensions for each (batch, channel) to stabilize the exponential.
+- Compute the exponentials of (x - max), sum them over the spatial dimensions to get the denominator.
+- Each element is then (exp(x_ij - max)) / sum_exp, then multiplied by the scale.
+
+The challenge is to implement this efficiently in CUDA.
+
+The kernel can be structured as follows:
+
+Each thread handles a single (batch, channel, spatial position) element, but this may require shared memory for the reduction step. Alternatively, we can use a tiled approach for the reduction.
+
+Alternatively, we can process per channel, since each channel is independent. Let's think of the data layout as (b, c, d, h, w). For each batch and channel, the spatial dimensions can be treated as a single vector.
+
+The kernel can process each (b, c) pair, compute the max over all spatial elements, then compute the exponentials and sum.
+
+But implementing this requires:
+
+- For each (b, c), find the maximum value across all d, h, w.
+
+This can be done via a reduction kernel first, but that would add steps. Alternatively, compute the max in the same kernel.
+
+Hmm, perhaps the best way is:
+
+The kernel can process each (batch, channel) as a block. Each block handles one (b,c) pair.
+
+Within the block, all threads process all spatial elements (d, h, w) to compute the max.
+
+Then, once the max is known, compute the exponential of (x - max) for each spatial element, accumulate the sum.
+
+Then, each spatial element's value is (exp(x - max) / sum) * scale.
+
+This requires the following steps:
+
+1. For each (b,c), compute max over spatial dims.
+
+2. Compute exp(x_ij - max).
+
+3. Sum all exp terms over spatial dims to get denominator.
+
+4. Compute (exp(x_ij - max)/denominator) * scale.
+
+So, the kernel can be structured with:
+
+Each block handles a (b,c) pair.
+
+Each thread in the block handles a spatial position (d, h, w).
+
+First, compute max over all threads in the block.
+
+Then, compute the exp terms and accumulate the sum.
+
+Finally, write back the result.
+
+But handling reductions in CUDA requires synchronization. Let me outline:
+
+Kernel steps for a block (b, c):
+
+- Each thread processes a spatial element (d, h, w) at index pos.
+
+- Load the value x[b][c][d][h][w], clamp it.
+
+- Compute the maximum over all threads in the block (to get the max for this (b,c)).
+
+- Compute exp(clamped_x - max).
+
+- Sum all the exp terms into a shared memory sum.
+
+- Then, each thread can compute the result as (exp_val / sum) * scale[c].
+
+Wait, but the scale is a parameter of shape (1, c, 1, 1, 1). So for each (b,c), scale[c] is the value.
+
+This approach requires:
+
+- For each (b, c), the block must compute the max and sum over all spatial elements.
+
+This is feasible with a block per (b, c). Let's calculate the dimensions.
+
+Given the problem parameters:
+
+batch_size = 32
+
+in_channels = 32
+
+out_channels = 64
+
+depth, height, width = 32, 64, 64
+
+The spatial dimensions for each (b,c) are d*h*w = 32*64*64 = 131072 elements.
+
+The number of (b, c) pairs is 32 * 64 = 2048. So each block would need to process 131072 elements, which is a lot.
+
+The block size can't be that big. So this approach may not be efficient. Perhaps we need a different way.
+
+Alternative approach: Using a tiled reduction.
+
+Each thread block processes a tile of the spatial dimensions, and within the block, computes partial max and partial sums, then combines the partials.
+
+Alternatively, using a 3D grid where each block handles a spatial tile.
+
+Alternatively, use a 2D grid where each block handles a (b,c) pair, but with multiple threads per spatial element.
+
+Wait, perhaps it's better to have each thread process one element in the spatial dimensions. Let's think of the kernel as follows:
+
+The kernel is launched with a grid of blocks, where each block corresponds to a (batch, channel) pair. The block dimension (number of threads per block) must be at least as large as the number of spatial elements, but that's impossible because 32*64*64 is 131k, which exceeds the maximum threads per block (1024 in many setups). So this approach won't work.
+
+Therefore, need a different approach.
+
+Alternative approach: process all (batch, channel) pairs in parallel, using a grid of blocks, where each block handles a spatial position (d, h, w), and threads within the block process different (batch, channel) pairs.
+
+Wait, perhaps a better way is to structure the kernel to process each spatial element in parallel, but with shared memory to accumulate the max and sum.
+
+Alternatively, let's consider the following:
+
+The spatial dimensions can be flattened into a single index (as in the view step). For each (b, c), the spatial data is a 1D array of length N = d*h*w.
+
+The plan is:
+
+1. For each (b,c), compute the max over the N elements.
+
+2. Compute exp(clamped_x - max) for each element.
+
+3. Sum all the exp terms to get the denominator.
+
+4. Each element is (exp_val / denominator) * scale[c]
+
+Thus, the problem reduces to, for each (b,c), performing these operations on their N elements.
+
+To implement this in CUDA:
+
+We can launch a kernel where each thread block processes a single (b,c) pair. Each thread in the block handles a portion of the spatial elements.
+
+The steps would be:
+
+- For a given (b,c) pair (each block handles one):
+
+   a. Load the clamped input values for all spatial positions (d, h, w).
+
+   b. Compute the maximum value among all these elements.
+
+   c. Compute the exponential of (x - max) for each element.
+
+   d. Sum all these exponentials to get the denominator.
+
+   e. For each element, compute (exp_val / denominator) * scale[c].
+
+   f. Write the result back to the output tensor.
+
+The challenge is to do this efficiently in CUDA, especially steps b and d (the reductions).
+
+Implementing the max and sum reductions efficiently is key.
+
+One way is to use shared memory for the reductions.
+
+Let me outline the steps in code:
+
+Each thread block processes one (b,c) pair. The block size is chosen such that the number of threads can handle the spatial elements in chunks, or use a tiling approach.
+
+Suppose the block size is 256 threads. For N = 131072 elements, each thread can process multiple elements.
+
+But even with 256 threads, each thread would have to process ~512 elements. That's manageable.
+
+Alternatively, use a hierarchical reduction:
+
+For step b (computing max):
+
+Each thread processes a chunk of the spatial elements, computes a local max, then threads within the block combine their local maxes to get the global max.
+
+Similarly for the sum.
+
+Let's structure the kernel as follows:
+
+Kernel signature:
+
+__global__ void fused_clamp_softmax_scale_kernel(
+    const float* input,  // input tensor (b, c, d, h, w)
+    float* output,       // output tensor
+    const float clamp_min,
+    const float clamp_max,
+    const float* scale,  // shape (c,)
+    int batch_size,
+    int out_channels,
+    int spatial_size  // d * h * w
+) {
+
+    // Each block handles a (batch, channel) pair
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+
+    // Compute the starting index in the input
+    int offset = b * out_channels * spatial_size + c * spatial_size;
+
+    // Shared memory to hold partial max and sum
+    __shared__ float s_max;
+    __shared__ float s_sum;
+
+    // Each thread processes a portion of the spatial elements
+    // Assuming blockDim.x is the number of threads per block (e.g., 256)
+    float local_max = -FLT_MAX;
+    float local_sum = 0.0f;
+
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);  // clamp
+        if (val > local_max) {
+            local_max = val;
+        }
+        local_sum += expf(val - local_max);  // Wait, but this is before knowing the global max?
+    }
+
+    // Wait, this approach is flawed because each thread computes val - local_max, but the global max is needed.
+
+    // Oops, need to compute the global max first.
+
+    // So first, compute the global max for this (b,c)
+    // Need to perform reduction over all spatial elements for (b,c)
+
+    // So first pass: compute the max
+    // Each thread loads their elements and computes a local max
+    float local_max_val = -FLT_MAX;
+
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        if (val > local_max_val) {
+            local_max_val = val;
+        }
+    }
+
+    // Reduce to get global max in the block
+    // Use a reduction tree in shared memory
+    __shared__ float s_partials[MAX_THREADS_PER_BLOCK];  // Need to set MAX_THREADS_PER_BLOCK appropriately
+
+    s_partials[threadIdx.x] = local_max_val;
+    __syncthreads();
+
+    // Perform reduction using log2(threadCount) steps
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (s_partials[threadIdx.x] < s_partials[threadIdx.x + s]) {
+                s_partials[threadIdx.x] = s_partials[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    float global_max = (threadIdx.x == 0) ? s_partials[0] : 0.0f;
+    __syncthreads();
+
+    // Now compute the exponential terms and sum
+    float local_exp_sum = 0.0f;
+
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        float exp_val = expf(val - global_max);
+        local_exp_sum += exp_val;
+    }
+
+    // Sum all local_exp_sum to get the total sum
+    s_partials[threadIdx.x] = local_exp_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_partials[threadIdx.x] += s_partials[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    float global_sum = (threadIdx.x == 0) ? s_partials[0] : 0.0f;
+    __syncthreads();
+
+    // Now compute the output for each element
+    if (threadIdx.x == 0) {
+        // Only one thread needs to write the results, but that's slow. Alternatively, have all threads contribute.
+        // Hmm, this is a problem. To compute all elements, need to have each thread process their elements.
+
+        // Maybe restructure so that after computing global_max and global_sum, each thread can compute their elements.
+
+        // So, the third pass: compute the output
+        for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+            float val = input[offset + idx];
+            val = min(max(val, clamp_min), clamp_max);
+            float exp_val = expf(val - global_max);
+            float result = (exp_val / global_sum) * scale[c];  // scale is per channel
+            output[offset + idx] = result;
+        }
+    } else {
+        // Other threads can help in the computation
+        // Alternatively, let all threads participate in the third loop
+    }
+
+    // Wait, the above approach where only threadIdx.x ==0 does the final write won't work because it can't handle all elements.
+    // So instead, let all threads compute their own elements in the third pass.
+
+    // So, in the third loop:
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        float exp_val = expf(val - global_max);
+        float result = (exp_val / global_sum) * scale[c];
+        output[offset + idx] = result;
+    }
+}
+
+Wait, but this requires that each thread has access to global_max and global_sum, which are computed per (b,c). Since this is done per block, and each block handles a (b,c) pair, those values are available.
+
+The problem with this approach is that the reduction steps for max and sum require synchronization, which can be slow for large spatial dimensions (131k elements). The reductions may take many steps.
+
+Alternatively, using a larger block size with multiple warps might help, but the maximum block size is limited (e.g., 1024 threads). For N=131072 elements, even with 1024 threads, each thread would have to process 128 elements in the first loop. That's manageable but may have high memory traffic.
+
+Another optimization is to unroll the loops or use vectorized operations, but that's more complex.
+
+Alternatively, perhaps the spatial softmax can be approximated or there's a better way. But given the problem constraints, proceeding with this approach.
+
+Now, the kernel would be launched with a grid of (batch_size, out_channels) blocks, each of size blockDim threads.
+
+The block dimensions depend on the spatial size. For example, if spatial_size is 32*64*64=131072, and block size is 256 threads, then each thread processes 131072 / 256 = 512 elements in the loops. That's a lot, but manageable.
+
+Now, compiling this into code:
+
+First, in Python, we need to write the CUDA kernel code as a string.
+
+Additionally, the input tensor's shape is (b, c, d, h, w). The spatial_size is d*h*w.
+
+But in the kernel, the input is stored as a contiguous array, so the offset is correctly calculated.
+
+The scale is a parameter of shape (1, out_channels, 1, 1, 1), so in the kernel, we can pass a pointer to a 1D array of scales (scale[c]).
+
+Now, putting it all together:
+
+The custom CUDA kernel code:
+
+```cpp
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+template<int BlockSize>
+__global__ void fused_clamp_softmax_scale_kernel(
+    const float* input,
+    float* output,
+    const float clamp_min,
+    const float clamp_max,
+    const float* scale,
+    int batch_size,
+    int out_channels,
+    int spatial_size
+) {
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+
+    int offset = b * out_channels * spatial_size + c * spatial_size;
+
+    __shared__ float s_max;
+    __shared__ float s_sum;
+
+    float local_max = -FLT_MAX;
+    float local_sum = 0.0f;
+
+    // Compute local max for each spatial element in the current block
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        if (val > local_max) {
+            local_max = val;
+        }
+    }
+
+    // Reduce to find global max using shared memory
+    __shared__ float s_partials[BlockSize];
+    s_partials[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (int s = BlockSize / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (s_partials[threadIdx.x] < s_partials[threadIdx.x + s]) {
+                s_partials[threadIdx.x] = s_partials[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    float global_max = (threadIdx.x == 0) ? s_partials[0] : 0.0f;
+    __syncthreads();
+
+    // Compute local exponential sum
+    local_sum = 0.0f;
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        float exp_val = expf(val - global_max);
+        local_sum += exp_val;
+    }
+
+    // Reduce to find global sum
+    s_partials[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = BlockSize / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_partials[threadIdx.x] += s_partials[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    float global_sum = (threadIdx.x == 0) ? s_partials[0] : 0.0f;
+    __syncthreads();
+
+    // Compute final output
+    for (int idx = threadIdx.x; idx < spatial_size; idx += blockDim.x) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        float exp_val = expf(val - global_max);
+        float result = (exp_val / global_sum) * scale[c];
+        output[offset + idx] = result;
+    }
+}
+```
+
+Wait, but in this code, the blockDim is specified as BlockSize via a template. We can choose BlockSize as 256, for example.
+
+Then, in the kernel launch, we need to set the block size accordingly.
+
+The kernel function would need to be specialized for a particular BlockSize. Let's fix BlockSize to 256.
+
+Then, the kernel function would be:
+
+__global__ void fused_clamp_softmax_scale_kernel(...)
+
+But with the template, it would be:
+
+template<>
+__global__ void fused_clamp_softmax_scale_kernel<256>(...)
+
+But in the code, we can just hardcode the BlockSize as 256, to simplify.
+
+Alternatively, let's rewrite without template:
+
+__global__ void fused_clamp_softmax_scale_kernel(
+    const float* input,
+    float* output,
+    const float clamp_min,
+    const float clamp_max,
+    const float* scale,
+    int batch_size,
+    int out_channels,
+    int spatial_size
+) {
+    int BlockSize = 256;  // Compile-time constant?
+
+    // ... rest of code as before, replacing BlockSize with 256 where needed.
+}
+
+But CUDA kernels can't have variables for block sizes in shared memory declarations. So the shared memory array size must be a compile-time constant. Hence, we need to use a template or define the BlockSize as a constant.
+
+Alternatively, define BlockSize as a constexpr:
+
+constexpr int BlockSize = 256;
+
+But in CUDA, this is okay.
+
+Alternatively, proceed with the template approach.
+
+In the code, let's define BlockSize as 256.
+
+Now, in Python, we can define the kernel as follows:
+
+elementwise_add_source = """
+// ... code here ...
+"""
+
+Wait, but the kernel needs to be called from Python with the appropriate parameters.
+
+Additionally, the scale parameter is a PyTorch tensor, which needs to be passed correctly.
+
+The Python code would look like this:
+
+First, define the CUDA source code:
+
+```python
+fused_clamp_softmax_scale_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+template<int BlockSize>
+__global__ void fused_clamp_softmax_scale_kernel(
+    const float* input,
+    float* output,
+    const float clamp_min,
+    const float clamp_max,
+    const float* scale,
+    int batch_size,
+    int out_channels,
+    int spatial_size
+) {
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+
+    int offset = b * out_channels * spatial_size + c * spatial_size;
+
+    __shared__ float s_partials[BlockSize];  // Use template BlockSize
+
+    // Compute local max
+    float local_max = -FLT_MAX;
+    for (int idx = threadIdx.x; idx < spatial_size; idx += BlockSize) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        if (val > local_max) {
+            local_max = val;
+        }
+    }
+
+    // Reduction for max
+    s_partials[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (int s = BlockSize / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (s_partials[threadIdx.x] < s_partials[threadIdx.x + s]) {
+                s_partials[threadIdx.x] = s_partials[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    float global_max = (threadIdx.x == 0) ? s_partials[0] : 0.0f;
+    __syncthreads();
+
+    // Compute local sum of exp(val - global_max)
+    float local_sum = 0.0f;
+    for (int idx = threadIdx.x; idx < spatial_size; idx += BlockSize) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        float exp_val = expf(val - global_max);
+        local_sum += exp_val;
+    }
+
+    // Reduction for sum
+    s_partials[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = BlockSize / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_partials[threadIdx.x] += s_partials[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    float global_sum = (threadIdx.x == 0) ? s_partials[0] : 0.0f;
+    __syncthreads();
+
+    // Compute output
+    for (int idx = threadIdx.x; idx < spatial_size; idx += BlockSize) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        float exp_val = expf(val - global_max);
+        float result = (exp_val / global_sum) * scale[c];
+        output[offset + idx] = result;
+    }
+}
+
+// Define the kernel with BlockSize=256
+__global__ void fused_clamp_softmax_scale_256(
+    const float* input,
+    float* output,
+    const float clamp_min,
+    const float clamp_max,
+    const float* scale,
+    int batch_size,
+    int out_channels,
+    int spatial_size
+) {
+    fused_clamp_softmax_scale_kernel<256><<<dim3(1), 256>>>(input, output, clamp_min, clamp_max, scale, batch_size, out_channels, spatial_size);
+}
+
+// Host function to call the kernel
+torch::Tensor fused_clamp_softmax_scale_cuda(
+    torch::Tensor input,
+    torch::Tensor scale,
+    float clamp_min,
+    float clamp_max
+) {
+    const int batch_size = input.size(0);
+    const int out_channels = input.size(1);
+    const int d = input.size(2);
+    const int h = input.size(3);
+    const int w = input.size(4);
+    const int spatial_size = d * h * w;
+
+    auto output = torch::empty_like(input);
+
+    const dim3 blocks(batch_size, out_channels);  // Each block handles (b, c)
+    const dim3 threads(256);
+
+    // Launch the kernel
+    fused_clamp_softmax_scale_256<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        clamp_min,
+        clamp_max,
+        scale.data_ptr<float>(),
+        batch_size,
+        out_channels,
+        spatial_size
+    );
+
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+fused_clamp_softmax_scale_cpp_source = """
+torch::Tensor fused_clamp_softmax_scale_cuda(
+    torch::Tensor input,
+    torch::Tensor scale,
+    float clamp_min,
+    float clamp_max
+);
+"""
+
+# Compile the CUDA code
+fused_clamp_softmax_scale = load_inline(
+    name="fused_clamp_softmax_scale",
+    cpp_sources=fused_clamp_softmax_scale_cpp_source,
+    cuda_sources=fused_clamp_softmax_scale_source,
+    functions=["fused_clamp_softmax_scale_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+```
+
+Wait, but the kernel launcher function `fused_clamp_softmax_scale_256` must be properly defined. In the code above, the kernel function is a template, so to specialize it for BlockSize=256, we can create an alias by calling the template with that value.
+
+Alternatively, the code above uses a template and then defines the specialized function as fused_clamp_softmax_scale_256.
+
+However, the way it's written currently is incorrect. The `fused_clamp_softmax_scale_256` is supposed to be an instantiation of the template kernel. To do this correctly, we can write:
+
+template<int BlockSize>
+__global__ void fused_clamp_softmax_scale_kernel(...);
+
+// Instantiate with BlockSize 256
+template __global__ void fused_clamp_softmax_scale_kernel<256>(...);
+
+But in the code above, it's not properly done. So perhaps better to inline the BlockSize.
+
+Alternatively, use a preprocessor define:
+
+#define BLOCK_SIZE 256
+
+and then use that in the kernel.
+
+Alternatively, let me rework the code properly.
+
+Here's the corrected CUDA code:
+
+```cpp
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+#define BLOCK_SIZE 256
+
+__global__ void fused_clamp_softmax_scale_kernel(
+    const float* input,
+    float* output,
+    const float clamp_min,
+    const float clamp_max,
+    const float* scale,
+    int batch_size,
+    int out_channels,
+    int spatial_size
+) {
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+
+    int offset = b * out_channels * spatial_size + c * spatial_size;
+
+    __shared__ float s_partials[BLOCK_SIZE];  // Shared memory for reductions
+
+    // Compute local max
+    float local_max = -FLT_MAX;
+    for (int idx = threadIdx.x; idx < spatial_size; idx += BLOCK_SIZE) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        if (val > local_max) {
+            local_max = val;
+        }
+    }
+
+    // Reduction for max
+    s_partials[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (s_partials[threadIdx.x] < s_partials[threadIdx.x + s]) {
+                s_partials[threadIdx.x] = s_partials[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    float global_max = (threadIdx.x == 0) ? s_partials[0] : 0.0f;
+    __syncthreads();
+
+    // Compute local sum of exp(val - global_max)
+    float local_sum = 0.0f;
+    for (int idx = threadIdx.x; idx < spatial_size; idx += BLOCK_SIZE) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        float exp_val = expf(val - global_max);
+        local_sum += exp_val;
+    }
+
+    // Reduction for sum
+    s_partials[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_partials[threadIdx.x] += s_partials[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    float global_sum = (threadIdx.x == 0) ? s_partials[0] : 0.0f;
+    __syncthreads();
+
+    // Compute output
+    for (int idx = threadIdx.x; idx < spatial_size; idx += BLOCK_SIZE) {
+        float val = input[offset + idx];
+        val = min(max(val, clamp_min), clamp_max);
+        float exp_val = expf(val - global_max);
+        float result = (exp_val / global_sum) * scale[c];
+        output[offset + idx] = result;
+    }
+}
+
+// Host function to call the kernel
+torch::Tensor fused_clamp_softmax_scale_cuda(
+    torch::Tensor input,
+    torch::Tensor scale,
+    float clamp_min,
+    float clamp_max
+) {
+    const int batch_size = input.size(0);
+    const int out_channels = input.size(1);
+    const int d = input.size(2);
+    const int h = input.size(3);
+    const int w = input.size(4);
+    const int spatial_size = d * h * w;
+
+    auto output = torch::empty_like(input);
+
+    const dim3 blocks(batch_size, out_channels);  // Each block handles (b, c)
+    const dim3 threads(BLOCK_SIZE);
+
+    // Launch the kernel
+    fused_clamp_softmax_scale_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        clamp_min,
+        clamp_max,
+        scale.data_ptr<float>(),
+        batch_size,
+        out_channels,
+        spatial_size
+    );
+
+    cudaDeviceSynchronize();
+    return output;
+}
+```
+
+This version uses a constant BLOCK_SIZE of 256.
+
+Now, compiling this in Python:
+
+The Python code would then define the fused function and include it in the ModelNew.
+
+Now, the ModelNew class would replace the post-conv steps with this kernel:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, pool_kernel_size, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.avg_pool = nn.AvgPool3d(pool_kernel_size)
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+        self.scale = nn.Parameter(torch.ones(1, out_channels, 1, 1, 1))
+        self.fused_clamp_softmax_scale = fused_clamp_softmax_scale
+
+    def forward(self, x):
+        x = self.avg_pool(x)
+        x = self.conv_transpose(x)
+        # Instead of separate clamp, softmax, scale:
+        x = self.fused_clamp_softmax_scale.fused_clamp_softmax_scale_cuda(
+            x, self.scale, self.clamp_min, self.clamp_max)
+        return x
+
+However, the fused function requires that the scale is a tensor. Since self.scale is a parameter, we can pass it directly.
+
+Wait, in the kernel, the scale is a 1D tensor of shape (out_channels, ), but in PyTorch, self.scale

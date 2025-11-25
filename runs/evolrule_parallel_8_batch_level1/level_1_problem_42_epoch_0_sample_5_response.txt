@@ -1,0 +1,260 @@
+The code must work with the following function (do not modify the function):
+
+def get_init_inputs():
+    return [kernel_size, stride, padding, dilation]
+
+The new architecture must have the same interface as the original Model class. The forward() function must take the same inputs and outputs, and the __init__ must take the same arguments and in the same order. The new architecture must be compatible with the get_init_inputs() function.
+
+The new architecture may not use the torch.nn.MaxPool2d operator in any way. You must replace it with a custom CUDA operator.
+
+The new architecture may use any other PyTorch operators except MaxPool2d. 
+
+The goal is to achieve the best possible speedup compared to the original implementation. 
+
+You can add new helper methods, attributes, or parameters as needed in the new architecture.
+
+You must write the CUDA code for MaxPool2d from scratch, without relying on existing PyTorch implementations. You can choose any algorithm and implementation strategy. 
+
+The CUDA kernel must correctly compute the maximum values in the given kernel window with the provided parameters (stride, padding, dilation). 
+
+The CUDA kernel should be efficient and handle all the parameters (stride, padding, dilation).
+
+The input tensor dimensions are fixed as batch_size=32, channels=64, height=512, width=512. You can optimize specifically for these dimensions if it helps, but the code must be general enough to handle different input tensor dimensions.
+
+Your solution must be correct, meaning it must produce the same output as the original model (given the same inputs and parameters).
+
+Your code must be compatible with PyTorch's autograd system. The kernel must support backward passes for gradients. You can implement the backward kernel yourself or use PyTorch's autograd to compute the gradients. However, if you choose to implement the backward kernel, you must do so in a way that is compatible with PyTorch's custom autograd functions.
+
+You may use CUDA libraries like cuBLAS or cuDNN, but you are not required to. You must ensure that your code does not have any dependencies beyond PyTorch and CUDA.
+
+
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+from torch.autograd import Function
+
+class MaxPool2dFunction(Function):
+    @staticmethod
+    def forward(ctx, input, kernel_size, stride, padding, dilation):
+        ctx.kernel_size = kernel_size
+        ctx.stride = stride
+        ctx.padding = padding
+        ctx.dilation = dilation
+        ctx.input_shape = input.shape
+        ctx.save_for_backward(input)
+        
+        # Pad the input if necessary
+        if padding > 0:
+            padding = (padding, padding)
+            input_padded = F.pad(input, (padding[1], padding[1], padding[0], padding[0]), mode='constant', value=-float('inf'))
+        else:
+            input_padded = input
+
+        batch_size, channels, height, width = input_padded.shape
+        kH, kW = kernel_size, kernel_size
+        dH, dW = dilation, dilation
+
+        # Calculate output dimensions
+        output_height = (height + 2 * padding[0] - dilation * (kernel_size - 1) - 1) // stride + 1
+        output_width = (width + 2 * padding[1] - dilation * (kernel_size - 1) - 1) // stride + 1
+
+        output = torch.empty(batch_size, channels, output_height, output_width, device=input.device)
+        
+        # Launch CUDA kernel
+        threads_per_block = (16, 16)
+        blocks_per_grid_x = (output_width + threads_per_block[1] - 1) // threads_per_block[1]
+        blocks_per_grid_y = (output_height + threads_per_block[0] - 1) // threads_per_block[0]
+        blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y, batch_size * channels)
+
+        max_pool_forward_kernel[blocks_per_grid, threads_per_block](
+            input_padded,
+            output,
+            kernel_size,
+            stride,
+            dilation,
+            input_padded.shape[2],
+            input_padded.shape[3],
+            output.shape[2],
+            output.shape[3]
+        )
+
+        ctx.mark_non_differentiable(output)
+        ctx.save_for_backward(output, input_padded)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_padded, output = ctx.saved_tensors
+        batch_size, channels, height, width = input_padded.shape
+        kernel_size = ctx.kernel_size
+        stride = ctx.stride
+        dilation = ctx.dilation
+
+        grad_input = torch.zeros_like(input_padded)
+
+        threads_per_block = (16, 16)
+        blocks_per_grid_x = (grad_output.size(3) + threads_per_block[1] - 1) // threads_per_block[1]
+        blocks_per_grid_y = (grad_output.size(2) + threads_per_block[0] - 1) // threads_per_block[0]
+        blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y, batch_size * channels)
+
+        max_pool_backward_kernel[blocks_per_grid, threads_per_block](
+            grad_output,
+            grad_input,
+            input_padded,
+            output,
+            kernel_size,
+            stride,
+            dilation,
+            height,
+            width,
+            grad_output.size(2),
+            grad_output.size(3)
+        )
+
+        if ctx.padding > 0:
+            # Remove padding from gradient
+            pad = ctx.padding
+            grad_input = grad_input[..., pad:-pad, pad:-pad]
+
+        return grad_input, None, None, None, None
+
+# CUDA kernels
+max_pool_forward_kernel = load_inline(
+    name="max_pool_forward",
+    cuda_sources="""
+    #include <torch/extension.h>
+    #include <cuda.h>
+    #include <cuda_runtime.h>
+
+    template <typename scalar_t>
+    __global__ void max_pool_forward_kernel(
+        const torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits> input,
+        torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits> output,
+        const int kernel_size,
+        const int stride,
+        const int dilation,
+        const int input_height,
+        const int input_width,
+        const int output_height,
+        const int output_width
+    ) {
+        const int batch_idx = blockIdx.z / input.size(1);
+        const int channel_idx = blockIdx.z % input.size(1);
+        const int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+        const int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+
+        if (out_x >= output_width || out_y >= output_height) return;
+
+        const int in_x_start = out_x * stride;
+        const int in_y_start = out_y * stride;
+
+        scalar_t max_val = -INFINITY;
+        int max_idx_x = 0, max_idx_y = 0;
+
+        for (int ky = 0; ky < kernel_size; ++ky) {
+            for (int kx = 0; kx < kernel_size; ++kx) {
+                int dx = in_x_start + kx * dilation;
+                int dy = in_y_start + ky * dilation;
+                if (dx < 0 || dx >= input_width || dy < 0 || dy >= input_height)
+                    continue;
+                scalar_t val = input[batch_idx][channel_idx][dy][dx];
+                if (val > max_val) {
+                    max_val = val;
+                    max_idx_x = dx;
+                    max_idx_y = dy;
+                }
+            }
+        }
+
+        output[batch_idx][channel_idx][out_y][out_x] = max_val;
+    }
+    """,
+    extra_cuda_cflags=['-lineinfo'],
+    extra_include_paths=['/usr/local/cuda/include'],
+    functions=[],
+    verbose=True
+)
+
+max_pool_backward_kernel = load_inline(
+    name="max_pool_backward",
+    cuda_sources="""
+    #include <torch/extension.h>
+    #include <cuda.h>
+    #include <cuda_runtime.h>
+
+    template <typename scalar_t>
+    __global__ void max_pool_backward_kernel(
+        const torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits> grad_output,
+        torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits> grad_input,
+        const torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits> input,
+        const torch::PackedTensorAccessor<scalar_t,4,torch::RestrictPtrTraits> output,
+        const int kernel_size,
+        const int stride,
+        const int dilation,
+        const int input_height,
+        const int input_width,
+        const int output_height,
+        const int output_width
+    ) {
+        const int batch_idx = blockIdx.z / input.size(1);
+        const int channel_idx = blockIdx.z % input.size(1);
+        const int out_x = blockIdx.x * blockDim.x + threadIdx.x;
+        const int out_y = blockIdx.y * blockDim.y + threadIdx.y;
+
+        if (out_x >= output_width || out_y >= output_height) return;
+
+        scalar_t grad = grad_output[batch_idx][channel_idx][out_y][out_x];
+
+        const int in_x_start = out_x * stride;
+        const int in_y_start = out_y * stride;
+
+        scalar_t max_val = output[batch_idx][channel_idx][out_y][out_x];
+
+        for (int ky = 0; ky < kernel_size; ++ky) {
+            for (int kx = 0; kx < kernel_size; ++kx) {
+                int dx = in_x_start + kx * dilation;
+                int dy = in_y_start + ky * dilation;
+                if (dx < 0 || dx >= input_width || dy < 0 || dy >= input_height)
+                    continue;
+                if (input[batch_idx][channel_idx][dy][dx] == max_val) {
+                    atomicAdd(&grad_input[batch_idx][channel_idx][dy][dx], grad);
+                    break; // Only assign to first max element to avoid duplicates
+                }
+            }
+        }
+    }
+    """,
+    extra_cuda_cflags=['-lineinfo'],
+    extra_include_paths=['/usr/local/cuda/include'],
+    functions=[],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return MaxPool2dFunction.apply(
+            x,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation
+        )
+
+def get_inputs():
+    x = torch.rand(batch_size, channels, height, width).cuda()
+    return [x]
+
+def get_init_inputs():
+    return [kernel_size, stride, padding, dilation]
+```
+</think>

@@ -1,0 +1,787 @@
+First, I need to analyze the given model and identify which operations can be optimized with custom CUDA kernels. The model currently has a sequence of a linear layer (GEMM), batch normalization, GELU, and ReLU. Let me break down each component and think about potential optimizations.
+
+The linear layer involves a matrix multiplication followed by an addition (bias). The batch normalization involves normalizing the input and applying scale and shift parameters. The GELU and ReLU are activation functions.
+
+Operator fusion is a key strategy here. Since these operations are sequential, combining them into a single kernel could reduce memory bandwidth usage and kernel launch overhead. For example, fusing the GEMM, batch norm, GELU, and ReLU into a single kernel might be beneficial. Alternatively, combining the GEMM with the batch norm first, then handling activations.
+
+First, let's consider the GEMM (linear layer). The matrix multiplication (x * weight) is a significant operation. However, the subsequent batch norm requires mean and variance calculations, which are statistics over the batch. Since batch norm is typically used in training, but if this model is in evaluation mode, the batch norm would use running mean and variance. The problem statement doesn't specify, but assuming it's during inference (since the initial inputs don't include training flags), so batch norm can be simplified to a linear operation (scale and shift). Wait, batch norm in inference mode applies:
+
+x = (x - running_mean) / sqrt(running_var + eps) * weight + bias
+
+So during inference, it's a linear transformation. So the batch norm can be expressed as a scaling and shifting operation. Therefore, the entire sequence after the GEMM could be expressed as a combination of matrix multiplication, scaling, shifting, and applying activation functions.
+
+Therefore, the entire forward pass can be written as:
+
+x = (W*x + b) * scale + shift
+x = GELU(x)
+x = ReLU(x)
+
+Wait, but GELU followed by ReLU? Since GELU is a smooth version of ReLU, applying ReLU after might be redundant, but the user's code has both, so it's part of the architecture and must be preserved.
+
+Alternatively, perhaps combining GELU and ReLU into a single activation function. Let's see: GELU(x) is x*σ(x), where σ is the logistic function. ReLU(x) is max(0,x). So the combined function would be max(0, GELU(x)). Since GELU is always non-negative? Wait, GELU is actually a smooth approximation of ReLU, but it can take negative values? Let me check:
+
+The GELU function is defined as 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3))). Since tanh can be negative, but multiplied by x, so yes, GELU can output negative values for negative x. Therefore, applying ReLU after would clamp those to zero. So the combination is not redundant.
+
+Therefore, the sequence is:
+
+After the linear layer and batch norm, apply GELU followed by ReLU.
+
+To fuse these operations into a single kernel, we can combine the GEMM (including bias), batch norm scaling and shifting, then apply GELU and ReLU.
+
+This would reduce memory traffic because all operations are done in a single kernel, avoiding intermediate results stored in memory.
+
+Now, implementing this in CUDA requires writing a kernel that takes in the input tensor, the weights, bias, batch norm parameters (scale, shift, running mean, running var, eps), and applies all the operations in a single pass.
+
+But wait, the batch norm parameters are stored in the batch_norm layer. The model's batch_norm module has parameters (weight and bias), and running_mean and running_var buffers. So in the code, when we create the ModelNew class, we need to have access to these parameters.
+
+Alternatively, the custom kernel can take the parameters as inputs. So in the fused kernel, we'll need to pass the weight and bias from the linear layer, and the scale (weight) and shift (bias) from the batch norm, along with the running mean, running var, and eps.
+
+Wait, in inference mode, the batch norm computation is:
+
+output = (input - running_mean) / sqrt(running_var + eps) * gamma + beta
+
+where gamma and beta are the batch norm's learnable parameters (scale and shift).
+
+Therefore, the entire forward pass can be written as:
+
+x = (W*x + b) --> from linear layer
+Then, batch norm: (x - running_mean) / sqrt(running_var + eps) * gamma + beta
+Then apply GELU and ReLU.
+
+Therefore, the fused kernel would need to compute:
+
+for each element:
+
+temp = W*x + b
+
+temp = (temp - running_mean) / sqrt(running_var + eps) * gamma + beta
+
+then apply GELU(temp)
+
+then apply ReLU(temp_gelu)
+
+The final result is ReLU(GELU(temp))
+
+Wait, but the order in the original code is:
+
+x = self.gemm(x) --> W*x + b
+
+x = self.batch_norm(x) --> batch norm
+
+x = torch.nn.functional.gelu(x) --> GELU
+
+x = torch.relu(x) --> ReLU
+
+So the order is correct.
+
+Therefore, the fused kernel can combine all these steps into a single computation per element.
+
+Now, to implement this in CUDA, the steps would be:
+
+- For each element in the output (each element is for a batch and feature):
+
+Wait, actually, the GEMM is a matrix multiplication between the input (batch_size x in_features) and the weight (out_features x in_features) transpose? Wait, nn.Linear in PyTorch is implemented as: output = input @ weight.T + bias. So the weight matrix is of size (out_features, in_features). The input is (batch_size, in_features), so the GEMM is batch_size x in_features multiplied by in_features x out_features, resulting in batch_size x out_features. So each output element (batch, out_feature) is a dot product between the input row and the corresponding weight column.
+
+Therefore, the GEMM is the most compute-heavy part. Fusing this with the subsequent operations requires handling the GEMM computation, then applying the batch norm, then the activations.
+
+Implementing this in a single kernel might be challenging because the GEMM is a global memory-bound operation, and the subsequent element-wise operations are compute-bound. However, combining them could save memory bandwidth by not storing intermediate results.
+
+Alternatively, perhaps first implement a fused kernel for the GEMM + batch norm + activations. Let me think about the structure:
+
+The kernel would need to:
+
+1. Compute the GEMM (matrix multiplication) part for each output element.
+
+2. Apply batch norm's scaling and shifting.
+
+3. Apply GELU and ReLU.
+
+But the GEMM itself is a matrix multiplication, which is a reduction over the in_features dimension. To compute this efficiently in a kernel, perhaps we can structure the kernel to compute each output element (for a given batch and out_feature index).
+
+Each thread can compute a single output element (i,j) where i is batch index and j is out_feature index. Then, for each (i,j), compute the dot product between input[i][k] * weight[j][k] summed over k (in_features), add the bias[j], then apply batch norm, GELU, ReLU.
+
+This approach would have a thread for each output element. The number of threads would be batch_size * out_features. For the given parameters (batch_size=16384, out_features=4096), that's 16384 * 4096 ≈ 67 million threads, which is way too many. CUDA has a maximum of 1024 threads per block, and the maximum grid dimensions are 2^31-1 in each dimension, but the total number of threads is limited. However, 67 million is manageable if the block size is 256, so 67M / 256 ≈ 262k blocks. But this is feasible, but the GEMM part will be a loop over in_features=4096, which is 4096 iterations per thread, leading to a lot of computation.
+
+Alternatively, perhaps use a tiled approach or use shared memory to optimize the matrix multiplication. But writing a GEMM kernel from scratch is non-trivial and might not be faster than cuBLAS. Since the linear layer is using PyTorch's built-in implementation, which likely uses cuBLAS, so fusing it with other operations might not be straightforward. Alternatively, if the batch norm can be fused into the GEMM, then maybe there's a gain.
+
+Alternatively, perhaps first consider fusing the activations (GELU and ReLU) into a single kernel, then see if we can combine with the batch norm.
+
+Alternatively, since the batch norm's computation after the GEMM is an element-wise operation (once the GEMM is done, batch norm is element-wise), and the activations are also element-wise, perhaps the GEMM is the only non-element-wise part. So maybe first compute the GEMM using PyTorch's implementation, then combine the batch norm and activations into a single kernel.
+
+Wait, but the user wants to replace operators with custom CUDA kernels. So maybe the GEMM can be left to PyTorch's implementation, but the combination of batch norm, GELU, and ReLU can be fused into a single kernel. Let me see:
+
+The steps after GEMM are:
+
+1. Batch norm: (x - running_mean) / sqrt(running_var + eps) * gamma + beta
+
+2. GELU: compute GELU on the result.
+
+3. ReLU: clamp to non-negative.
+
+These are all element-wise operations, so they can be combined into a single kernel. That might be easier than combining with the GEMM.
+
+The GEMM is a matrix multiplication, which is already optimized, so replacing it might not give much gain, but the element-wise operations can be fused to reduce kernel launches and memory traffic.
+
+Therefore, let's consider fusing the batch norm, GELU, and ReLU into a single kernel.
+
+The steps in the kernel would be:
+
+for each element in the input tensor (after GEMM):
+
+temp = (input - running_mean) / sqrt(running_var + eps) * gamma + beta
+
+gelu_temp = gelu(temp)
+
+output = relu(gelu_temp)
+
+Therefore, the fused kernel can take the input tensor, along with the batch norm parameters (running_mean, running_var, gamma, beta, eps), and compute this sequence.
+
+This reduces three separate operations (batch norm, GELU, ReLU) into a single kernel call, which can save time from launching multiple kernels and synchronizing.
+
+Additionally, the batch norm's computation can be simplified if the parameters are precomputed. Since running_mean, running_var, gamma, beta, and eps are fixed during inference, we can precompute some terms to make the computation faster.
+
+Let me see:
+
+Let me denote:
+
+denom = sqrt(running_var + eps)
+
+scale = gamma / denom
+
+shift = beta - (running_mean * gamma) / denom
+
+Then, the batch norm can be expressed as:
+
+temp = input * scale + shift
+
+This way, the computation becomes a scaling and shifting, which is two element-wise operations. Then apply GELU and ReLU.
+
+Therefore, in code:
+
+scale = gamma / sqrt(running_var + eps)
+
+shift = beta - (running_mean * gamma) / sqrt(running_var + eps)
+
+temp = input * scale + shift
+
+gelu_temp = GELU(temp)
+
+output = ReLU(gelu_temp)
+
+Therefore, the batch norm computation can be precomputed into scale and shift parameters, which can be precomputed once during initialization and then used in the fused kernel. This way, the kernel only needs to multiply by scale and add shift, then apply GELU and ReLU.
+
+This would require the fused kernel to take scale, shift (which are tensors of shape (out_features,)), and then perform the element-wise operations.
+
+Therefore, the plan is:
+
+1. Precompute scale and shift parameters from batch norm's running_mean, running_var, gamma, beta, and eps.
+
+2. Create a fused kernel that takes the input tensor (from GEMM), scale, shift, and computes the batch norm (as scaling and shifting), applies GELU, then ReLU.
+
+3. The GEMM can remain as a PyTorch operator, but the subsequent three operations (batch norm, GELU, ReLU) are replaced with the custom kernel.
+
+Alternatively, if the batch norm parameters are fixed, then during the forward pass, we can compute the scale and shift once outside the kernel, then pass them as tensors. Since these parameters are per-channel (for 1D batch norm), the scale and shift tensors have the same shape as the output features (out_features).
+
+Therefore, the custom kernel will process each element in parallel, performing the element-wise operations.
+
+This approach is feasible. Let me outline the steps:
+
+In the ModelNew class:
+
+- Keep the linear layer (gemm) as is, since it's optimized by PyTorch.
+
+- Remove the batch norm layer since we will handle it in the kernel.
+
+- The fused kernel will take the input from the linear layer, then compute scale and shift from the batch norm parameters.
+
+Wait, but the batch norm parameters (running_mean, running_var, gamma, beta, eps) are part of the batch norm module. To access them in the kernel, we need to pass them as arguments to the kernel.
+
+Alternatively, we can extract them from the batch norm module in the forward pass and pass them to the kernel.
+
+Therefore, the steps in the forward pass would be:
+
+x = self.gemm(x)
+
+# Get batch norm parameters
+running_mean = self.batch_norm.running_mean
+running_var = self.batch_norm.running_var
+gamma = self.batch_norm.weight
+beta = self.batch_norm.bias
+eps = self.batch_norm.eps
+
+# Precompute scale and shift
+scale = gamma / torch.sqrt(running_var + eps)
+shift = beta - (running_mean * gamma) / torch.sqrt(running_var + eps)
+
+# Now pass x, scale, shift to the fused kernel
+output = fused_kernel(x, scale, shift)
+
+However, in PyTorch, the batch norm module's parameters are stored as buffers and parameters. So in the model, the batch_norm module is part of the ModelNew, so we can access its parameters.
+
+But when writing the custom CUDA kernel, we need to handle the parameters as tensors passed to the kernel.
+
+Alternatively, in the fused kernel, we can perform the computation inline without precomputing scale and shift, but that might be less efficient.
+
+Let me think about the kernel code:
+
+The kernel would need to perform:
+
+for each element in x (after GEMM):
+
+temp = x[i]
+
+# Compute batch norm
+denom = sqrt(running_var[i] + eps)
+scale_i = gamma[i] / denom
+shift_i = beta[i] - (running_mean[i] * gamma[i]) / denom
+
+temp = temp * scale_i + shift_i
+
+gelu_temp = GELU(temp)
+output[i] = max(0.0, gelu_temp)
+
+Wait, but in the kernel, we need to loop over each element, and for each element, access the corresponding channel parameters (since batch norm is per-channel for 1D). So for example, if the input is (batch_size, out_features), then for each element in position (b, c), the parameters for channel c are used.
+
+Therefore, in the kernel, for each element (b, c), we can compute:
+
+denom_c = sqrt(running_var[c] + eps)
+
+scale_c = gamma[c] / denom_c
+
+shift_c = beta[c] - (running_mean[c] * gamma[c]) / denom_c
+
+temp = x[b][c] * scale_c + shift_c
+
+Then apply GELU and ReLU.
+
+This way, we don't precompute scale and shift as tensors, but compute them on the fly for each channel in the kernel.
+
+However, computing sqrt and division for each element might be computationally expensive. Precomputing scale and shift as tensors would save computation.
+
+Therefore, precomputing scale and shift is better. The precomputation can be done on the CPU or GPU. Since it's per-channel (out_features elements), it's a small computation.
+
+Therefore, in the forward pass:
+
+After getting x from the linear layer:
+
+running_mean = self.batch_norm.running_mean
+running_var = self.batch_norm.running_var
+gamma = self.batch_norm.weight
+beta = self.batch_norm.bias
+eps = self.batch_norm.eps
+
+scale = gamma / torch.sqrt(running_var + eps)
+shift = beta - (running_mean * gamma) / torch.sqrt(running_var + eps)
+
+Then pass scale and shift to the kernel.
+
+The kernel can then do for each element:
+
+temp = x * scale[c] + shift[c]
+
+then GELU and ReLU.
+
+Wait, but in the kernel, how to index into scale and shift? Since scale and shift are vectors of length out_features, for each element in x (which is batch_size x out_features), the channel index is the second dimension (c).
+
+So in the kernel, for each element (b, c), we can access scale[c] and shift[c].
+
+Therefore, the kernel can be structured as follows:
+
+__global__ void fused_kernel(const float* x, const float* scale, const float* shift, float* out, int batch_size, int out_features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_features) return;
+
+    int c = idx % out_features; // channel index
+    float temp = x[idx] * scale[c] + shift[c];
+
+    // Compute GELU(temp)
+    float gelu_val;
+    // GELU implementation here
+
+    // Apply ReLU
+    out[idx] = fmaxf(gelu_val, 0.0f);
+}
+
+Wait, but how to implement GELU in CUDA. The GELU function can be approximated as 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3))) for the exact version, or the tanh approximation. Since PyTorch's GELU uses the exact version by default, but for speed, the kernel might use the tanh approximation, which is faster but less accurate. Alternatively, implement the exact version.
+
+Alternatively, look up the CUDA implementation of GELU. Let me recall the exact formula.
+
+The exact GELU is:
+
+gelu(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ) )
+
+So in code:
+
+float gelu_val = 0.5f * temp * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (temp + 0.044715f * temp * temp * temp)));
+
+But computing this for each element might be computationally intensive, but it's manageable.
+
+Alternatively, use the tanh approximation which is faster:
+
+gelu_approx = 0.5 * x * (1 + tanh( x * sqrt(2/pi) * (1 + 0.0447 * x^2) ) )
+
+Wait, the tanh-approximation is sometimes used for faster computation. Let me confirm:
+
+The standard tanh approximation for GELU is:
+
+gelu ≈ 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 x^3) )) 
+
+Wait, that's the exact version. Alternatively, there's a different approximation?
+
+Alternatively, the "GELU" in PyTorch's functional can be set to approximate or exact. The default is exact. However, if the user's code uses the default (exact), then we must implement the exact version.
+
+Therefore, the code for GELU in the kernel must compute that formula.
+
+Now, putting this together.
+
+The kernel will need to:
+
+1. For each element:
+
+   a. Multiply by scale[c], add shift[c].
+
+   b. Compute GELU on the result.
+
+   c. Apply ReLU.
+
+Thus, the CUDA code for the fused kernel would be as follows.
+
+Now, moving to the code structure:
+
+First, the custom kernel code in Python:
+
+We need to define the CUDA code inline.
+
+The function signature would be something like:
+
+def fused_batchnorm_gelu_relu_cuda(x, scale, shift):
+
+    # implementation
+
+But since we're using load_inline, we need to write the CUDA code.
+
+The kernel code will need to take:
+
+- Input tensor x (from the linear layer)
+
+- scale and shift tensors (precomputed)
+
+The output tensor will be of the same shape as x.
+
+Now, writing the CUDA code.
+
+First, the kernel function:
+
+#include <torch/extension.h>
+#include <math.h>
+
+__global__ void fused_kernel(const float* x_data,
+                            const float* scale_data,
+                            const float* shift_data,
+                            float* out_data,
+                            int batch_size,
+                            int out_features) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_features)
+        return;
+
+    int c = idx % out_features;
+
+    // Apply batch norm scaling and shifting
+    float temp = x_data[idx] * scale_data[c] + shift_data[c];
+
+    // Compute GELU(temp)
+    float x_pow3 = temp * temp * temp;
+    float tanh_arg = sqrtf(2.0f / M_PI) * (temp + 0.044715f * x_pow3);
+    float tanh_val = tanhf(tanh_arg);
+    float gelu_val = 0.5f * temp * (1.0f + tanh_val);
+
+    // Apply ReLU
+    out_data[idx] = fmaxf(gelu_val, 0.0f);
+}
+
+Then the wrapper function:
+
+torch::Tensor fused_batchnorm_gelu_relu_cuda(torch::Tensor x,
+                                            torch::Tensor scale,
+                                            torch::Tensor shift) {
+
+    int batch_size = x.size(0);
+    int out_features = x.size(1);
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    const int num_blocks = (batch_size * out_features + threads_per_block - 1) / threads_per_block;
+
+    // Launch the kernel
+    fused_kernel<<<num_blocks, threads_per_block>>>(
+        x.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        shift.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        out_features
+    );
+
+    return out;
+}
+
+This is the CUDA code. The kernel is launched with a grid of blocks and threads. The input tensors must be contiguous and on the same device.
+
+Now, in the Python code:
+
+We need to compile this kernel using load_inline.
+
+First, define the CUDA source code as a string:
+
+fused_kernel_source = """
+#include <torch/extension.h>
+#include <math.h>
+
+__global__ void fused_kernel(const float* x_data,
+                            const float* scale_data,
+                            const float* shift_data,
+                            float* out_data,
+                            int batch_size,
+                            int out_features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_features)
+        return;
+
+    int c = idx % out_features;
+
+    float temp = x_data[idx] * scale_data[c] + shift_data[c];
+
+    float x_pow3 = temp * temp * temp;
+    float tanh_arg = sqrtf(2.0f / M_PI) * (temp + 0.044715f * x_pow3);
+    float tanh_val = tanhf(tanh_arg);
+    float gelu_val = 0.5f * temp * (1.0f + tanh_val);
+
+    out_data[idx] = fmaxf(gelu_val, 0.0f);
+}
+
+torch::Tensor fused_batchnorm_gelu_relu_cuda(torch::Tensor x,
+                                            torch::Tensor scale,
+                                            torch::Tensor shift) {
+    int batch_size = x.size(0);
+    int out_features = x.size(1);
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    const int num_blocks = (batch_size * out_features + threads_per_block - 1) / threads_per_block;
+
+    fused_kernel<<<num_blocks, threads_per_block>>>(
+        x.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        shift.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        out_features
+    );
+
+    return out;
+}
+"""
+
+Then the corresponding header (cpp_sources):
+
+fused_kernel_cpp_source = """
+torch::Tensor fused_batchnorm_gelu_relu_cuda(torch::Tensor x,
+                                            torch::Tensor scale,
+                                            torch::Tensor shift);
+"""
+
+Then, compile it:
+
+fused = load_inline(
+    name="fused_batchnorm_gelu_relu",
+    cpp_sources=fused_kernel_cpp_source,
+    cuda_sources=fused_kernel_source,
+    functions=["fused_batchnorm_gelu_relu_cuda"],
+    verbose=True,
+)
+
+Now, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        # Keep the batch_norm module to access its parameters
+        self.batch_norm = nn.BatchNorm1d(out_features)
+        self.fused = fused  # The compiled kernel
+
+    def forward(self, x):
+        # Linear layer
+        x = self.gemm(x)
+        
+        # Get batch norm parameters
+        running_mean = self.batch_norm.running_mean
+        running_var = self.batch_norm.running_var
+        gamma = self.batch_norm.weight
+        beta = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        # Precompute scale and shift
+        scale = gamma / torch.sqrt(running_var + eps)
+        shift = beta - (running_mean * gamma) / torch.sqrt(running_var + eps)
+
+        # Apply fused kernel
+        x = self.fused.fused_batchnorm_gelu_relu_cuda(x, scale, shift)
+
+        return x
+
+Wait, but the parameters running_mean, running_var are on the same device as the model? Since the model is on CUDA, they should be. Also, the scale and shift must be on the same device as the input x. So we need to ensure that these computations are done on the GPU.
+
+Assuming the model is on CUDA, we can do:
+
+scale = gamma / torch.sqrt(running_var + eps).cuda()
+Wait no, actually:
+
+gamma, running_var, etc. are already tensors on the same device as the model. So when the model is moved to CUDA, these parameters are already there. Therefore, the computations of scale and shift are done on the GPU.
+
+Therefore, the code should work.
+
+However, there might be a problem with the computation of scale and shift. Let me see:
+
+scale = gamma / torch.sqrt(running_var + eps)
+
+running_var and gamma are tensors of shape (out_features,). The addition with eps is element-wise. The sqrt is also element-wise.
+
+Similarly for shift:
+
+shift = beta - (running_mean * gamma) / torch.sqrt(running_var + eps)
+
+This is all element-wise operations. So the code is correct.
+
+Testing: The fused kernel is launched with the correct parameters. The output tensor is created as empty_like(x).
+
+Potential issues:
+
+- Ensure that the input x is contiguous. The kernel assumes that the input is a contiguous array. If x is not contiguous, we need to call .contiguous() on it before passing to the kernel.
+
+- The kernel's grid and block dimensions must be correctly computed. The current code uses 256 threads per block, which is standard.
+
+- The GELU implementation must match PyTorch's exact version. The code above implements the exact version.
+
+Another possible optimization: precompute the constants sqrt(2/pi) and 0.044715 as precomputed constants to save computation.
+
+Let me see:
+
+Instead of computing sqrt(2/pi) each time, compute it once:
+
+float sqrt_2_over_pi = sqrt(2.0f / M_PI);
+
+float tanh_arg = sqrt_2_over_pi * (temp + 0.044715f * x_pow3);
+
+But in CUDA, M_PI is a constant, so it can be computed at compile time.
+
+Alternatively, define a constant in the kernel:
+
+constexpr float sqrt_2_over_pi = sqrt(2.0f / M_PI);
+constexpr float a = 0.044715f;
+
+But in CUDA, constexpr might not work for functions like sqrt. So better to compute it as a constant float:
+
+const float sqrt_2_over_pi = sqrt(2.0f / M_PI);
+
+But in the kernel function, this would be recomputed each time. Alternatively, make it a constant variable outside:
+
+__constant__ float sqrt_2_over_pi = sqrt(2.0f / M_PI);
+
+Wait, __constant__ variables are device constants, but they need to be allocated in device memory. It might be overkill for a single constant.
+
+Alternatively, just compute the constants inline. Since sqrt(2/pi) is a scalar, it's negligible.
+
+Alternatively, precompute them as compile-time constants. Let's see:
+
+float sqrt_2_over_pi = sqrt(2.0f / 3.141592653589793f);
+float a = 0.044715f;
+
+But these are constants, so better to hardcode:
+
+const float sqrt_2_over_pi = 0.7978845608f; // sqrt(2/pi) ≈ 0.7978845608
+const float a = 0.044715f;
+
+This would save computation time, as the sqrt(2/pi) can be precomputed.
+
+Therefore, modifying the kernel code to use these constants:
+
+const float sqrt_2_over_pi = 0.7978845608f;
+const float a = 0.044715f;
+
+Wait, but in CUDA, you can define constants at the top of the kernel function?
+
+Wait, in the kernel function:
+
+Inside the kernel:
+
+float tanh_arg = sqrt_2_over_pi * (temp + a * x_pow3);
+
+But we need to define the constants outside the kernel. Alternatively, define them as const variables in the kernel function's scope:
+
+__global__ void fused_kernel(...){
+    const float sqrt_2_over_pi = 0.7978845608f;
+    const float a = 0.044715f;
+    ...
+}
+
+This is acceptable, as these are compile-time constants.
+
+Thus, the kernel code can be optimized by hardcoding these constants.
+
+So, updating the kernel code:
+
+Inside the kernel:
+
+    const float sqrt_2_over_pi = 0.7978845608f;
+    const float a = 0.044715f;
+
+    float x_pow3 = temp * temp * temp;
+    float tanh_arg = sqrt_2_over_pi * (temp + a * x_pow3);
+    float tanh_val = tanhf(tanh_arg);
+    float gelu_val = 0.5f * temp * (1.0f + tanh_val);
+
+This is better for performance.
+
+Additionally, in the fused kernel's wrapper function, we need to ensure that the input tensors are on the same device (GPU) and have the correct type (float). Since the model is designed to run on CUDA, and the inputs are generated by get_inputs() as CUDA tensors, it should be okay.
+
+Now, putting all together in the code.
+
+Another point: The batch norm's parameters (running_mean, running_var, gamma, beta) are stored as tensors on the GPU, so when we compute scale and shift, those tensors are already on the GPU, so the computation happens there. Therefore, no need to transfer data between CPU and GPU.
+
+Therefore, the code should be correct.
+
+Now, in the ModelNew class's forward method:
+
+The batch_norm module is kept so that its parameters can be accessed. The fused kernel replaces the batch norm, GELU, and ReLU steps.
+
+This way, the model uses the linear layer (gemm), then the fused kernel.
+
+This should give a speedup by fusing the three element-wise operations into a single kernel, avoiding multiple kernel launches and intermediate memory copies.
+
+Now, check for any possible errors:
+
+- The order of operations: batch norm, GELU, ReLU. The kernel applies them in that order.
+
+- The parameters are correctly accessed from the batch norm module.
+
+- The scale and shift are computed correctly.
+
+- The kernel is properly launched with the right grid and block dimensions.
+
+- The GELU implementation matches PyTorch's exact version.
+
+Now, the code should be correct.
+
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.batch_norm = nn.BatchNorm1d(out_features)
+        
+        # Define the fused kernel code
+        fused_kernel_source = """
+        #include <torch/extension.h>
+        #include <math.h>
+
+        __global__ void fused_kernel(const float* x_data,
+                                    const float* scale_data,
+                                    const float* shift_data,
+                                    float* out_data,
+                                    int batch_size,
+                                    int out_features) {
+            const float sqrt_2_over_pi = 0.7978845608f;
+            const float a = 0.044715f;
+            
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= batch_size * out_features)
+                return;
+
+            int c = idx % out_features;
+
+            float temp = x_data[idx] * scale_data[c] + shift_data[c];
+
+            float x_pow3 = temp * temp * temp;
+            float tanh_arg = sqrt_2_over_pi * (temp + a * x_pow3);
+            float tanh_val = tanhf(tanh_arg);
+            float gelu_val = 0.5f * temp * (1.0f + tanh_val);
+
+            out_data[idx] = fmaxf(gelu_val, 0.0f);
+        }
+
+        torch::Tensor fused_batchnorm_gelu_relu_cuda(torch::Tensor x,
+                                                    torch::Tensor scale,
+                                                    torch::Tensor shift) {
+            int batch_size = x.size(0);
+            int out_features = x.size(1);
+            auto out = torch::empty_like(x);
+
+            const int threads_per_block = 256;
+            const int num_blocks = (batch_size * out_features + threads_per_block - 1) / threads_per_block;
+
+            fused_kernel<<<num_blocks, threads_per_block>>>(
+                x.data_ptr<float>(),
+                scale.data_ptr<float>(),
+                shift.data_ptr<float>(),
+                out.data_ptr<float>(),
+                batch_size,
+                out_features
+            );
+
+            return out;
+        }
+        """
+        
+        fused_kernel_cpp_source = """
+        torch::Tensor fused_batchnorm_gelu_relu_cuda(torch::Tensor x,
+                                                    torch::Tensor scale,
+                                                    torch::Tensor shift);
+        """
+        
+        # Compile the fused kernel
+        self.fused = load_inline(
+            name="fused_batchnorm_gelu_relu",
+            cpp_sources=fused_kernel_cpp_source,
+            cuda_sources=fused_kernel_source,
+            functions=["fused_batchnorm_gelu_relu_cuda"],
+            verbose=False
+        )
+
+    def forward(self, x):
+        x = self.gemm(x)
+        
+        # Extract batch norm parameters
+        running_mean = self.batch_norm.running_mean
+        running_var = self.batch_norm.running_var
+        gamma = self.batch_norm.weight
+        beta = self.batch_norm.bias
+        eps = self.batch_norm.eps
+
+        # Precompute scale and shift
+        scale = gamma / torch.sqrt(running_var + eps)
+        shift = beta - (running_mean * gamma) / torch.sqrt(running_var + eps)
+
+        # Apply fused kernel
+        x = self.fused.fused_batchnorm_gelu_relu_cuda(x, scale, shift)
+        return x
+
+# The original get_inputs and get_init_inputs remain unchanged
+batch_size = 16384
+in_features = 4096
+out_features = 4096
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```

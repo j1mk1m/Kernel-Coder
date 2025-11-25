@@ -1,0 +1,32 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define your custom CUDA kernel here
+custom_kernel_source = """
+// Your CUDA kernel source code goes here
+"""
+
+custom_kernel_cpp_source = (
+    // Your C++ function declarations go here
+)
+
+# Compile the inline CUDA code
+custom_op = load_inline(
+    name="custom_op",
+    cpp_sources=custom_kernel_cpp_source,
+    cuda_sources=custom_kernel_source,
+    functions=["your_custom_function"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        # Initialize your layers here using custom_op if needed
+
+    def forward(self, x):
+        # Implement your forward pass using custom_op if needed
+        return x

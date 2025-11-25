@@ -1,0 +1,1 @@
+Invalid syntax error found in the provided code snippet. Please ensure that the code is correctly formatted and follows Python syntax rules.

@@ -1,0 +1,896 @@
+I want you to focus on the L1 normalization operation (x / mean(abs(x), dim=1)), which is the main computation in this model. You can either implement a fused kernel for the entire L1 normalization, or break it down into parts and replace certain components (e.g., abs, mean, divide). But make sure that the overall computation is correct. 
+
+You may choose to use CUDA streams to parallelize independent operations, but be careful about dependencies between operations. For example, the mean computation must complete before the division step. 
+
+Alternatively, you can reorganize memory access patterns to coalesce memory accesses for better performance. For example, if the input tensor is stored in row-major order, then accessing elements along rows can be more cache-friendly. 
+
+Another optimization could be to vectorize computations using CUDA intrinsics (e.g., using float4 or half4 for FP16) to process multiple elements in parallel. However, this requires the input dimensions to be multiples of the vector size. 
+
+Make sure that the optimized kernel(s) handle the reduction (mean computation) efficiently, possibly using shared memory for intermediate results to reduce global memory latency. 
+
+Additionally, ensure that your kernel is launch configured properly for the given problem size (number of threads and blocks). You should use best practices for thread block sizes (e.g., 256, 512) to maximize GPU occupancy.
+
+Alright, I need to optimize the L1 normalization operation in the given Model. The current implementation uses PyTorch's built-in functions like torch.abs, torch.mean, and division. To get a speedup, I'll create a custom CUDA kernel that fuses these operations into a single kernel. 
+
+First, I'll analyze the computation steps of L1 normalization:
+1. Compute the absolute values of each element in the input tensor.
+2. Sum these absolute values along dimension 1 to get the sum for each row.
+3. Divide each element by the mean (sum divided by the dimension size) of its row.
+
+The current approach involves multiple intermediate tensors (abs(x), sum, mean), which can be memory-intensive and slow due to multiple kernel launches. By fusing into a single kernel, I can reduce memory traffic and kernel launch overhead.
+
+I'll need to handle the reduction (sum along dim=1) efficiently. For large batch sizes and dimensions, using shared memory for the reduction steps can help. Let's plan the kernel structure:
+
+- Each thread processes a row (since dim=1 is the reduction dimension). Wait, no, actually each row (since dim=1 is the second dimension, assuming the input is (batch_size, dim)), so for each row (each batch's dim elements), compute the sum of absolute values, then divide each element by (sum / dim).
+
+Hmm, but how to parallelize this. Let me think. The input tensor is of shape (batch_size, dim). For each row (each batch element), the L1 norm is sum(abs(x_i)) over the dim elements. So for each row, each element in that row will be divided by the row's sum.
+
+So the steps per row are:
+1. Compute absolute values of each element in the row.
+2. Sum all abs values in the row to get sum_row.
+3. Divide each element by (sum_row / dim) → actually, since mean = sum / dim, so dividing by mean is equivalent to multiplying by dim/sum_row.
+
+Wait, the formula is x / mean(abs(x), dim=1, keepdim=True). The mean is sum / dim. So x / (sum / dim) = x * dim / sum.
+
+So the key is, for each row, compute sum_row = sum of absolute values of elements in that row. Then for each element in the row, compute (element * dim) / sum_row.
+
+Therefore, the problem can be structured as:
+
+For each row (each batch element in the first dimension), process the row's elements:
+
+- Compute the sum of absolute values of the row's elements.
+- Then perform the division.
+
+The challenge is efficiently computing the sum for each row and then applying it to each element.
+
+Approach for the CUDA kernel:
+
+1. Each thread block processes a row (since the rows are independent, this can be parallelized across blocks).
+
+2. Within a block, threads compute the absolute values and accumulate the sum for the row.
+
+Wait, but for large dim (like 65535), using a block per row might not be efficient. Alternatively, process the rows in a way that each block handles multiple rows, or each row is handled by a block.
+
+Let me think in terms of thread and block configuration.
+
+Suppose each row is handled by a single block. The block has as many threads as needed to process the elements of the row. Since the reduction (summing the row) needs to be done per row, perhaps a block per row is manageable.
+
+The steps for a block handling a single row:
+
+- Each thread in the block processes a chunk of the elements in the row. For example, if the block has 256 threads and dim=65535, each thread can handle 65535 / 256 ≈ 256 elements.
+
+Wait, but 256 * 256 = 65536, which is close to 65535. That's manageable.
+
+But how to compute the sum:
+
+The block can first compute the absolute values of all elements in the row, store them in shared memory, then perform a reduction within the block to get the sum.
+
+Alternatively, combine the absolute and sum in a single step.
+
+Here's a possible plan:
+
+Kernel structure:
+
+- Each block is responsible for one row (each row is a batch element).
+- The block size (number of threads per block) can be chosen (like 256 or 512). For dim=65535, with 256 threads, each thread can handle about 256 elements (since 65535 / 256 ≈ 256.17). 
+
+Wait, 65535 elements divided by 256 threads gives 256 elements per thread (with some remainder). Let's see: 256 threads * 256 elements = 65536, so exactly 65535 would leave one thread with 255.
+
+But first, for each thread in the block, process their assigned elements:
+
+Each thread:
+
+- Reads their assigned elements from the input (x), computes their absolute values, and accumulates into a local sum.
+
+Then, the threads in the block perform a reduction to get the total sum for the row.
+
+Once the sum is known, each thread can then compute the normalized value for their assigned elements.
+
+This requires two passes over the elements: first to compute the absolute values and accumulate the sum, and second to perform the division.
+
+Alternatively, compute the absolute values in the first step, store them in shared memory, then compute the sum, then use the sum to compute the result.
+
+Wait, but storing in shared memory might be necessary for the reduction step.
+
+Alternatively, use shared memory to accumulate the partial sums from each thread.
+
+So here's a detailed plan for the kernel:
+
+Kernel per row:
+
+1. Each block handles one row (each block processes a single row).
+
+2. The block has N threads (e.g., 256). Each thread is responsible for a chunk of the row's elements (each thread handles dim / N elements).
+
+3. For each thread in the block:
+
+   a. Load their chunk of elements from global memory (x's row).
+
+   b. Compute absolute values of each element in their chunk.
+
+   c. Sum those absolute values locally (per thread).
+
+4. Use shared memory to perform a block-wide reduction of all the partial sums from each thread to get the total sum_row.
+
+5. After the reduction, each thread then computes their chunk's normalized values:
+
+   a. For each element in their chunk: result_element = (original_element * dim) / sum_row
+
+   b. The dim is a constant (since it's the size of the dimension being normalized).
+
+   Wait, but the original element is x's element. Wait, actually, the formula is (x_element) / mean_abs, where mean_abs = sum_row / dim. Therefore, the normalized value is x_element / (sum_row / dim) = x_element * (dim / sum_row).
+
+   So, the division is done with the original x's elements (not the absolute values, except for the denominator).
+
+Wait, this is a key point. The numerator is the original x's element (with its sign), but the denominator is the mean of the absolute values. So the normalization is applied to each element's original value, divided by the mean of the absolute values of the row.
+
+Therefore, the steps are:
+
+- For each row:
+
+   a. Compute sum of absolute values of elements in the row (sum_row).
+
+   b. For each element in the row: result = x_element * dim / sum_row.
+
+Therefore, in the kernel, after computing the absolute values (to compute the sum), the actual computation uses the original x's elements (with their signs) for the numerator. Wait, but in the first step, do we need to store the absolute values? Or can we compute them on the fly?
+
+Wait, no. The absolute values are only needed for computing the sum_row. The actual computation of the normalized value uses the original x's elements (so their signs are preserved in the numerator). Therefore, in the first step, when we process each element, we can compute the absolute value for the sum, but keep the original value for later use.
+
+But this requires storing the original elements. However, since the input is read-only, we can read the original values again when computing the normalized result. But that would involve reading the same data twice. Alternatively, we can store the original elements in shared memory temporarily, but that may not be efficient.
+
+Hmm, so perhaps the steps are:
+
+- Each thread processes their chunk of the row's elements. For each element in their chunk:
+
+   i. Read x_element (original value).
+
+   ii. Compute abs(x_element) and add to the thread's partial sum.
+
+   iii. Also store the original x_element in a local array (if needed for the second pass). But storing might be expensive.
+
+Alternatively, during the first pass (summing the absolute values), we can just compute the partial sums, and then in the second pass (computing the normalized values), read the original elements again from global memory. This would require two reads from global memory for each element, but might be manageable.
+
+Alternatively, for each thread, during the first pass, they can keep track of their original elements in registers (but that's not feasible if the chunk is large).
+
+Hmm. Let's consider that the first step is to compute the sum_row, then the second step is to compute the normalized values using the original elements. Since the two steps can be done in sequence by the same threads, perhaps the second pass can re-read the original elements from global memory. The downside is two global memory reads, but for large dim (like 65535), the cost of global memory access might be mitigated by coalesced access.
+
+Alternatively, use shared memory to cache the original elements. But with dim=65535 and block size 256, each thread would need to store 256 elements (for example), which would require 256 * 4 bytes (float) per thread, leading to 1KB per thread, which is way too much. Shared memory per block is limited (typically 48 or 96KB per SM), so 256 threads * 1KB would be 256KB, which exceeds the shared memory available. So that's not feasible.
+
+Thus, the best approach is:
+
+- First, compute the partial sums of absolute values for each thread's chunk.
+
+- Do a block reduction to get sum_row.
+
+- Then, each thread processes their chunk's elements again, this time reading the original elements from global memory, applying the normalization, and writing to the output.
+
+This requires two passes over the elements in global memory, but the kernel can be structured to minimize divergence.
+
+Now, let's think about the kernel code structure:
+
+First, for the block processing a single row:
+
+- The row's index is determined by the block index. Since the batch size is 32768, the grid size would be batch_size, with each block handling one row.
+
+Wait, the batch size is 32768, so the grid would have 32768 blocks. Each block handles one row. Each block has, say, 256 threads. So total threads would be 32768 * 256, which is manageable as long as the GPU has enough resources.
+
+Now, within each block:
+
+Each thread is assigned a chunk of elements from the row.
+
+Let's define:
+
+dim = 65535
+
+blockDim.x = 256 (number of threads per block)
+
+Each thread's chunk size = (dim + blockDim.x - 1) / blockDim.x
+
+This way, each thread handles ceil(dim / 256) elements.
+
+Wait, for 65535 elements with 256 threads:
+
+65535 / 256 ≈ 255.996, so each thread would handle 256 elements except the last few.
+
+Wait, 256 * 256 = 65536, so with 65535 elements, the last thread would handle 255 elements.
+
+So each thread processes a chunk of up to 256 elements.
+
+Now, in the first phase:
+
+Each thread reads their chunk of the row's elements, computes the absolute values, and accumulates the sum.
+
+The code steps:
+
+1. Each thread loads their chunk's elements from global memory (x is the input tensor).
+
+Wait, the input tensor is of shape (batch_size, dim), so for a given row (blockIdx.x), the elements start at offset blockIdx.x * dim.
+
+Each thread's starting index within the row is threadIdx.x * chunk_size. The chunk_size is (dim + blockDim.x - 1) / blockDim.x.
+
+Wait, let's compute chunk_size as:
+
+int chunk_size = (dim + blockDim.x - 1) / blockDim.x;
+
+Each thread's start = threadIdx.x * chunk_size;
+
+end = start + chunk_size;
+
+But for threadIdx.x beyond (dim - 1)/chunk_size, their end may exceed dim. So the actual elements are from start to min(end, dim).
+
+Alternatively, use a loop:
+
+for (int i = threadIdx.x; i < dim; i += blockDim.x) { ... }
+
+This approach is better for variable chunk sizes. So perhaps a better way is to use a loop where each thread processes elements i = threadIdx.x + blockIdx.x * blockDim.x * ... Wait no. Since each block is handling a single row, the blockIdx.x is the row index. Within the block, the threads process the elements of the row.
+
+Therefore, for each thread in the block:
+
+for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+
+    float val = x[blockIdx.x * dim + i]; // assuming row-major order, the row is contiguous.
+
+    abs_val = abs(val);
+
+    partial_sum += abs_val;
+
+}
+
+Wait, but the input is a tensor stored in row-major. So the row is contiguous in memory, so for row blockIdx.x, the elements start at offset blockIdx.x * dim. So the element at position i in the row is at x[blockIdx.x * dim + i].
+
+Therefore, the above code would process each element in the row, with each thread handling every blockDim.x-th element.
+
+Wait, but with this approach, the chunk_size is blockDim.x. So for each thread, they process elements spaced by blockDim.x. This is a standard way of distributing elements among threads in a block.
+
+This is a more straightforward way and avoids having to compute chunk_size.
+
+Therefore, for each thread in the block, loop over their assigned elements (i = threadIdx.x, threadIdx.x + blockDim.x, ..., up to dim-1).
+
+Each iteration processes one element.
+
+This is manageable even for large dim, as the loop will have at most blockDim.x iterations, but actually for dim=65535 and blockDim.x=256, each thread would loop 256 times (since 65535 / 256 is ~256). Wait, 256 * 256 is 65536, so each thread would process 256 elements except the last thread which might process 255.
+
+Wait, for example, with dim=65535 and blockDim=256:
+
+Total threads: 256. Each thread's first index is threadIdx.x (0-255). The next index is threadIdx.x + 256, etc. The last element is 65534. The last thread (thread 255) would process 255 elements (starting at 255, then 255+256=511, ... up to 255 + 255*256 = 255 + 65280 = 65535, but since dim is 65535 (indices 0-65534), the last element would be 255 + 254*256 = let me see: 255 + (n)*256 ≤ 65534.
+
+Wait, perhaps it's better to just loop over the elements as i += blockDim.x until i < dim.
+
+So in code:
+
+float partial_sum = 0.0f;
+
+for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+
+    float val = x[blockIdx.x * dim + i];
+
+    partial_sum += abs(val);
+
+}
+
+Then, perform a block reduction to get the total sum_row.
+
+The block reduction can be done using shared memory.
+
+Allocate shared memory for partial sums:
+
+__shared__ float sdata[256]; // assuming blockDim.x is 256.
+
+Each thread writes its partial_sum to sdata[threadIdx.x].
+
+Then perform a reduction using the standard parallel reduction approach.
+
+Once the sum is in sdata[0], we can then proceed to compute the normalized values.
+
+After the reduction, each thread can then loop over their elements again to compute the normalized value.
+
+Wait, but the sum is stored in sdata[0], so after the reduction, we need to broadcast the sum to all threads in the block. So after the reduction, we can set sum_row = sdata[0], and then each thread can compute the denominator (dim / sum_row).
+
+Wait, the denominator is (dim / sum_row). Let me confirm:
+
+Original formula: x_element / (mean_abs) = x_element / (sum_row / dim) = x_element * (dim / sum_row).
+
+Yes. So the denominator is dim / sum_row.
+
+Therefore, each element's normalized value is x_element * (dim / sum_row).
+
+So once the sum_row is known, each thread can compute their chunk's normalized values as:
+
+denominator = dim / sum_row;
+
+for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+
+    float val = x[blockIdx.x * dim + i];
+
+    float normalized = val * denominator;
+
+    output[blockIdx.x * dim + i] = normalized;
+
+}
+
+This requires that the output tensor is pre-allocated.
+
+Putting this together, the kernel would have two loops: one for the sum, one for the normalization.
+
+Now, handling edge cases:
+
+- What if sum_row is zero? That could cause division by zero. But in practice, since the input is generated as random (as per get_inputs using torch.rand), it's unlikely, but perhaps we can handle it by setting sum_row to a small epsilon if it's zero. But for the purpose of this problem, perhaps we can ignore that and assume inputs are valid.
+
+Now, let's code this step by step.
+
+First, the CUDA kernel:
+
+__global__ void l1_norm_kernel(float* x, float* out, int batch_size, int dim) {
+
+    // Each block handles a row (batch element)
+    int row = blockIdx.x;
+
+    // Shared memory for partial sums
+    __shared__ float sdata[256]; // assuming blockDim.x is 256
+
+    float sum_partial = 0.0f;
+
+    // First loop: compute sum of absolute values for the row
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+
+        int idx = row * dim + i;
+
+        float val = x[idx];
+
+        sum_partial += fabsf(val); // Use fabsf for float
+
+    }
+
+    // Write partial sum to shared memory
+    sdata[threadIdx.x] = sum_partial;
+
+    __syncthreads();
+
+    // Block reduction to compute sum_row
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+
+        if (threadIdx.x < s) {
+
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    float sum_row = sdata[0];
+
+    // Broadcast sum_row to all threads (could be done via shared memory)
+    // Since only thread 0 has it, so we can read it.
+
+    __syncthreads();
+
+    float denominator = dim / sum_row;
+
+    // Second loop: compute normalized values
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+
+        int idx = row * dim + i;
+
+        float val = x[idx]; // original value (with sign)
+
+        float normalized = val * denominator;
+
+        out[idx] = normalized;
+
+    }
+
+}
+
+Wait, but in the first loop, after writing to sdata[threadIdx.x], we need to synchronize before the reduction steps. The __syncthreads() after the first loop is correct.
+
+Then, after reduction, the sum_row is in sdata[0].
+
+Then, after __syncthreads() again, since the threads may have diverged during the reduction steps.
+
+Wait, actually, after the reduction loop, after the last __syncthreads(), the sum_row is in sdata[0], and all threads have the same view of shared memory.
+
+So each thread can access sdata[0].
+
+Therefore, the denominator can be computed as dim / sdata[0].
+
+Wait, but each thread can compute denominator as (dim / sum_row), since sum_row is sdata[0]. So each thread can compute denominator = dim / sdata[0].
+
+Wait, but sdata[0] is the sum_row. So yes.
+
+But we need to ensure that all threads have the same value of sum_row. Since after the reduction, sdata[0] holds the total sum_row, and after __syncthreads(), all threads can read it.
+
+Therefore, the code seems okay.
+
+Now, the kernel needs to be called with:
+
+- grid size: batch_size (since each block is a row)
+
+- block size: 256 threads per block (or another number)
+
+Now, the problem is, what if blockDim.x is not 256? The shared memory array sdata must be of size blockDim.x. So in the kernel code, we can declare it dynamically? No, in CUDA, the shared memory size must be known at compile time. Therefore, the blockDim.x must be a compile-time constant, so the kernel must be written with a fixed blockDim.x, or we need to use template code. Alternatively, use a larger shared memory array and only use up to blockDim.x elements.
+
+Alternatively, to make it more flexible, perhaps we can use a template parameter for blockDim.x. But in this case, since the user will compile with a specific block size, perhaps we can set it to 256.
+
+Alternatively, since in the problem statement, the user can choose the block size, so in the code, we can fix it to 256.
+
+Therefore, in the code above, the shared memory array is size 256, assuming blockDim.x is 256. So when launching the kernel, we must set the block size to 256.
+
+Now, let's think about the host-side code.
+
+The function to call the kernel would need to:
+
+- Allocate the output tensor.
+
+- Launch the kernel with the correct grid and block dimensions.
+
+- Handle any necessary error checking.
+
+So in Python, the code would be something like:
+
+def l1_norm_cuda(x: torch.Tensor) -> torch.Tensor:
+
+    batch_size, dim = x.shape
+
+    out = torch.empty_like(x)
+
+    # Launch kernel
+    threads_per_block = 256
+
+    blocks_per_grid = batch_size
+
+    l1_norm_kernel[blocks_per_grid, threads_per_block](x.data_ptr(), out.data_ptr(), batch_size, dim)
+
+    return out
+
+Wait, but in the CUDA kernel, the dim is a parameter, so we need to pass it.
+
+But need to ensure that the kernel can handle large dim (like 65535). Since dim is an int, which is 32-bit, it's okay as long as it's under 2^31.
+
+Now, checking the code for possible errors:
+
+- The shared memory array size must be exactly blockDim.x. So if we use 256 threads per block, then sdata[256] is okay.
+
+- The reduction steps: the for loop in the block reduction starts with s = blockDim.x / 2, so for 256, s starts at 128, then 64, etc., down to 1. Each step halves the stride. That is correct.
+
+Potential issues:
+
+- If the blockDim.x is not a power of two, the reduction may not work. Since 256 is a power of two, it's okay. But if someone uses a different block size (not a power of two), the reduction may have issues. Since we are using 256, which is a power of two, it's okay.
+
+Now, testing the code:
+
+The kernel should correctly compute the L1 normalization.
+
+Now, considering the input is a tensor of shape (batch_size, dim). The kernel's first loop correctly processes each element in the row, computes the absolute value, and accumulates the sum. Then, the reduction computes the total sum, and the second loop applies the normalization.
+
+Now, the kernel's launch parameters:
+
+blockDim.x = 256.
+
+gridDim.x = batch_size (which is 32768).
+
+This is acceptable as long as the GPU can handle that many blocks (modern GPUs can handle grids up to 2^31 blocks in each dimension).
+
+Now, in terms of memory access patterns:
+
+- In the first loop, each thread accesses elements spaced by blockDim.x. So for the input x, the accesses are coalesced. Since the rows are contiguous, and threads in a warp (32 threads) will access elements that are contiguous in memory (since each warp's threads are consecutive in threadIdx.x). For example, threads 0-31 will access elements 0, 256, 512, etc., which are spaced by 256. However, since the rows are stored contiguously, this may not be coalesced. Wait, in row-major order, the elements in a row are contiguous. So the first row is elements 0 to dim-1, next row is dim to 2dim-1, etc.
+
+Therefore, when processing the first row (blockIdx.x=0), each thread's first element is threadIdx.x, so threads 0-255 will access x[0], x[1], ..., x[255] (since blockIdx.x=0, so row=0). Wait no:
+
+Wait, for the first row (row=0), the elements are from 0*dim to 0*dim + dim-1 = 0 to 65534.
+
+Each thread in the block processes elements starting at threadIdx.x, then threadIdx.x + 256, etc. So thread 0 processes 0, 256, 512,... up to less than 65535.
+
+Thread 1 processes 1, 257, 513, etc.
+
+This means that the memory accesses for the first iteration (i = threadIdx.x) are all contiguous. The next iteration (i += 256) would be 256 elements later. So the accesses for the first loop are coalesced for each warp? Not sure. Since each thread accesses a different element, the accesses are scattered, which can lead to poor coalescing. Hmm, this is a problem.
+
+Wait, the problem here is that the threads in a warp (32 threads) are accessing elements that are spaced by blockDim.x (256). So the first warp (threads 0-31) will access elements 0,1,...,31, then 256,257,...287, etc. These are contiguous in memory, so each warp's accesses are contiguous. Wait, no, for the first iteration (i=threadIdx.x), threads 0-31 access elements 0-31, which are contiguous. The next iteration (i += 256) for thread 0 would be element 256, which is after 255 elements. So the next set of elements (256-287) are also contiguous. So each warp's accesses for each iteration are contiguous, so the memory access is coalesced for each iteration. Since all threads in a warp are processing consecutive elements in their own strides, the memory accesses are coalesced.
+
+Therefore, this approach should have good memory coalescing.
+
+Now, the second loop (for the normalization) similarly accesses the same memory locations, so the same coalescing applies.
+
+Therefore, this should be efficient.
+
+Now, the next consideration is the block size. Choosing 256 is a standard size, but maybe 512 or 1024 could be better? Let's see:
+
+With block size 256, each row is processed by 256 threads. The number of threads per row is 256. The number of elements per row is 65535.
+
+Each thread handles about 256 elements, so for each element in their chunk, the thread does:
+
+- Read from global memory (for the absolute value computation)
+
+- Sum the absolute values
+
+Then, after the reduction, read again for the normalization step.
+
+The number of registers per thread may be manageable. The variables are sum_partial (1 float), and the loop indices.
+
+The shared memory usage is 256 floats (1KB per block), which is acceptable.
+
+Now, the Python wrapper code:
+
+We need to compile the CUDA kernel using load_inline. So the code structure would be similar to the example.
+
+The CUDA source code for the kernel would be:
+
+elementwise_add_source becomes l1_norm_source, and similarly.
+
+So putting it all together, here's the code:
+
+First, in the Python code, after importing, define the CUDA code:
+
+l1_norm_source = """
+#include <cuda_runtime.h>
+#include <math.h>
+
+extern "C" {
+    __global__ void l1_norm_kernel(float* x, float* out, int batch_size, int dim) {
+        int row = blockIdx.x;
+        __shared__ float sdata[256]; // Assuming blockDim.x is 256
+
+        float sum_partial = 0.0f;
+
+        // Compute partial sum of absolute values
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            int idx = row * dim + i;
+            float val = x[idx];
+            sum_partial += fabsf(val);
+        }
+
+        // Write partial sum to shared memory
+        sdata[threadIdx.x] = sum_partial;
+        __syncthreads();
+
+        // Block reduction
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                sdata[threadIdx.x] += sdata[threadIdx.x + s];
+            }
+            __syncthreads();
+        }
+
+        float sum_row = sdata[0];
+        __syncthreads();
+
+        float denominator = dim / sum_row;
+
+        // Compute normalized values
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+            int idx = row * dim + i;
+            float val = x[idx];
+            out[idx] = val * denominator;
+        }
+    }
+}
+"""
+
+l1_norm_cpp_source = """
+extern "C" {
+    void l1_norm_kernel(float*, float*, int, int);
+}
+"""
+
+Then, load the kernel using load_inline:
+
+l1_norm = load_inline(
+    name="l1_norm",
+    cpp_sources=l1_norm_cpp_source,
+    cuda_sources=l1_norm_source,
+    functions=["l1_norm_kernel"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+Then, the ModelNew class would use this kernel:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l1_norm = l1_norm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, dim = x.shape
+        # Launch kernel with block size 256
+        threads_per_block = 256
+        blocks_per_grid = batch_size
+        # Need to ensure that x is contiguous and on the same device
+        assert x.is_cuda, "Input must be on GPU"
+        out = torch.empty_like(x)
+        self.l1_norm.l1_norm_kernel(
+            x.data_ptr(),
+            out.data_ptr(),
+            batch_size,
+            dim,
+            block=(threads_per_block, 1, 1),
+            grid=(blocks_per_grid, 1, 1),
+            stream=torch.cuda.current_stream().cuda_stream
+        )
+        return out
+
+Wait, but the kernel launch in PyTorch's load_inline requires using the function returned. Wait, in the example given, the function is called as elementwise_add_cuda(a, b). So perhaps the kernel is wrapped in a Python function.
+
+Wait, in the example, the elementwise_add_cuda function was defined in the CUDA code and exposed via the functions=["elementwise_add_cuda"].
+
+But in my case, the kernel is __global__, so to call it from Python, I need to wrap it in a Python function that launches it. Alternatively, perhaps I should structure it differently.
+
+Wait, in the example, the CUDA code has a host function (elementwise_add_cuda) that launches the kernel. So perhaps I should define a similar host function for the L1 norm.
+
+Therefore, modifying the CUDA code to include a host function:
+
+l1_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void l1_norm_kernel(float* x, float* out, int batch_size, int dim) {
+    // previous code as before
+}
+
+torch::Tensor l1_norm_cuda(torch::Tensor x) {
+    auto batch_size = x.size(0);
+    auto dim = x.size(1);
+    auto out = torch::empty_like(x);
+    
+    const int threads_per_block = 256;
+    const int blocks_per_grid = batch_size;
+
+    AT_DISPATCH_FLOATING_TYPES(x.type(), "l1_norm_cuda", ([&] {
+        l1_norm_kernel<<<blocks_per_grid, threads_per_block>>>(
+            x.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            batch_size,
+            dim
+        );
+    }));
+
+    cudaDeviceSynchronize();
+    return out;
+}
+"""
+
+Wait, but this uses ATen macros like AT_DISPATCH_FLOATING_TYPES, which requires including appropriate headers.
+
+Alternatively, since the example used torch::Tensor and CUDA kernels, perhaps better to use the same approach.
+
+Wait, in the example given, the elementwise_add_cuda function is a host function that launches the kernel. So similarly, I should define a host function in the CUDA code that takes a tensor and returns the output.
+
+Therefore, modifying the CUDA code to include a host function:
+
+l1_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void l1_norm_kernel(float* x, float* out, int batch_size, int dim) {
+    // ... the kernel code as before ...
+}
+
+torch::Tensor l1_norm_cuda(torch::Tensor x) {
+    // Ensure input is contiguous and on GPU
+    x = x.contiguous();
+    auto batch_size = x.size(0);
+    auto dim = x.size(1);
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    const int blocks_per_grid = batch_size;
+
+    l1_norm_kernel<<<blocks_per_grid, threads_per_block>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    // Check for errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
+    }
+
+    return out;
+}
+"""
+
+Wait, but this assumes that the input is float. The example model uses torch.rand, which is float32, so that's okay. But for generality, perhaps better to use ATen's dispatch. However, to keep it simple, and given the problem constraints, we can proceed with assuming float32.
+
+Therefore, the host function takes a torch::Tensor x (float), and returns the output tensor.
+
+The corresponding cpp_sources should declare the function:
+
+l1_norm_cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor l1_norm_cuda(torch::Tensor x);
+"""
+
+Now, in the Python code, the load_inline would have functions=["l1_norm_cuda"], and then the ModelNew can call it:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # The loaded module is stored as self.l1_norm
+        self.l1_norm = l1_norm
+
+    def forward(self, x):
+        return self.l1_norm.l1_norm_cuda(x)
+
+Wait, but in the example, the function was imported as a function from the module. Let's check:
+
+In the example, after loading with load_inline, the elementwise_add module has a function elementwise_add_cuda.
+
+So in the code:
+
+elementwise_add = load_inline(...)
+
+Then, in the forward, it's called as elementwise_add.elementwise_add_cuda(a, b).
+
+So similarly, in this case:
+
+l1_norm = load_inline(...)
+
+Then, in the forward, the function would be l1_norm.l1_norm_cuda(x).
+
+So the code would be:
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        # The CUDA module is stored as an attribute
+        self.l1_norm = l1_norm  # the module returned by load_inline
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.l1_norm.l1_norm_cuda(x)
+
+Wait, but in the load_inline, the function is named "l1_norm_cuda", so the syntax would be self.l1_norm.l1_norm_cuda(x). However, in the example, the function was accessed via elementwise_add (the module) and the function name. So perhaps:
+
+Yes, the module (elementwise_add) has the function as an attribute. So in the code above, the "l1_norm" variable is the module, which has the function l1_norm_cuda.
+
+Therefore, the code should work.
+
+Now, checking the CUDA kernel code:
+
+The kernel's parameters are:
+
+float* x, float* out, int batch_size, int dim.
+
+The host function passes x.data_ptr<float>(), which is correct for a float tensor.
+
+The kernel uses the row index (blockIdx.x), which corresponds to the batch element.
+
+The output tensor is initialized as empty_like(x), which is correct.
+
+Now, potential issues:
+
+- The kernel may have a division by zero if sum_row is zero. To handle this, perhaps add a small epsilon, but for the problem's scope, it's assumed inputs are valid.
+
+- The blockDim.x is fixed at 256. If dim is not a multiple of 256, the loop handles it via i < dim.
+
+- The shared memory size is fixed at 256. If the block size is changed, this must be adjusted. Since we're using 256, it's okay.
+
+- The kernel uses blockIdx.x up to batch_size. If batch_size is larger than the maximum grid size (which for modern GPUs is 2^31), but given the problem's batch_size is 32768, which is well within limits.
+
+- The kernel assumes that the input is stored in row-major order. Since PyTorch uses row-major, this is correct.
+
+Now, testing the kernel for correctness:
+
+Suppose a simple case with batch_size=1 and dim=3.
+
+Input x = [[1, -2, 3]] → absolute values are [1, 2, 3], sum_row = 6 → mean = 2 → normalized values are (1/2, -2/2, 3/2) → [0.5, -1, 1.5].
+
+The kernel should compute this correctly.
+
+Another test case with dim=2, batch_size=1:
+
+x = [[4, -4]] → sum_row = 8 → mean 4 → normalized: [1, -1].
+
+Thus, the kernel should work.
+
+Now, compiling this code. The CUDA code should be correct, and the Python code should load it properly.
+
+Therefore, this should be the optimized code.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for L1 normalization
+l1_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void l1_norm_kernel(float* x, float* out, int batch_size, int dim) {
+    int row = blockIdx.x;
+    __shared__ float sdata[256]; // Shared memory for partial sums
+
+    float sum_partial = 0.0f;
+
+    // Compute partial sum of absolute values for the row
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        int idx = row * dim + i;
+        float val = x[idx];
+        sum_partial += fabsf(val);
+    }
+
+    // Write partial sum to shared memory
+    sdata[threadIdx.x] = sum_partial;
+    __syncthreads();
+
+    // Block reduction to compute sum_row
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    float sum_row = sdata[0];
+    __syncthreads();
+
+    float denominator = dim / sum_row;
+
+    // Compute normalized values
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        int idx = row * dim + i;
+        float val = x[idx];
+        out[idx] = val * denominator;
+    }
+}
+
+torch::Tensor l1_norm_cuda(torch::Tensor x) {
+    x = x.contiguous();
+    auto batch_size = x.size(0);
+    auto dim = x.size(1);
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    const int blocks_per_grid = batch_size;
+
+    l1_norm_kernel<<<blocks_per_grid, threads_per_block>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
+    }
+
+    return out;
+}
+"""
+
+l1_norm_cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor l1_norm_cuda(torch::Tensor x);
+"""
+
+# Compile the inline CUDA code for L1 normalization
+l1_norm = load_inline(
+    name="l1_norm",
+    cpp_sources=l1_norm_cpp_source,
+    cuda_sources=l1_norm_source,
+    functions=["l1_norm_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l1_norm = l1_norm  # Reference to the CUDA module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.l1_norm.l1_norm_cuda(x)
+```

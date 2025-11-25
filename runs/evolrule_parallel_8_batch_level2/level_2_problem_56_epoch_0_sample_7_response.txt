@@ -1,0 +1,627 @@
+The code you write should work on CUDA and be compatible with PyTorch 2.0.0. Also, make sure to use the same batch_size, input_size, hidden_size, get_inputs, and get_init_inputs as in the original code. The new architecture must have the same outputs as the original architecture (up to numerical precision errors).
+Okay, let's tackle this problem. The user wants to optimize the given PyTorch model using custom CUDA kernels. The original model has a linear layer followed by a sigmoid and then a sum. The goal is to replace some of these operations with custom CUDA kernels for better performance.
+
+First, I need to understand the operations in the forward pass. The linear layer does a matrix multiplication (x @ weight^T + bias). Then, the sigmoid activation is applied, and finally, the sum over dimension 1.
+
+The candidate operations for optimization are the linear layer (matmul + add), the sigmoid, and the sum. Since matrix multiplication is compute-heavy, that's a prime candidate. However, the standard PyTorch implementation uses optimized CUDA kernels already, so maybe fusing the linear and sigmoid into a single kernel could help reduce memory accesses and overhead.
+
+Alternatively, the sum operation is a reduction. Maybe fusing all three operations into a single kernel could be better. Let me think: if I can combine the matrix multiply, sigmoid, and summation into one kernel, that would minimize memory transfers between GPU and RAM, and reduce kernel launch overhead.
+
+Let's break down the steps:
+
+1. Matrix multiplication: x (batch, input_size) * weight (input_size, hidden_size) -> (batch, hidden_size). Then add bias.
+2. Apply sigmoid to each element of the result.
+3. Sum each row (dim=1) to get (batch, 1).
+
+If I can do all three steps in one kernel, that might be efficient. But how?
+
+Wait, the sum is over the hidden dimension. The sigmoid is element-wise, so the order matters. The sum can be done after the sigmoid, so the steps are sequential. But combining the linear (matmul + add) and sigmoid into one kernel might be feasible. Then, the sum can be done in a separate kernel or even fused further.
+
+Alternatively, maybe the sum can be done during the sigmoid step? Let me see:
+
+The linear layer's output is (batch, hidden_size). Applying sigmoid is element-wise. Then summing along the hidden dimension. If I can compute the matrix multiply, apply sigmoid, and accumulate the sum in a single step, that would be ideal.
+
+Wait, the matrix multiplication is the most time-consuming part. Let me see the dimensions. The input size and hidden size are both 32768, so the weight matrix is 32768x32768. That's a huge matrix. The input x is 128x32768. The multiplication would produce 128x32768 outputs. Applying sigmoid and then summing each row to get 128x1.
+
+Hmm. The matrix multiplication is going to be the bulk of the computation. Let's see the number of operations. The matmul between 128x32768 and 32768x32768 would be O(128 * 32768^2) operations. That's 128*(3e4)^2 ≈ 1.3e11 FLOPs. The sigmoid and sum would be O(128*3e4) each, which is negligible in comparison. So the main optimization should target the matrix multiplication.
+
+Wait, but the standard PyTorch implementation uses cuBLAS for the matmul, which is highly optimized. So maybe replacing that with a custom kernel won't help. However, perhaps if we can fuse the matmul with the sigmoid and the sum, we can save some memory copies and computation.
+
+Alternatively, maybe the bias addition can be incorporated into the matmul kernel. Let me think about how to structure this.
+
+Another approach: The sum over the hidden dimension after applying sigmoid can be considered as integrating the sigmoid and the sum into one step. Since the sum is over the entire hidden dimension, each element is first passed through sigmoid and then added together. So for each row in the output, the sum is sum_{j=1 to H} sigmoid( (x * W)[i,j] + bias[j] )
+
+So perhaps we can compute each element's contribution to the final sum in a single pass. That would require:
+
+For each element in the input x, compute the dot product with each row of the weight matrix, add the bias, apply sigmoid, and accumulate into the output's batch element.
+
+Wait, the matrix multiplication x @ W gives a batch of vectors. Each element in that vector is a dot product between x and the corresponding column of W. Wait, no: the result of x (B, I) * W (I, H) is (B, H). Each element (b, h) is sum_{i} x[b,i] * W[i,h]. Then add bias[h].
+
+Hmm, but if we need to compute for each (b, h), compute that value, apply sigmoid, then sum over h. So the total for each b is sum_h sigmoid( (sum_i x[b,i] * W[i,h]) + bias[h] )
+
+To compute this, perhaps we can structure the computation as follows:
+
+For each batch element b, and each hidden unit h, compute the activation, then accumulate into the sum for that batch. So for each batch, the output is a scalar (the sum over h of the sigmoid terms).
+
+Wait, the output is (batch_size, 1). So the sum over h for each b is the scalar.
+
+Therefore, the entire computation can be thought of as a reduction over h of the sigmoid terms. So maybe we can compute the sum during the computation of the sigmoid terms.
+
+This might allow us to avoid storing the entire (B, H) matrix, which is 128 x 32768 = 4,194,304 elements (about 16MB if using 32-bit floats). But if H is 32768, that's manageable, but perhaps avoiding storing that intermediate could save memory and time.
+
+Wait, but if we can compute the sum on the fly, we can avoid storing the entire matrix. Let's see:
+
+The plan:
+
+For each batch element b in B:
+
+sum_{h=0 to H-1} sigmoid( (x[b] * W[:,h]) + bias[h] )
+
+Here, x[b] is a vector of length I (input_size, 32768). W[:,h] is the h-th column of W (since W is I x H). So the dot product x[b] ⋅ W[:,h] plus bias[h] gives the pre-activation for h. Then apply sigmoid, then sum all h.
+
+Therefore, for each batch element, the total is the sum over h of the sigmoid of (x[b] · W[:,h] + bias[h]).
+
+To compute this efficiently, we can loop over each batch, then for each h in H, compute the term and accumulate.
+
+However, the problem is that H is 32768, so for each batch element, we have to loop over 32768 terms. That's a lot of operations, but maybe in parallel?
+
+Alternatively, let's see if we can express this as a matrix operation. Wait, but the sum is over h, so perhaps the entire computation can be optimized as follows:
+
+The final sum over h of sigmoid( xW + b ) can be written as the sigmoid applied element-wise, then summed over h. Since the sigmoid is applied element-wise, it's equivalent to sum over h (sigmoid( (xW)_{b,h} + b_h )). 
+
+The problem is that the standard approach requires computing the entire matrix xW + b, then applying sigmoid and summing. The memory cost is O(B*H), which for B=128 and H=3e4 is about 16MB, which is manageable, but if we can avoid storing that, perhaps we can save memory and time.
+
+Alternatively, the custom kernel can compute the sum on the fly without storing the intermediate matrix.
+
+So here's the idea: create a CUDA kernel that, for each batch element, computes the sum over h by iterating over each h, and for each h, compute the dot product of x[b] and W's column h, add bias[h], apply sigmoid, and accumulate into the sum for b. This way, we don't store the entire matrix, just the sum.
+
+But doing this naively in CUDA might be slow because the dot product for each h would require accessing all elements of x[b], which is 32768 elements. So for each h, you have to loop through all the I elements of x's row.
+
+Wait, but the weight matrix is I x H. So for each h, the column is W[:, h], which is a vector of length I (32768). So for each h, the dot product with x[b] is sum_{i} x[b][i] * W[i][h].
+
+But if we have to do this for each h, it's O(B * H * I) operations. That's 128 * 32768 * 32768 ≈ 1.3e11 operations, which is the same as the matrix multiplication. But the matrix multiplication is optimized in cuBLAS. However, in the standard approach, the matrix multiplication is done first, which is O(B * H * I) FLOPs, then the sigmoid is O(B*H), then the sum is O(B*H). So the majority is the matrix multiplication.
+
+Therefore, perhaps the best approach is to just use the standard linear layer, but then fuse the sigmoid and sum into a single kernel. Let's see:
+
+After the matrix multiplication (which is done by the existing linear layer), we can have a custom kernel that takes the (B, H) tensor, applies sigmoid to each element, then sums along the H dimension. This would reduce the memory accesses and eliminate a kernel launch (since we can do both operations in a single kernel). That might be a good optimization.
+
+Alternatively, if we can combine the matrix multiply, sigmoid, and sum into one kernel, we can save the intermediate storage and reduce memory usage.
+
+Alternatively, let's see if we can do that.
+
+Let me think of the steps again:
+
+The standard approach:
+
+1. Compute y = x @ W + bias (shape BxH)
+2. Apply sigmoid to each element of y (element-wise) → BxH
+3. Sum along axis 1 → Bx1
+
+The total memory is storing y (BxH) and the result (Bx1). The intermediate storage is BxH.
+
+If we can combine steps 2 and 3 into one kernel, then we can avoid storing the entire y tensor. Wait, but we still need to compute the elements of y to apply the sigmoid and sum them. Unless the sum can be computed in a way that doesn't require storing all the elements, but in this case, since the sigmoid is applied element-wise, each element must be processed before summing. So perhaps the best we can do is compute the sigmoid and sum in a single kernel, thus saving the memory of the BxH tensor.
+
+Wait, no. Because the matrix multiplication is the first step, which requires that memory. Unless we can compute the matrix multiplication and the subsequent steps in a single step without storing the intermediate.
+
+Alternatively, let's think of the entire computation as:
+
+For each element in the batch (b in 0..B-1):
+
+result[b] = sum_{h=0 to H-1} sigmoid( (x[b] · W[:,h] + bias[h]) )
+
+So the question is, can we compute this without ever storing the entire y matrix?
+
+This would require computing each term of the sum on the fly and accumulating it. To do this, we need to loop over all h for each b, compute the dot product x[b] · W[:,h], add bias[h], apply sigmoid, and add to the result.
+
+But this approach would require for each b, H iterations, each requiring I multiplications and additions. That's O(B*H*I) operations, which is the same as the matrix multiply. However, the matrix multiply is optimized in cuBLAS, which is highly optimized. So perhaps this approach is slower, but avoids the memory for the y tensor.
+
+Alternatively, if we can compute the dot product for all h in a vectorized way.
+
+Wait, perhaps we can compute for each batch element and each h, the term in parallel. Let me think in terms of CUDA threads.
+
+Suppose we have a grid of blocks, each block processes one batch element. Within each block, there are H threads, each processing one h. For each h, the thread would need to compute the dot product between x[b] and W[:,h], add bias[h], apply sigmoid, and then accumulate into the result[b]. But the dot product for each h requires accessing all I elements of x[b], which could be a problem for memory access patterns.
+
+Alternatively, for each h, the dot product can be computed as a reduction over the input features (I elements). So for each batch element and h, we need to compute the sum of x[b][i] * W[i][h] over i from 0 to I-1. Then add bias[h], apply sigmoid, then add to the total.
+
+This seems computationally intensive. However, perhaps this can be done more efficiently by reorganizing the computation. Let's see:
+
+The dot product for h is sum_{i} x[b][i] * W[i][h]. This can be written as W[:,h] · x[b]. Since W is a matrix of size I×H, each column is W's column h.
+
+The problem is that for each h, we need to loop over all I elements of x[b], multiply by W's corresponding element, then accumulate. Since I is 32768, that's a lot of loops. Doing this in a naive way would be slow, as each thread would have to process I elements for each h, leading to O(I * H) operations per batch element, which is 32768 * 32768 per batch element, which is 1e9 operations per batch element. For 128 batches, that's 1.2e11 operations, which might be too much.
+
+Alternatively, if we can compute the matrix multiplication using cuBLAS, then do the element-wise sigmoid and sum, that might be faster. The standard approach would be better in terms of FLOPs because the matrix multiply is done efficiently.
+
+Hmm, so maybe the best optimization is to fuse the sigmoid and the sum into a single kernel, thus avoiding the need to store the intermediate B×H tensor. Let's see:
+
+The current standard approach requires storing the B×H tensor. If we can compute the sigmoid and sum in a single kernel, we can save that memory. Let's see how:
+
+The kernel would take as input the output of the linear layer (the B×H tensor), apply sigmoid to each element, and then sum along the rows. But the problem is that the linear layer's output is already stored, so the memory is still used. Alternatively, if we can combine the linear layer's computation with the sigmoid and sum, but without storing the intermediate.
+
+Alternatively, perhaps we can use PyTorch's native functions which may already be optimized. For example, the sum of the sigmoid could be expressed as:
+
+torch.sum(torch.sigmoid(linear_output), dim=1, keepdim=True)
+
+But maybe we can write a custom kernel that does this in a single step, which might be faster than two separate operations (sigmoid followed by sum).
+
+So let's consider writing a kernel that takes the linear output (B×H), applies sigmoid to each element, then sums along the rows.
+
+The steps for the kernel would be:
+
+- For each element in the linear output, compute sigmoid.
+- For each row (batch element), accumulate the sum of the sigmoid values in that row.
+
+This can be done in a single kernel with the following approach:
+
+Each thread block can handle one row (since the batch is 128, which is manageable). Each block processes one row. Within the block, each thread handles a chunk of the H elements.
+
+Wait, let's think in terms of threads. Suppose we have a grid of 128 blocks (one per batch element). Each block has a number of threads (e.g., 256 threads). The H dimension is 32768. Each thread in the block processes H / 256 elements (approx 128 elements per thread). Each thread computes the sigmoid of its elements and adds to a local partial sum. Then, the block's threads perform a reduction to get the total sum for that row.
+
+This approach would be more efficient than doing it in two steps because it avoids a separate kernel for the sigmoid and then another for the sum. Also, it can be done in parallel across the batch elements.
+
+Therefore, the plan is:
+
+- Keep the linear layer as is (since it uses cuBLAS, which is optimized), but then replace the sigmoid and sum with a custom fused kernel.
+
+Alternatively, maybe the linear layer can also be fused with the sigmoid and sum. But let's see.
+
+First, let's try fusing the sigmoid and sum.
+
+So, let's first proceed to write the custom kernel for the sigmoid and sum.
+
+The kernel would take the input tensor (B×H), and output a B×1 tensor.
+
+The code outline would be:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void sigmoid_sum_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int hidden_size
+) {
+    // Each block handles one batch element
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    // Each thread in the block handles a portion of the hidden_size
+    int tid = threadIdx.x;
+    __shared__ float shared_data[BLOCK_SIZE]; // Maybe not needed, depends on implementation
+
+    float sum = 0.0f;
+    for (int h = tid; h < hidden_size; h += blockDim.x) {
+        float val = input[b * hidden_size + h];
+        val = 1.0f / (1.0f + expf(-val)); // Sigmoid
+        sum += val;
+    }
+
+    // Now, perform a reduction within the block to get the total sum
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (tid < s) {
+            sum += shared_data[tid + s]; // Wait, need to use shared memory or something?
+            // Maybe better to use warp-level reductions, but for simplicity here, let's think of a block-level reduction.
+
+        }
+    }
+    // Only thread 0 writes the result
+    if (tid == 0) {
+        output[b] = sum;
+    }
+}
+
+Wait, but this code is a bit rough. Let's think again. The shared memory approach might be better.
+
+Alternatively, use a block reduction:
+
+Each block handles a batch element. Each thread processes a chunk of hidden_size elements, computes the sigmoid and accumulates their sum locally. Then, they perform a reduction in the block to get the total sum for that batch.
+
+Here's a better approach:
+
+Each block has blockDim.x threads. For each block (batch element), each thread processes a portion of the hidden_size elements. Each thread's partial sum is stored in shared memory, then a reduction is done within the block to compute the total.
+
+So the steps:
+
+1. Each block is assigned to a batch element (b).
+
+2. Each thread in the block processes a set of h indices (hidden units).
+
+3. For each h assigned to the thread, compute the sigmoid of input[b][h] and accumulate into a private variable.
+
+4. Use shared memory to accumulate the partial sums from all threads in the block.
+
+5. Then perform a reduction in shared memory to compute the total sum for the batch element.
+
+6. The first thread (tid 0) writes the result to output[b].
+
+Implementing this requires:
+
+- A shared memory array to hold each thread's partial sum.
+
+- Each thread first processes its assigned h's, computes the sigmoid and accumulates the sum into a private register.
+
+Wait, actually, for each h in the thread's range, they compute the sigmoid and add it to a private sum. Then, they store their partial sum into shared memory. Then, the reduction step in the block can sum all the partial sums.
+
+So code outline:
+
+__global__ void sigmoid_sum_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int hidden_size
+) {
+    extern __shared__ float sdata[];
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    // Each thread processes some hidden elements
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+
+    float sum = 0.0f;
+    for (int h = tid; h < hidden_size; h += nthreads) {
+        float val = input[b * hidden_size + h];
+        val = 1.0f / (1.0f + expf(-val));
+        sum += val;
+    }
+
+    // Write partial sum to shared memory
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Now perform reduction in shared memory
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[b] = sdata[0];
+    }
+}
+
+This requires that the block size is a power of two. So the kernel is launched with a block size of, say, 256. The shared memory size is blockDim.x * sizeof(float).
+
+This way, for each batch element (each block), we process all hidden units in parallel across threads, compute the sigmoid and accumulate, then do a reduction.
+
+The size of the block would need to be chosen such that it fits within the SM's capacity, and that the hidden_size is large enough to justify the parallelism. Since hidden_size is 32768, even with 256 threads, each thread would process about 128 elements. That should be manageable.
+
+So this kernel can be written and used to replace the two operations (sigmoid and sum) in the original model.
+
+Therefore, the steps in the new ModelNew class would be:
+
+- Keep the linear layer (nn.Linear) as is.
+
+- Then, replace the sigmoid and sum with a custom kernel.
+
+So the forward function becomes:
+
+def forward(self, x):
+    x = self.linear(x)
+    # Apply custom sigmoid_sum kernel
+    return self.sigmoid_sum(x)
+
+Thus, the custom kernel would need to take the output of the linear layer (a BxH tensor), and return Bx1.
+
+Now, let's code this.
+
+First, the CUDA code for the kernel:
+
+elementwise_add_source was the example, but here we need the sigmoid_sum kernel.
+
+The code would look something like:
+
+sigmoid_sum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void sigmoid_sum_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int hidden_size
+) {
+    extern __shared__ float sdata[];
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+
+    float sum = 0.0f;
+    for (int h = tid; h < hidden_size; h += nthreads) {
+        float val = input[b * hidden_size + h];
+        val = 1.0f / (1.0f + expf(-val));
+        sum += val;
+    }
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[b] = sdata[0];
+    }
+}
+
+torch::Tensor sigmoid_sum_cuda(torch::Tensor input, int hidden_size) {
+    auto batch_size = input.size(0);
+    auto output = torch::empty({batch_size, 1}, input.options());
+
+    int threads_per_block = 256;
+    int blocks_per_grid = batch_size;
+
+    // The shared memory per block is blockDim.x * sizeof(float)
+    size_t shared_mem_size = threads_per_block * sizeof(float);
+
+    sigmoid_sum_kernel<<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        hidden_size
+    );
+
+    return output;
+}
+"""
+
+Then, the corresponding CPP header:
+
+sigmoid_sum_cpp_source = """
+torch::Tensor sigmoid_sum_cuda(torch::Tensor input, int hidden_size);
+"""
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.linear = nn.Linear(input_size, hidden_size)
+        self.sigmoid_sum = load_inline(...)
+
+    def forward(self, x):
+        x = self.linear(x)
+        # Get hidden_size from the linear layer's out_features
+        hidden_size = self.linear.out_features
+        return self.sigmoid_sum.sigmoid_sum_cuda(x, hidden_size).view(-1, 1)
+
+Wait, but in the original code, the hidden_size is a parameter passed to the model's __init__, so the new model would need to take input_size and hidden_size as parameters. So the __init__ in ModelNew would require those.
+
+This approach would replace the sigmoid and sum with a single kernel, which may be faster than doing them separately. The advantage is that it reduces memory traffic since it doesn't need to store the BxH tensor's intermediate values (actually, the linear layer's output is stored, but the kernel processes it in place, so maybe not, but the two steps (sigmoid and sum) are fused into one kernel, reducing the number of kernel launches and possibly memory accesses).
+
+Alternatively, if the linear layer's output is a tensor, the kernel can process it directly. So the memory for the BxH tensor still exists, but the kernel is more efficient.
+
+Another optimization: The sum can be done with a reduction over the H dimension, and the sigmoid can be applied element-wise. Using PyTorch's built-in functions, it's torch.sum(torch.sigmoid(linear_output), dim=1, keepdim=True). But perhaps the custom kernel can be faster because it combines both steps, avoiding the intermediate tensor for the sigmoid.
+
+Wait, the sigmoid is applied in-place? No, the input is read-only. The kernel computes the sigmoid and sums it, but doesn't store the intermediate sigmoid tensor. This is the key advantage: avoiding the memory for the sigmoid tensor. The original approach would require storing the BxH tensor from the linear layer, then another BxH tensor for the sigmoid, but in the custom kernel, the kernel reads the linear layer's output and computes the sum without storing the sigmoid results. Therefore, memory savings here are significant, as we avoid storing an additional 16MB tensor (for B=128 and H=32768, each tensor is ~16MB). So that's a saving of 16MB, which is useful.
+
+Therefore, this approach is better.
+
+Now, let's check the code details.
+
+In the CUDA code:
+
+The sigmoid_sum_cuda function takes the input (B, H) tensor, and the hidden_size (H). The output is (B, 1). The kernel is launched with batch_size blocks, each block for a batch element. The threads per block are 256, so shared memory size is 256 * 4 bytes = 1KB per block, which is acceptable.
+
+Now, in the Python code, the ModelNew would have to load this kernel.
+
+Wait, in the original example, the elementwise_add was loaded via load_inline. Let's structure this similarly.
+
+First, define the CUDA source and the CPP header.
+
+Then, in the ModelNew class, we need to have the linear layer and the custom kernel.
+
+Putting this all together, here's the full code:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.linear = nn.Linear(input_size, hidden_size)
+        # Define and load the custom CUDA kernel
+        sigmoid_sum_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+        #include <math.h>
+
+        __global__ void sigmoid_sum_kernel(
+            const float* input,
+            float* output,
+            int batch_size,
+            int hidden_size
+        ) {
+            extern __shared__ float sdata[];
+            int b = blockIdx.x;
+            if (b >= batch_size) return;
+
+            int tid = threadIdx.x;
+            int nthreads = blockDim.x;
+
+            float sum = 0.0f;
+            for (int h = tid; h < hidden_size; h += nthreads) {
+                float val = input[b * hidden_size + h];
+                val = 1.0f / (1.0f + expf(-val));
+                sum += val;
+            }
+
+            sdata[tid] = sum;
+            __syncthreads();
+
+            for (int s = nthreads / 2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    sdata[tid] += sdata[tid + s];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                output[b] = sdata[0];
+            }
+        }
+
+        torch::Tensor sigmoid_sum_cuda(torch::Tensor input, int hidden_size) {
+            auto batch_size = input.size(0);
+            auto output = torch::empty({batch_size, 1}, input.options());
+
+            int threads_per_block = 256;
+            int blocks_per_grid = batch_size;
+
+            size_t shared_mem_size = threads_per_block * sizeof(float);
+
+            sigmoid_sum_kernel<<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+                input.data_ptr<float>(),
+                output.data_ptr<float>(),
+                batch_size,
+                hidden_size
+            );
+
+            return output;
+        }
+        """
+        sigmoid_sum_cpp = "torch::Tensor sigmoid_sum_cuda(torch::Tensor input, int hidden_size);"
+
+        # Load the kernel
+        self.sigmoid_sum = load_inline(
+            name="sigmoid_sum",
+            cpp_sources=sigmoid_sum_cpp,
+            cuda_sources=sigmoid_sum_source,
+            functions=["sigmoid_sum_cuda"],
+            verbose=True,
+            extra_cflags=[""],
+            extra_ldflags=[""]
+        )
+
+    def forward(self, x):
+        x = self.linear(x)
+        hidden_size = self.linear.out_features
+        output = self.sigmoid_sum.sigmoid_sum_cuda(x, hidden_size)
+        return output.view(-1, 1)
+
+# Ensure the batch_size, input_size, hidden_size are same as original
+batch_size = 128
+input_size = 32768
+hidden_size = 32768
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+
+def get_init_inputs():
+    return [input_size, hidden_size]
+```
+
+Wait, but in the original problem's code, the get_inputs function returns [torch.rand(...)], but the user's code for ModelNew must also have get_inputs and get_init_inputs that match. Wait, in the problem statement, the user provided get_inputs and get_init_inputs as part of the original code. The new code must retain the same functions. Wait, the original code has:
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size]
+
+But in the new code, since the batch_size, input_size, hidden_size are defined as module-level variables (as in the original), we need to keep them the same. So in the generated code above, I have those variables at the top, which matches.
+
+Wait in the original code:
+
+The original code has:
+
+batch_size = 128
+input_size = 32768
+hidden_size = 32768
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size]
+
+So in the new code, the user must also have the same batch_size, input_size, hidden_size variables, and the same get_inputs and get_init_inputs functions. The code I wrote above does that.
+
+Wait but in the new code, the batch_size etc. are defined at the top, same as original, so that's okay.
+
+Another point: the original get_inputs returns [torch.rand(...)], but in the problem's example, the input tensors are generated on CPU. However, in the original code, the get_inputs function returns tensors on CPU (since torch.rand creates CPU tensors unless specified otherwise). But in the original example's get_inputs, they had .cuda(), but in the given problem's original code, the get_inputs does not have .cuda(). Wait, let me check the problem's given code:
+
+Looking back, the user provided the original code as:
+
+class Model(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        ...
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size]
+
+So the get_inputs function returns a tensor on CPU. However, in PyTorch, the model parameters are on the default device (usually CPU unless moved). But since the user's example had a .cuda() in get_inputs, but in this problem's code, the user's original code does not have .cuda(). Wait, but the user's instructions say that the new architecture must have the same outputs as the original, and the code should work on CUDA. So perhaps in the original code, the model and tensors are on CUDA.
+
+Wait the problem says:
+
+"When writing kernels, consider the following tips:
+
+You are given the following architecture: [the code block here]..."
+
+In that code block, the get_inputs returns [torch.rand(...)], which is CPU tensor. But the problem says the new architecture must work on CUDA. Therefore, the correct approach is to generate inputs on CUDA.
+
+Therefore, the get_inputs function in the new code should generate tensors on CUDA. Hence, in the original problem's code, the user probably intended for the inputs to be on CUDA, but the given code might have a mistake. Since the problem's example had .cuda(), I should modify the get_inputs in the new code to return CUDA tensors.
+
+Therefore, in the new code, the get_inputs function should be:
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+
+Similarly, the get_init_inputs remains as before.
+
+So the code should have that.
+
+Another thing: in the forward function of ModelNew, after calling self.sigmoid_sum.sigmoid_sum_cuda(x, hidden_size), the output is (batch_size, 1) as expected? Let's see:
+
+The sigmoid_sum_cuda returns a tensor of size (batch_size, 1)? No, looking at the code:
+
+In the kernel, the output is allocated as torch::empty({batch_size, 1}, input.options());
+
+Wait no, the code in the sigmoid_sum_cuda function is:
+
+auto output = torch::empty({batch_size, 1}, input.options());
+
+Wait no, the code says:
+
+Wait in the CUDA code:
+
+output = torch::empty({batch_size, 1}, input.options());
+
+Wait yes. So the output is of shape (batch_size, 1). But in the kernel, the output is stored as a 1D array (since the kernel writes to output[b], which is a 1D array). Wait, the output is initialized as {batch_size, 1}, so it's a 2D tensor, but when accessed as output[b], it's the first element of the second dimension. Therefore, after the kernel, the output tensor is already (batch_size, 1), so no need to .view(-1,1). Wait:
+
+Wait, in the CUDA code:
+
+output is declared as torch::empty({batch_size, 1}, input.options());
+
+The kernel's output is a pointer to the data. The output is a 2D tensor of shape (batch_size, 1). The kernel writes to output[b], which corresponds to the first element of each batch's row. Because in a 2D tensor stored in row-major, output[b] is the first element of the second dimension for batch b. Since the second dimension is size 1, that's exactly the correct position. Therefore, the output is already (batch_size, 1), so the view is unnecessary. But in the forward function, the code currently has .view(-1,1). That might be redundant, but it won't hurt. Alternatively, maybe it's needed if the kernel returns a 1D tensor.
+
+Wait, looking at the kernel code:
+
+The output is declared as {batch_size, 1}, so it's a 2D tensor. The kernel writes to output[b], which is the first element of each batch's row. Therefore, the output tensor is correct as a 2D tensor. So the return statement in the forward can just return output, and it's already (B,1). So the .view is unnecessary. But perhaps the kernel returns a 1D tensor?
+
+Wait let me recheck:
+
+The output is initialized with torch::empty({batch_size, 1}, ...), so it's a 2D tensor. The pointer output.data_ptr<float>() points to the first element. The kernel writes to output[b], so for each batch b, the value is stored in output[b][0], but since the kernel writes directly to the pointer, the memory layout is contiguous. Therefore, the output tensor is indeed (batch_size,1).
+
+Hence, the .view is not needed. So the forward should be:
+
+return self.sigmoid_sum.sigmoid_sum_cuda(x, hidden_size)
+
+But in the original code, the output is returned as a (B,1) tensor. So the code is correct.
+
+Another thing

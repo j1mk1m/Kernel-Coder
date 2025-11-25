@@ -1,0 +1,1 @@
+output = torch.ops.your_module_name.function_name(input_tensor)

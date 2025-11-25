@@ -1,0 +1,800 @@
+You may choose to replace some or all of the operators in the original architecture. You can also choose to replace multiple operators in a single kernel (e.g., fusion). For example, the first two operations (GEMM and GroupNorm) could be fused into a single kernel for better performance. 
+
+When writing kernels, consider the following tips:
+
+- Use PyTorch's extension API to write custom CUDA kernels.
+- Your kernels must be compatible with PyTorch's autograd system (i.e., implement backward passes or ensure they are differentiable via other means).
+- You may need to write custom backward kernels if you replace operators with non-differentiable custom kernels.
+- If you replace an operator with a custom CUDA kernel, make sure that the kernel is correct and provides the same output as the original operator.
+- If you choose operator fusion, ensure that the fused kernel is efficient and correct.
+- When defining your kernels, use the inline method as in the example (load_inline).
+- Remember to handle the CUDA stream properly to ensure compatibility with PyTorch's asynchronous execution.
+
+I will give you some additional information about the inputs and model parameters. The batch size is 1024, in_features is 8192, out_features is 8192, num_groups is 256, and the multiply_weight_shape is (out_features,). The input tensor shape is (batch_size, in_features).
+
+To start, let me ask: which operators in the given Model do you plan to replace or fuse, and why?
+
+The operators in the given Model are:
+
+1. GEMM (from the Linear layer): This is a matrix multiplication followed by a bias addition. It is a fundamental operation and can be optimized with fused kernels.
+2. GroupNorm: Normalization is a common operation that can be optimized by fusing with subsequent operations to reduce memory traffic and kernel launches.
+3. Swish activation (x * sigmoid(x)): Swish is an element-wise operation that can be fused with other element-wise operations for efficiency.
+4. Element-wise multiplication with a parameter (multiply_weight): Another element-wise operation that can be fused.
+5. Another Swish activation: Similarly, this can be fused with previous element-wise operations.
+
+### Plan:
+- **Fusion of GEMM + GroupNorm + First Swish + Multiply + Second Swish** into a single kernel.
+
+**Why?** 
+
+Fusing these operations into a single kernel can significantly reduce memory latency and kernel launch overhead. Each kernel launch has some overhead, so combining operations reduces the number of launches. Additionally, fusing allows intermediate results to stay in registers or shared memory, avoiding global memory accesses, which are slow.
+
+### Key Steps:
+1. **GEMM (Matrix Multiplication + Bias Addition):** The linear layer's computation is \( x = Wx + b \). Since PyTorch's Linear includes a bias, we need to handle that in our fused kernel.
+2. **GroupNorm:** Normalize the output of the GEMM across groups. GroupNorm computes mean and variance for each group of channels, then applies affine transformation (scale and bias).
+3. **First Swish:** \( x = x \times \sigma(x) \), where \( \sigma \) is the sigmoid function.
+4. **Element-wise Multiply:** \( x = x \times \text{multiply\_weight} \).
+5. **Second Swish:** Same as the first one.
+
+### Challenges:
+- **Handling the Bias in GEMM:** Need to add the bias after matrix multiplication.
+- **GroupNorm Computation:** Calculating group-wise mean and variance efficiently. This requires per-group reductions, which can be parallelized but needs careful handling of threads and shared memory.
+- **Element-wise Operations:** The subsequent element-wise operations (Swish and multiply) can be done in a straightforward thread-wise fashion.
+- **Autograd:** Since we're fusing multiple operations, we need to ensure that the gradient is correctly propagated. The simplest way is to implement a backward kernel that computes the gradient of the entire fused computation in one step. Alternatively, if the operations are differentiable and the kernel is written in a way that autograd can automatically compute gradients, but that might not be feasible. Hence, a custom backward kernel is likely necessary.
+
+### Approach:
+1. **Implement a Forward Kernel:** Fusing all the forward operations into a single CUDA kernel.
+2. **Implement a Backward Kernel:** Compute the gradients for the inputs and parameters (weight, bias of Linear, scale/bias of GroupNorm, multiply_weight, etc.) in one kernel. This is complex but necessary for efficiency.
+3. **Wrap in a PyTorch Extension:** Use the `load_inline` method to compile the kernels and expose them as PyTorch functions.
+
+### Optimization Opportunities:
+- **Memory Access:** Minimize global memory accesses by reorganizing computations to reuse data.
+- **Parallelism:** Efficient thread and block configuration for each operation.
+- **Vectorization:** Use CUDA intrinsics like `float4` or Tensor Cores if applicable.
+- **Shared Memory:** For GroupNorm's mean and variance calculations, using shared memory to store per-group data can reduce latency.
+
+Now, I will proceed to write the fused kernel and its backward counterpart.
+
+First, let me outline the steps in the forward kernel:
+
+**Forward Kernel Steps:**
+1. **GEMM (Matrix Multiply + Bias):**
+   - Compute \( y = W \cdot x + b \). Since the input is (batch_size, in_features), and the weight matrix is (out_features, in_features), this is a batched matrix multiplication.
+   - Each output element \( y_{b, c} = \sum_{k} W_{c, k} \cdot x_{b, k} + b_c \).
+   - This is a standard GEMM. However, for a single layer, we can parallelize over the output features (out_features) and batch dimension.
+
+2. **GroupNorm:**
+   - Split the channels (out_features) into `num_groups` groups. Each group has \( \text{channels_per_group} = \text{out_features} / \text{num_groups} \).
+   - For each group in each sample, compute the mean and variance.
+   - Normalize each element in the group using these statistics.
+   - Apply affine transformation (gamma and beta parameters of GroupNorm).
+
+3. **First Swish:**
+   - For each element, compute \( \text{swish1} = y_{\text{groupnorm}} \times \sigma(y_{\text{groupnorm}}) \).
+
+4. **Element-wise Multiply:**
+   - Multiply by the `multiply_weight` parameter (element-wise).
+
+5. **Second Swish:**
+   - Apply Swish again: \( \text{swish2} = \text{after_multiply} \times \sigma(\text{after_multiply}) \).
+
+**Backward Kernel Steps:**
+The backward pass needs to compute gradients with respect to all inputs and parameters. This requires backpropagating through all the steps in reverse order.
+
+1. **Second Swish Backward:**
+   - The derivative of Swish is \( \sigma(x) (1 + x (1 - \sigma(x))) \). So, the gradient from the next layer is multiplied by this term.
+
+2. **Element-wise Multiply Backward:**
+   - The gradient w.r.t. the multiply_weight is the input multiplied by the gradient from the next step.
+   - The gradient w.r.t. the input before multiply is the multiply_weight multiplied by the gradient.
+
+3. **First Swish Backward:**
+   - Similar to the second Swish, compute the derivative and propagate the gradient.
+
+4. **GroupNorm Backward:**
+   - Compute gradients w.r.t. the input to GroupNorm, and also gradients w.r.t. the gamma and beta parameters.
+
+5. **GEMM Backward:**
+   - Compute gradients w.r.t. the input x, weight matrix W, and bias b.
+
+This backward pass is quite involved. To simplify, the fused backward kernel must handle all these steps efficiently.
+
+### Implementation Considerations:
+- **Kernel Launch Parameters:** The GEMM is the most compute-intensive part. The kernel should be designed to handle it efficiently, possibly using a tiled approach for matrix multiplication to maximize cache locality and coalesced memory accesses.
+- **GroupNorm Implementation:** Efficiently compute group-wise statistics. For each sample and group, compute mean and variance. Since group size is out_features / num_groups = 8192 / 256 = 32, which is manageable in shared memory.
+- **Element-wise Operations:** These can be handled in a simple thread-per-element configuration.
+- **Autograd Integration:** The custom forward and backward functions must be wrapped in a PyTorch extension, with proper handling of inputs, outputs, and gradients.
+
+### Steps to Implement:
+1. **Write the Forward Kernel:**
+   - Structure: Each thread handles one output element for the GEMM, then proceeds to perform the subsequent operations.
+   - However, for GEMM, it's better to parallelize over the output elements (since input is batched, batch size is 1024, which is large enough to parallelize).
+   - Let's think of the GEMM as: for each batch, each output channel (out_features) is computed by a thread block or thread.
+
+Alternatively, a tiled approach for GEMM would be better for large matrices. However, given that in_features and out_features are both 8192, this might be challenging. Let's proceed with a simple per-element computation for simplicity.
+
+Wait, actually, for a fully connected layer (Linear), the matrix multiplication is between the input tensor (B x In) and the weight (Out x In), resulting in B x Out. 
+
+The GEMM can be optimized by tiling. Let me think:
+
+The standard approach for matrix multiplication is to have blocks of threads handle tiles of the matrices. However, given the problem constraints, perhaps a more straightforward approach is manageable for this fused kernel.
+
+Alternatively, for the forward pass, the GEMM can be handled with a kernel where each thread computes one element of the output matrix. Since the input is batch_size x in_features, and the weight is out_features x in_features, the output is batch_size x out_features.
+
+Each thread can compute an element (b, c) where b is the batch index and c is the output channel.
+
+The computation for each (b, c) is:
+
+output[b][c] = sum_{k=0}^{in_features-1} (input[b][k] * weight[c][k]) + bias[c]
+
+This can be parallelized with a grid of threads, where each thread handles one (b, c) pair.
+
+The size of the grid would be (batch_size * out_features). For batch_size=1024 and out_features=8192, this is 1024*8192 = ~8.4 million threads. This is feasible on a GPU with sufficient SMs.
+
+But in CUDA, the maximum number of threads per block is 1024, and the grid size is limited. However, 1024 * 8192 = 8,388,608 threads. Using 256 threads per block would require 32,768 blocks (since 8,388,608 / 256 = 32,768). The maximum grid dimension for a kernel is typically 65,535, so this is acceptable.
+
+However, for large matrices, this approach may not be the most efficient in terms of memory access patterns, but it's a starting point.
+
+Once the GEMM is computed, the subsequent operations (GroupNorm, Swish, etc.) can be done in the same kernel, as they are element-wise or group-wise.
+
+### GroupNorm Implementation in the Forward Kernel:
+After computing the GEMM output, we need to apply GroupNorm. To compute the mean and variance for each group in each sample:
+
+- The number of groups is 256, so each group has 8192 / 256 = 32 channels.
+- For each sample (b), and each group (g), compute the mean and variance over the 32 channels in that group.
+
+This requires, for each sample and group:
+
+- Sum of all elements in the group: sum = sum_{i in group} x[b][i]
+- Mean = sum / 32
+- Sum of squares: sum_sq = sum_{i in group} x[b][i]^2
+- Variance = (sum_sq / 32) - mean^2
+
+Once we have the mean and variance for each group, we can normalize each element:
+
+normalized = (x[b][i] - mean) / sqrt(variance + eps)
+
+Then apply scale and shift (gamma and beta parameters of GroupNorm).
+
+However, in PyTorch's GroupNorm, the affine parameters (gamma and beta) are of size equal to the number of channels (out_features). Each group's channels have their own gamma and beta parameters. Wait, actually, in GroupNorm, the gamma and beta are per channel, but computed per group. Specifically, the gamma and beta are applied per channel after normalization. So each group's channels share the same gamma and beta? No, actually, each channel has its own gamma and beta, but grouped into the groups. Wait, no: the gamma and beta are of size C (out_features), same as the number of channels. Each group's channels have their own gamma and beta parameters? No, the gamma and beta are per channel, but computed for each group. For example, if you have 256 groups, each with 32 channels, each of the 32 channels in a group shares the same gamma and beta? No, actually, each channel has its own gamma and beta. Wait, let me confirm:
+
+PyTorch's GroupNorm documentation says: The group normalization layer expects the input to have dimensions (N, C, *), where N is the batch size and C is the number of channels. The layer normalizes the channels into G groups. The gamma and beta parameters are per channel, so they have the same shape as the input's channel dimension (C).
+
+Wait, no. The gamma and beta are parameters of shape C, so each channel has its own gamma and beta. But during normalization, the mean and variance are computed per group, but the scaling and shifting (gamma and beta) are applied per channel. So for each group's channels, the same normalization (mean/variance) is applied, but each channel has its own gamma and beta. 
+
+Therefore, the steps for GroupNorm are:
+
+For each sample b, and for each group g (0 to G-1):
+
+- channels in group g: channels (g*32 to (g+1)*32 -1)
+- compute mean and variance for this group's channels in sample b
+- normalize each channel in the group using mean and variance
+- multiply by gamma[channel] and add beta[channel]
+
+This can be parallelized across samples and groups.
+
+Implementing this in a CUDA kernel requires, for each thread, handling a particular channel and sample. Alternatively, per group per sample.
+
+However, integrating this into the fused kernel requires that after the GEMM, the kernel proceeds to compute the group norms.
+
+### The Fused Forward Kernel Outline:
+
+The forward kernel will need to handle the following steps:
+
+1. **GEMM (Matrix Multiply + Bias):**
+   - For each output element (b, c):
+     - Compute sum_{k} W[c][k] * x[b][k] + b[c]
+
+2. **GroupNorm:**
+   - For each sample b:
+     - For each group g (0..255):
+       - Compute mean and variance for the group's channels
+       - Normalize each channel in the group
+       - Apply gamma and beta (per channel)
+
+3. **First Swish:**
+   - For each element (b, c): x = x * sigmoid(x)
+
+4. **Multiply by multiply_weight:**
+   - For each element (b, c): x *= multiply_weight[c]
+
+5. **Second Swish:**
+   - For each element (b, c): x = x * sigmoid(x)
+
+### Memory Layout:
+The input x is of shape (batch_size, in_features), weight is (out_features, in_features), and bias is (out_features). The output after GEMM is (batch_size, out_features).
+
+### CUDA Kernel Structure:
+Each thread can be responsible for a single output channel and batch. For example, each thread handles one (b, c) pair. However, since the GroupNorm requires group-wise operations, we need to compute per-group statistics. 
+
+This complicates things because for the group norm, the mean and variance are per-group per sample, so we need to collect the sums for each group.
+
+Perhaps a better approach is to split the kernel into two phases:
+
+1. **Compute the GEMM + bias and store intermediate results.**
+2. **Compute GroupNorm and subsequent activations.**
+
+But since this is a fused kernel, it's better to handle all steps in a single kernel launch. However, for the GEMM step, we can do the following:
+
+- Each thread computes an element of the GEMM output (b, c).
+
+Then, for the GroupNorm:
+
+- For each sample b, and group g, compute the mean and variance. To do this efficiently, we can use shared memory to accumulate sums per group.
+
+This requires a more complex thread organization.
+
+Alternatively, reorganize the threads so that for the GroupNorm step, threads are grouped per sample and per group.
+
+Perhaps the kernel will have to be divided into multiple stages.
+
+Alternatively, the entire kernel can be structured with two main parts:
+
+1. **GEMM and intermediate storage**
+2. **GroupNorm and activations**
+
+But given that it's a single kernel, let's see.
+
+Another idea is to have each thread handle a (b, c) pair for the entire computation chain.
+
+### Let's attempt to outline the kernel code:
+
+First, the kernel will need to handle the GEMM computation for (b, c):
+
+Each thread is assigned a (b, c) pair.
+
+The GEMM part is straightforward:
+
+for each (b, c) in grid:
+    val = 0.0
+    for k in 0 to in_features-1:
+        val += weight[c][k] * input[b][k]
+    val += bias[c]
+    // store intermediate value
+    intermediate[b][c] = val
+
+Then, after the GEMM, we need to compute the GroupNorm for this (b, c).
+
+But to compute the mean and variance for the group, we need to know which group this c belongs to. 
+
+Let group_size = out_features / num_groups = 32.
+
+group_id = c / group_size
+
+Within the group, the offset within the group is c % group_size.
+
+For each sample b and group g:
+
+The mean and variance are computed over the channels in group g for sample b.
+
+To compute these, each thread in the group can contribute to the sum.
+
+Alternatively, since each thread is handling a (b, c), it can contribute to the sum for its group.
+
+But how to accumulate the sums?
+
+Perhaps, after computing the GEMM, we can use shared memory to accumulate the sums for each group per sample.
+
+But this requires synchronization.
+
+Alternatively, use atomic operations, but that would be inefficient.
+
+Perhaps a better approach is to have each thread (b, c) compute its own contribution to the group's sum and sum_sq, then reduce those.
+
+But this is complex.
+
+Alternatively, for each (b, g):
+
+   threads compute the sum and sum_sq for group g in sample b.
+
+So, reorganizing threads for the group norm phase.
+
+This is getting complicated. Perhaps the best approach is to first write the GEMM part, then the group norm part, but within a single kernel.
+
+Alternatively, use separate kernel launches, but that would lose the fusion benefit.
+
+Hmm. Maybe it's better to proceed with writing the code step by step.
+
+First, let me consider the data layout.
+
+The input tensor is (B, In), weight is (Out, In), bias is (Out).
+
+The intermediate after GEMM is (B, Out).
+
+Then, for GroupNorm, the output is also (B, Out).
+
+The GroupNorm computation requires, for each sample (b) and group (g), the mean and variance over the group's channels.
+
+Let me think of the steps again:
+
+After GEMM:
+
+For each b in 0..B-1:
+
+   For each g in 0..G-1:
+
+       group_channels = [g*group_size, ..., (g+1)*group_size -1]
+
+       compute mean = (sum of intermediate[b, c] for c in group_channels) / group_size
+
+       compute sum_sq = sum( (intermediate[b,c] - mean)^2 for c in group_channels )
+
+       variance = sum_sq / group_size
+
+       Then, for each c in group_channels:
+
+           normalized_val = (intermediate[b,c] - mean) / sqrt(variance + eps)
+
+           normalized_val = normalized_val * gamma[c] + beta[c]
+
+So this requires per-sample and per-group reductions.
+
+To implement this in CUDA efficiently, perhaps we can use a thread block per (b, g) group.
+
+Each block handles a (b, g) group, computes mean and variance, and then normalizes each channel in the group.
+
+This way, the block can compute the sums in shared memory.
+
+Let me consider this approach.
+
+Suppose we launch a grid where each block corresponds to a (b, g) pair.
+
+Block size could be group_size (32), so each thread in the block handles one channel in the group.
+
+Each block (b, g) has group_size threads.
+
+Steps:
+
+1. Each block (b, g) loads the input channels for this group and sample into shared memory.
+
+Wait, the input for this block is the intermediate[b, c] for c in [g*group_size, ..., (g+1)*group_size -1]
+
+To compute the mean and variance:
+
+- Each thread in the block loads its own channel's value into shared memory.
+
+- Then, using parallel reduction in shared memory, compute the sum and sum of squares.
+
+- Compute mean and variance.
+
+- Then, each thread computes the normalized value for its channel.
+
+- Then apply gamma and beta.
+
+But in this approach, the first part (GEMM) would have to be done in a separate kernel. But we need to fuse everything.
+
+Hmm, perhaps we can structure the entire kernel as follows:
+
+The entire computation is split into two main phases within the kernel:
+
+Phase 1: Compute GEMM + bias for all (b, c)
+
+Phase 2: Compute GroupNorm and subsequent activations for all (b, c)
+
+But to do this within a single kernel, we need to manage both phases. Alternatively, reorganize the threads.
+
+Alternatively, we can have each thread handle a (b, c) pair, and perform all steps in sequence:
+
+For each thread (b, c):
+
+   compute gemm_val = W[c] * input[b] + bias[c]
+
+   // Then, compute group norm for this (b, c):
+
+   // Determine group of c:
+
+   group_id = c / group_size
+
+   // Now, need to compute mean and variance for group group_id in sample b
+
+   // But this requires reading all elements in the group for sample b.
+
+   // This would require a barrier and shared memory.
+
+This seems challenging because each thread needs the group's data for its own c.
+
+Perhaps a better approach is to separate the GEMM into a first part, then handle the group norm in a second part.
+
+However, given that the group norm requires information from all elements in the group for the sample, it's challenging to do this efficiently in a fused kernel unless we can store intermediate results and use shared memory.
+
+Given the time constraints, perhaps we should proceed with writing the fused kernel in a way that handles the GEMM first, then computes the group norm using shared memory for each group in each sample.
+
+Let me structure the kernel as follows:
+
+Each thread processes a single (b, c). The kernel will be divided into two main stages:
+
+1. **GEMM Computation:** Each thread computes its (b, c) element and stores it in a temporary buffer.
+
+2. **GroupNorm and subsequent activations:** For this, the threads are reorganized to process per group per sample.
+
+But this requires synchronization and reorganization.
+
+Alternatively, use a two-pass approach:
+
+- First pass: compute GEMM and store the intermediate results in a tensor.
+
+- Second pass: compute the group norm and the rest.
+
+But this would require two separate kernels, losing some of the fusion benefits.
+
+Alternatively, the group norm can be handled by having each block process a (b, g) group.
+
+Let me think of the following structure:
+
+The kernel is launched with grid dimensions (B, G), where each block handles one (b, g) group.
+
+Each block has a number of threads equal to the group size (32).
+
+In this way:
+
+Block (b, g):
+
+   group_size = 32
+
+   for each thread in the block (thread_id = 0..31):
+
+      c = g*group_size + thread_id
+
+      // Compute the GEMM for this (b, c):
+
+      val = 0.0
+
+      for k in 0..in_features-1:
+
+          val += weight[c][k] * input[b][k]
+
+      val += bias[c]
+
+      // Now store the intermediate value in a shared memory array
+
+      shared_intermediate[thread_id] = val
+
+   // Wait for all threads to compute their values
+
+   __syncthreads();
+
+   // Now compute mean and variance:
+
+   sum_val = sum of shared_intermediate[0..31]
+
+   mean = sum_val / group_size
+
+   sum_sq = 0.0
+
+   for i in 0..31:
+
+       diff = shared_intermediate[i] - mean
+
+       sum_sq += diff * diff
+
+   variance = sum_sq / group_size
+
+   // Compute the normalized values
+
+   for each thread:
+
+       idx = thread_id
+
+       x = shared_intermediate[idx]
+
+       normalized = (x - mean) / sqrt(variance + 1e-5)
+
+       normalized *= gamma[c] // where c = g*group_size + idx
+
+       normalized += beta[c]
+
+       // Apply first Swish
+
+       swish1 = normalized * (1.0 / (1.0 + exp(-normalized)))
+
+       // Multiply by multiply_weight
+
+       multiplied = swish1 * multiply_weight[c]
+
+       // Apply second Swish
+
+       swish2 = multiplied * (1.0 / (1.0 + exp(-multiplied)))
+
+       // Store the final result in output[b][c]
+
+       output[b][g*group_size + idx] = swish2
+
+This approach requires that each block handles a (b, g) group and all its channels, allowing for efficient computation of the group statistics using shared memory.
+
+This is a promising approach. Let's formalize this.
+
+### Kernel Structure:
+
+The kernel will be launched with:
+
+- gridDim.x = batch_size
+
+- gridDim.y = num_groups
+
+Each block (b, g) handles sample b and group g.
+
+Each block has blockDim.x = group_size (32).
+
+Each thread in the block handles one channel in the group:
+
+thread_id = 0..31 corresponds to channels g*32 + 0 to g*32 + 31.
+
+Each thread computes the GEMM for its channel, then participates in the reduction for the group's mean and variance.
+
+This approach is efficient because the group's data is stored in shared memory, and the computations are done within the block.
+
+### Steps in the Kernel:
+
+1. **Compute GEMM for each channel in the group:**
+   - Each thread computes val = W[c][k] * input[b][k] + bias[c], where c = g*32 + thread_id.
+
+2. **Store the intermediate values in shared memory.**
+
+3. **Compute mean and variance for the group:**
+   - Sum all val in shared memory to get the mean.
+
+   - Compute sum of squares for variance.
+
+4. **Compute normalized values using mean and variance.**
+
+5. **Apply Swish, multiply, and second Swish.**
+
+6. **Write the final result to the output tensor.**
+
+This approach is efficient and reduces global memory accesses.
+
+### Handling the GEMM computation:
+
+The GEMM for each channel is:
+
+val = 0.0
+
+for k in 0 to in_features-1:
+
+    val += weight[c][k] * input[b][k]
+
+val += bias[c]
+
+However, with in_features = 8192, this loop over 8192 elements per thread is computationally intensive and could be slow. To optimize this, we can vectorize the computation or use CUDA's matrix multiplication functions like cublas.
+
+Wait, but since this is part of a fused kernel, we can't call cublas. So need to handle it manually.
+
+An alternative approach for the GEMM computation is to load the input vector and weight row into shared memory, but this might be too memory-heavy.
+
+Alternatively, use tiled approach for matrix multiplication:
+
+But given that the input is a row vector (input[b] is of length in_features), and the weight rows are contiguous, perhaps the best way is to use a loop with proper memory access patterns.
+
+Let me see:
+
+Each thread in the block is computing the GEMM for its channel c = g*32 + tid.
+
+The weight for channel c is stored as a row: weight[c][0], ..., weight[c][in_features-1]
+
+The input is input[b][0], ..., input[b][in_features-1]
+
+So for each thread, the computation is a dot product between the input vector and the weight row for channel c.
+
+This can be optimized by using shared memory to cache the input vector for the block.
+
+Wait, but each block is processing a different sample b and group g. The input vector for sample b is needed by all threads in the block.
+
+So for each block (b, g):
+
+- Load the input vector (size in_features) into shared memory once.
+
+Then, each thread can compute its dot product using the shared input.
+
+This reduces global memory accesses for the input vector.
+
+Similarly, the weight rows for the group's channels can be loaded into shared memory, but given that the group has 32 channels and in_features is 8192, this might not be feasible.
+
+Alternatively, pre-load the input vector into shared memory:
+
+Let me see:
+
+In the block:
+
+1. Each thread loads a portion of the input vector into shared memory.
+
+2. Synchronize.
+
+3. Each thread computes its dot product using the shared input vector.
+
+This can significantly reduce memory access latency.
+
+Let's formalize:
+
+Shared memory allocation:
+
+Shared input: size in_features (8192 floats). This requires 8192 * 4 bytes = ~32KB per block. The maximum shared memory per block is typically 48KB or more, so this is feasible.
+
+Steps:
+
+In block (b, g):
+
+   // First, load the input vector into shared memory:
+
+   float *s_input = shared_input;
+
+   int tid = threadIdx.x;
+
+   // Each thread loads a portion of the input vector.
+
+   // Since in_features is 8192 and blockDim.x is 32:
+
+   // Each thread can handle 8192 / 32 = 256 elements.
+
+   for (int i = tid; i < in_features; i += blockDim.x) {
+
+       s_input[i] = input[b][i];
+
+   }
+
+   __syncthreads();
+
+   // Now, each thread computes the dot product for its channel c.
+
+   int c = g * group_size + tid;
+
+   float val = 0.0;
+
+   for (int k = 0; k < in_features; ++k) {
+
+       val += weight[c][k] * s_input[k];
+
+   }
+
+   val += bias[c];
+
+   // Store val in shared_intermediate[tid]
+
+   s_intermediate[tid] = val;
+
+   __syncthreads();
+
+   // Now proceed to compute group norm...
+
+This approach reduces the number of global memory accesses for the input vector from 8192 per thread to 8192 in total per block. This is a significant optimization.
+
+However, the weight access is still O(in_features) per thread, which is 8192 iterations per thread. This may be slow.
+
+An alternative is to tile the weight matrix. But that requires more complex indexing.
+
+Alternatively, since the weight is stored as a row-major array, the rows for the group's channels (c in g's group) are contiguous? No, each channel is a row. The weight matrix is of size (out_features, in_features). So the rows are separated by in_features elements. For a group of 32 channels, their rows are spaced by in_features elements.
+
+Therefore, the weight access pattern for the group's channels may not be contiguous.
+
+Given the time constraints, perhaps proceed with the initial approach, assuming that the GEMM loop is manageable.
+
+Now, putting all this into code.
+
+### CUDA Kernel Code:
+
+First, define the parameters:
+
+- `input`: input tensor (batch_size, in_features)
+- `weight`: weight tensor (out_features, in_features)
+- `bias`: bias tensor (out_features)
+- `gamma`: GroupNorm's scale parameter (out_features)
+- `beta`: GroupNorm's shift parameter (out_features)
+- `multiply_weight`: parameter (out_features,)
+- `output`: output tensor (batch_size, out_features)
+
+Constants:
+
+- `num_groups = 256`
+- `group_size = out_features / num_groups = 8192 / 256 = 32`
+
+The kernel code will look something like this:
+
+```cpp
+template <int GROUP_SIZE>
+__global__ void fused_kernel(
+    const float* input, const float* weight, const float* bias,
+    const float* gamma, const float* beta, const float* multiply_weight,
+    float* output,
+    int batch_size, int in_features, int out_features, int num_groups) {
+
+    int b = blockIdx.x;
+    int g = blockIdx.y;
+    int tid = threadIdx.x;
+
+    // Ensure that group_size is correct (should be out_features / num_groups)
+    const int group_size = GROUP_SIZE;
+
+    // Each thread in the block processes one channel in the group
+    int c = g * group_size + tid;
+
+    // Shared memory for input and intermediate values
+    extern __shared__ float s_data[];
+
+    float* s_input = s_data;
+    float* s_intermediate = s_input + in_features;
+
+    // Load the input vector into shared memory
+    for (int i = tid; i < in_features; i += blockDim.x) {
+        s_input[i] = input[b * in_features + i];
+    }
+    __syncthreads();
+
+    // Compute GEMM for this channel
+    float val = 0.0f;
+    for (int k = 0; k < in_features; ++k) {
+        val += weight[c * in_features + k] * s_input[k];
+    }
+    val += bias[c];
+
+    // Store intermediate value in shared memory
+    s_intermediate[tid] = val;
+    __syncthreads();
+
+    // Compute group mean and variance
+    float sum_val = 0.0f;
+    for (int i = 0; i < group_size; ++i) {
+        sum_val += s_intermediate[i];
+    }
+    __shared__ float local_sum;
+    if (tid == 0) {
+        local_sum = sum_val;
+    }
+    __syncthreads();
+    float mean = local_sum / group_size;
+
+    float sum_sq = 0.0f;
+    for (int i = 0; i < group_size; ++i) {
+        float diff = s_intermediate[i] - mean;
+        sum_sq += diff * diff;
+    }
+    __shared__ float local_sum_sq;
+    if (tid == 0) {
+        local_sum_sq = sum_sq;
+    }
+    __syncthreads();
+    float variance = local_sum_sq / group_size + 1e-5; // epsilon
+    float inv_std = rsqrt(variance);
+
+    // Compute normalized value
+    float x = s_intermediate[tid];
+    float normalized = (x - mean) * inv_std;
+
+    // Apply gamma and beta
+    normalized = normalized * gamma[c] + beta[c];
+
+    // First Swish: x * sigmoid(x)
+    float swish1 = normalized * (1.0f / (1.0f + expf(-normalized)));
+
+    // Multiply by multiply_weight
+    float multiplied = swish1 * multiply_weight[c];
+
+    // Second Swish
+    float swish2 = multiplied * (1.0f / (1.0f + expf(-multiplied)));
+
+    // Write output
+    output[b * out_features + c] = swish2;
+}
+```
+
+### Notes on the Kernel:
+
+- **Shared Memory Allocation:** The shared memory is divided into two parts: `s_input` for the input vector and `s_intermediate` for the intermediate GEMM results. The total shared memory needed is `in_features + group_size` floats. For in_features=8192 and group_size=32, this is 8224 floats, which is ~32KB (8224 * 4 bytes = 32,896 bytes). This is within typical shared memory limits (48KB per block).
+
+- **Thread Synchronization:** After loading the input into shared memory and after computing the intermediate values, threads synchronize.
+
+- **Reductions for Mean and Variance:** The sum and sum of squares are computed using a loop over the group's channels, then the sums are stored in shared memory variables (local_sum and local_sum_sq) by thread 0.
+
+- **Mathematical Operations:** The Swish function is implemented using `expf` and division. For efficiency, this could be replaced with an approximation or inline calculation, but for correctness, the standard implementation is used.
+
+- **Output Writing:** The final result is written to the output tensor at position (b, c).
+
+### Launch Configuration:
+
+The kernel is launched with:
+
+- `blockDim.x = group_size = 32` threads per block (since each block handles a group of 32 channels).
+
+- `gridDim.x = batch_size = 1024`
+
+- `gridDim.y = num_groups = 256`
+
+The shared memory size is

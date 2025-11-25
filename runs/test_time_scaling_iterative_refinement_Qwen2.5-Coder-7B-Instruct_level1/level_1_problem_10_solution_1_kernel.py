@@ -1,0 +1,40 @@
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        return torch.matmul(A, B)
+
+N = 16
+M = 1024
+K = 2048
+L = 768
+
+def get_inputs():
+    A = torch.rand(N, M, K)
+    B = torch.rand(K, L)
+    return [A, B]
+
+def get_init_inputs():
+    return []
+
+# Instantiate models
+model = Model().cuda()
+model_new = ModelNew().cuda()
+
+# Get inputs
+inputs = get_inputs()
+
+# Forward pass through original model
+output_original = model(*inputs)
+
+# Forward pass through new model
+output_new = model_new(*inputs)
+
+# Check if outputs match
+assert torch.allclose(output_original, output_new), "Outputs do not match"
+
+print("ModelNew passed all tests.")

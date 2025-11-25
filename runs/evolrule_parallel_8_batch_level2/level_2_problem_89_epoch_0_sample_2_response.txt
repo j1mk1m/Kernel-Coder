@@ -1,0 +1,874 @@
+When you write the code, you can choose any operators you want to replace. For example, you can choose to replace the Max operator (torch.max) with a custom CUDA kernel, or you can fuse multiple operators into a single kernel (e.g., fusing the softmax and subtract into a single kernel, or fusing convtranspose3d and maxpool3d, etc). You can also choose to replace multiple operators with custom kernels. The goal is to get a speedup, so choose operators that have a high computational cost or high memory traffic, and that can be efficiently parallelized on the GPU. 
+
+You should also consider the following:
+
+- Make sure the kernel is correct (i.e. same results as before)
+- Avoid redundant memory allocations and copies (for example, in-place operations where possible)
+- Optimize memory usage and kernel launch parameters
+- Use shared memory or other CUDA techniques to improve performance
+
+You can also use torch.utils.cpp_extension.load_inline for inline CUDA code.
+
+I will now attempt to optimize the given Model by creating custom CUDA kernels for some of its operations. Let me first analyze which operations might benefit the most from custom CUDA implementations.
+
+Looking at the architecture:
+
+1. ConvTranspose3d: This is a large operation with a lot of computation. However, PyTorch's implementation is likely already highly optimized. Implementing this from scratch would be very time-consuming and probably not worth it unless there's a specific optimization. Maybe fusion with the following MaxPool3d could be beneficial?
+
+2. MaxPool3d: Also a common operation, but again PyTorch's implementation is optimized. Maybe fusing with the previous layer?
+
+3. Softmax: This is a candidate for optimization. The standard softmax might have some overhead, especially in the log-softmax or along certain dimensions. Since we have a 3D tensor, the softmax is applied over channels (dim=1). Maybe a custom kernel can compute this more efficiently, especially if combined with the next subtraction step.
+
+4. Subtract: The element-wise subtraction with a parameter. Since it's a simple element-wise operation, combining it with the softmax in a single kernel would eliminate a memory copy and reduce kernel launches.
+
+5. Swish: The Swish activation (x * sigmoid(x)). This is an element-wise operation. Combining this with the next step (max) might be possible?
+
+6. Max: The max along a dimension (dim=1). This is a reduction operation which can be optimized with a custom kernel.
+
+Considering the above, I think the most promising candidates for optimization are:
+
+- Combining Softmax and Subtract into a single kernel. Since they are sequential and element-wise, this can save a memory transfer.
+
+- Combining Swish and Max into a single kernel. Since Swish is element-wise and Max is a reduction, maybe they can be computed in a single pass.
+
+Alternatively, maybe fusing the MaxPool3d and ConvTranspose3d would help, but that might be complex.
+
+Let me proceed step by step.
+
+First, let's tackle the Softmax and Subtract. The current code has:
+
+x = torch.softmax(x, dim=1)
+x = x - self.subtract.view(...)
+
+The softmax is over dim=1 (channels). The subtract is a tensor of shape (1, out_channels, 1, 1, 1), so element-wise subtraction across channels.
+
+A custom kernel can perform softmax and subtract in one step, which is better.
+
+Similarly, the Swish (x * sigmoid(x)) and the Max (max over dim=1) can be combined. The Swish is element-wise, then the Max is a reduction over the channel dimension.
+
+Let me start by writing a fused Softmax-Subtract kernel.
+
+Next, the Max operation over dim=1. The current code does torch.max(x, dim=1)[0], which gives the maximum along the specified dimension. The max is a reduction, so each element in the output is the max of a slice along dim=1. For a 5D tensor (batch, channels, depth, height, width), the output would be (batch, 1, depth, height, width) but actually, after max, the dimension is removed, so it becomes (batch, depth, height, width). Wait, no:
+
+Wait, original x has shape (batch, C, D, H, W). After max over dim=1, the result is (batch, D, H, W).
+
+The current code returns the maximum values. To compute this, we can do it in a custom kernel.
+
+Alternatively, the Swish is applied first, then the max. Since both are element-wise and reduction, perhaps they can be fused.
+
+Wait, the sequence is:
+
+x = torch.sigmoid(x) * x (Swish)
+x = torch.max(x, dim=1)[0]
+
+So the Swish is element-wise, then the max is across the channel dimension (dim=1). Maybe these can be combined into a single kernel where for each spatial location (depth, height, width), we compute the Swish first, then track the maximum across channels.
+
+Alternatively, since Swish is applied first, perhaps the max can be computed as part of the same kernel, thereby eliminating the intermediate storage of the Swish result.
+
+Yes, that's a good idea. For each spatial position, for each channel, compute the Swish value, then keep track of the maximum.
+
+So combining Swish and Max into a single kernel can save memory and reduce computation steps.
+
+Therefore, the plan is to:
+
+1. Create a fused kernel for Softmax + Subtract.
+
+2. Create a fused kernel for Swish + Max.
+
+This would replace two pairs of operations with two custom kernels, potentially saving time and memory.
+
+Alternatively, maybe even more fusion can be done, but let's proceed step by step.
+
+First, let's implement the Softmax and Subtract fusion.
+
+The Softmax formula is:
+
+softmax(x_i) = exp(x_i) / sum_j(exp(x_j)) along dim=1.
+
+Then subtract the parameter (which is per channel).
+
+But since the parameter is per channel, the subtraction can be done in the same kernel.
+
+The steps would be:
+
+For each element in the tensor (but along dim=1):
+
+Compute the exponentials for all elements in the channel dimension for each spatial position.
+
+Sum those exponents along the channel dimension to compute the denominator.
+
+Then compute softmax values, then subtract the per-channel parameter.
+
+Wait, the parameter is a tensor of shape (1, out_channels, 1, 1, 1). So each channel has its own subtraction value.
+
+Therefore, in the kernel, for each element (n, c, d, h, w), we can compute the softmax value and subtract the parameter's c-th element.
+
+The fusion can be done in one kernel.
+
+Now, the Softmax is over the channels (dim=1). So for each spatial position (d, h, w) in each batch, we have a vector of length C (out_channels). The softmax is computed over this vector, then subtracted by the parameter's corresponding channel.
+
+Implementing this in a CUDA kernel:
+
+The plan is:
+
+- For each block, handle a batch element and a spatial position (d, h, w).
+
+- Each thread in the block handles a channel (since C is the channels).
+
+- Compute the exponents for each channel in the block.
+
+- Sum the exponents in the block to get the denominator.
+
+- Then compute the softmax value for each channel, subtract the parameter, and write the result.
+
+But handling this efficiently requires some shared memory for the reduction.
+
+Alternatively, since the spatial dimensions are D, H, W, which could be large, perhaps we need a grid of blocks where each block processes a (batch, d, h, w) position, and threads process channels.
+
+Wait, the batch size is 128, which might be too much for a single block. Let's think about the dimensions.
+
+The input is 5D: (N, C, D, H, W).
+
+The softmax is over dim=1 (C), so for each spatial position (d, h, w) in each batch, the C elements are processed.
+
+Suppose we have N=128, C=16, D=16, H=32, W=32.
+
+The total elements are 128 * 16 * 16 * 32 *32. But the reduction over C for each spatial position.
+
+The kernel should process each spatial position in each batch as a unit.
+
+Perhaps each block processes one (n, d, h, w) position, and threads in the block handle the C channels.
+
+The number of blocks would be N * D * H * W.
+
+Each block has at least C threads, but if C is small (e.g., 16), this is manageable.
+
+Let me outline the steps:
+
+For each block (n, d, h, w):
+
+1. Each thread t (0 <= t < C) loads x[n][t][d][h][w].
+
+2. Compute exp(x[t]) for each thread.
+
+3. Sum all the exp values across the threads in the block (reduction).
+
+4. Compute denominator = sum.
+
+5. For each thread t, compute softmax_val = exp(x[t]) / denominator.
+
+6. Subtract the parameter (self.subtract[t] ? Wait, the parameter is a tensor of shape (1, C, 1, 1, 1), so self.subtract is stored as a 1D tensor of length C? Or maybe in the code it's a 5D tensor but broadcasted.
+
+Wait in the original model:
+
+self.subtract = nn.Parameter(torch.randn(out_channels)) 
+
+So the parameter is a 1D tensor of size [out_channels], and in the forward, it's reshaped to (1, C, 1, 1, 1) to allow broadcasting.
+
+Therefore, each channel's subtraction value is self.subtract[c].
+
+Thus, in the kernel, each thread can have access to the parameter values (either via texture memory or as a constant array).
+
+Wait, in CUDA, we can pass the subtract parameter as a tensor. So in the kernel, we can have:
+
+float subtract_val = subtract_data[c]; // assuming subtract_data is a pointer.
+
+Thus, steps in the kernel:
+
+After step 5, each thread has the softmax value. Then subtract_val is subtract[c], so:
+
+result = softmax_val - subtract_val.
+
+Then write the result to the output tensor.
+
+The key is to handle the reduction of the exponentials in the block.
+
+To implement the reduction efficiently, using shared memory:
+
+Each block has a shared array of size C (or a suitable size for the number of threads). But if C is small (e.g., 16), we can do a parallel reduction.
+
+Alternatively, since each thread has its exp(x), we can do a sum reduction.
+
+Let me think of the kernel structure:
+
+Kernel softmax_subtract_kernel:
+
+Inputs:
+
+- input: tensor (N, C, D, H, W)
+
+- subtract_param: tensor (C, )
+
+Output: tensor (N, C, D, H, W)
+
+The kernel is launched with:
+
+blockDim.x = C (if C is small)
+
+gridDim.x = N * D * H * W
+
+Each block processes one (n, d, h, w).
+
+Inside the block:
+
+Each thread t (0..C-1) loads x[n][t][d][h][w]
+
+Compute exp(x) for each thread.
+
+Then perform a block-wide reduction to sum all the exp values.
+
+Once the sum is obtained, each thread computes its term: exp(x)/sum - subtract_param[t]
+
+Then write back to the output.
+
+The reduction can be done using shared memory:
+
+Each thread stores its exp value in shared memory.
+
+Then perform a parallel reduction to compute the sum.
+
+Alternatively, since C is 16, which is manageable.
+
+Let me code this kernel.
+
+First, need to handle the indexing correctly.
+
+The input tensor is 5D, but to map to linear indices:
+
+The linear index for (n, c, d, h, w) is:
+
+index = n * (C*D*H*W) + c*(D*H*W) + d*(H*W) + h*W + w
+
+But when launching the kernel, each block corresponds to a specific (n, d, h, w). The c dimension is handled per thread.
+
+Wait, the block's position in the grid can be mapped as:
+
+blockIdx.x = n * (D*H*W) + d*(H*W) + h*W + w
+
+Then, for each block, the n, d, h, w can be derived from blockIdx.x.
+
+Within each block, each thread t (threadIdx.x) corresponds to channel t.
+
+Thus, the threads in the block process each channel for this (n, d, h, w).
+
+This way, each block handles a single spatial position across all channels for a batch element.
+
+Now, the kernel code:
+
+First, include headers, and define the kernel.
+
+The function in Python would be something like:
+
+def fused_softmax_subtract(input, subtract_param):
+
+    # ... CUDA code ...
+
+Now, in CUDA:
+
+__global__ void fused_softmax_subtract_kernel(
+    const float* input, float* output, 
+    const float* subtract_param,
+    int N, int C, int D, int H, int W) {
+
+    // Each block corresponds to (n, d, h, w)
+    int idx = blockIdx.x;
+    int n = idx / (D*H*W);
+    int rem = idx % (D*H*W);
+    int d = rem / (H*W);
+    rem %= (H*W);
+    int h = rem / W;
+    int w = rem % W;
+
+    // Each thread handles a channel c = threadIdx.x
+    int c = threadIdx.x;
+    if (c >= C) return;
+
+    // Load the input value for this channel
+    int input_offset = n * C*D*H*W + c*D*H*W + d*H*W + h*W + w;
+    float x = input[input_offset];
+
+    // Compute exp(x)
+    float exp_x = expf(x);
+
+    // Store in shared memory
+    __shared__ float exp_values[16]; // assuming C=16. Hmm, need to make this dynamic? But for the given problem, C is fixed as 16.
+    exp_values[c] = exp_x;
+    __syncthreads();
+
+    // Compute sum of all exp_x in the block
+    float sum = 0.0f;
+    for (int i = 0; i < C; ++i) {
+        sum += exp_values[i];
+    }
+    __syncthreads(); // Not sure if needed here.
+
+    // Compute softmax value
+    float softmax_val = exp_x / sum;
+
+    // Subtract the parameter
+    float subtract_val = subtract_param[c];
+    float result = softmax_val - subtract_val;
+
+    // Write to output
+    output[input_offset] = result;
+}
+
+Wait, but the shared memory approach here is using a fixed size (16). Since in the given architecture, the out_channels are 16, this is okay. But if C varies, need to parameterize it, but for this problem, it's fixed.
+
+Alternatively, we can use a dynamic approach, but for simplicity, since C is 16, let's hardcode it.
+
+Wait, the problem defines out_channels = 16, so the code can use that.
+
+Now, the kernel uses a block of threads equal to C (16 threads per block). Each block has 16 threads.
+
+The grid size is N * D * H * W.
+
+Now, the kernel launch would be:
+
+block_size = C (16)
+
+num_blocks = N * D * H * W.
+
+Wait, N is 128, D=16, H=32, W=32. So:
+
+128 * 16 * 32 *32 = 128 * 16*1024 = 128*16384 = 2,097,152 blocks. That's a huge number of blocks. CUDA has a maximum grid size. Wait, the maximum grid dimensions in recent CUDA are large (up to 2^31-1 in each dimension), but launching 2 million blocks might be okay, but it's a lot. Maybe there's a better way.
+
+Wait, maybe the indexing is done incorrectly. Let me think again.
+
+Wait, in the current setup:
+
+blockDim.x = C (16)
+
+Each block corresponds to a (n, d, h, w) position.
+
+The total number of blocks is N * D * H * W = 128 * 16 * 32 * 32 = 128*16384 = 2,097,152 blocks.
+
+This is a lot, but maybe manageable. However, the shared memory per block is 16 floats, which is negligible.
+
+Alternatively, maybe the block can process multiple spatial positions? Not sure. Alternatively, since the spatial dimensions are D, H, W, perhaps we can handle multiple positions per block. But that might complicate the code.
+
+Alternatively, the other way: Each block processes a batch element and a channel, and threads handle the spatial dimensions. But that might not be as efficient.
+
+Alternatively, perhaps using a 2D grid where each block handles a batch and a spatial position, but threads handle channels. Hmm, perhaps it's better to proceed with the initial approach.
+
+Assuming that the kernel can handle this.
+
+Now, in the Python code, the function would be:
+
+def fused_softmax_subtract_cuda(input, subtract_param):
+    N, C, D, H, W = input.shape
+    assert C == 16, "Only supports C=16"
+    output = torch.empty_like(input)
+    block_size = C
+    num_blocks = N * D * H * W
+    fused_softmax_subtract_kernel[blocks, block_size](
+        input.data_ptr(), 
+        output.data_ptr(),
+        subtract_param.data_ptr(),
+        N, C, D, H, W
+    )
+    return output
+
+Wait, but in CUDA kernel code, the parameters passed are N, C, D, H, W. However, in the code, these are fixed according to the problem's input parameters.
+
+Wait, the problem's parameters are fixed as:
+
+batch_size = 128
+
+in_channels = 3
+
+out_channels = 16
+
+depth, height, width = 16, 32, 32
+
+Wait, the input to the model is x, which after conv_transpose has out_channels=16, so the dimensions of x after conv_transpose would be (N, 16, D', H', W'), but let me confirm.
+
+Wait, the initial input is get_inputs() returns a tensor of shape (128, 3, 16,32,32).
+
+The conv_transpose has parameters:
+
+kernel_size=3, stride=2, padding=1, output_padding=1.
+
+The ConvTranspose3d output shape formula:
+
+For each spatial dimension:
+
+output_size = (input_size - 1) * stride - 2 * padding + kernel_size + output_padding
+
+So for each dimension (depth, height, width):
+
+Original input depth: 16
+
+After ConvTranspose3d:
+
+depth_out = (16 -1)*2 - 2*1 + 3 +1 = 15*2 -2 +4 = 30 -2 +4 = 32?
+
+Wait, let me compute for each dimension:
+
+Let me take depth first.
+
+Input depth: 16.
+
+After ConvTranspose3d:
+
+Output depth = (input_depth - 1)*stride - 2*padding + kernel_size + output_padding
+
+= (16-1)*2 - 2*1 +3 +1 = 15*2=30 -2=28 +3=31 +1=32.
+
+Similarly for height and width.
+
+Original input height=32, width=32.
+
+After conv_transpose:
+
+height_out = (32-1)*2 -2*1 +3 +1 = 31*2=62 -2=60 +3+1=64.
+
+Wait, same for width:
+
+Same calculation, so 64 as well.
+
+Thus, after the ConvTranspose3d, the tensor has shape (128, 16, 32, 64, 64).
+
+Wait, wait, the initial depth, height, width are 16,32,32.
+
+Wait, the input to the model is x of shape (batch_size, in_channels, depth, height, width) = (128,3,16,32,32). So after ConvTranspose3d, the output is (N, 16, D', H', W') where D' = (16-1)*2 - 2*1 + 3 +1 = 32, similarly H'= (32-1)*2 -2*1 +3+1 = 31*2 -2 +4 = 62 +4 -2? Wait let me recalculate:
+
+Wait, formula again:
+
+output_size = (input_size -1) * stride + kernel_size - 2 * padding + output_padding
+
+Wait, perhaps I got the formula wrong. Let me check the PyTorch documentation for ConvTranspose3d.
+
+According to PyTorch's documentation:
+
+The formula for the output shape is:
+
+output_size = (input_size - 1) * stride - 2 * padding + kernel_size + output_padding
+
+So for depth:
+
+input_size (original depth) is 16.
+
+output_size = (16-1)*2 - 2*1 +3 +1 = 30 -2 +3 +1 = 32, yes.
+
+Height: input_size 32:
+
+(32-1)*2 -2*1 +3 +1 = 31*2=62 -2=60 +3=63 +1=64.
+
+Same for width.
+
+Thus after conv_transpose, the tensor is (128, 16, 32, 64, 64).
+
+Then it goes through MaxPool3d with kernel_size=2, stride=2, padding=0.
+
+MaxPool3d applies a 2x2x2 kernel with stride 2, so:
+
+depth_out = ceil(32/2) = 16
+
+height_out = ceil(64/2) = 32
+
+width_out = ceil(64/2)=32.
+
+Thus, after max_pool, the tensor has shape (128,16,16,32,32).
+
+Then, the softmax is applied over dim=1 (channels), so the shape remains (128,16,16,32,32).
+
+The subtract is a parameter of shape (16,), so when subtracted, it's broadcasted to (1,16,1,1,1).
+
+The output after subtract is still (128,16,16,32,32).
+
+Then Swish is applied, element-wise, so same shape.
+
+Finally, the max over dim=1 reduces the channels, resulting in (128,16,16,32,32) → (128,16,16,32,32) → (128,16,16,32,32) after Swish, then max over dim=1 → (128,16,16,32,32) → (128, 16,16,32,32)? Wait no:
+
+Wait after Swish, it's still (128,16,16,32,32). Then the max over dim=1 (channels) would reduce the second dimension to 1, so the output is (128, 1,16,32,32), but actually, torch.max returns the values and indices. The code uses [0], so the shape becomes (128,16,16,32,32) → (128, 16, ...) → wait no:
+
+Wait, the max over dim=1 for a tensor of shape (N, C, D, H, W) will produce a tensor of shape (N, D, H, W), because the dimension is removed.
+
+Wait, let me think:
+
+Original size after Swish: (128,16,16,32,32). Max over dim=1 (the second dimension) → the result is (128, 16, 32, 32) ?
+
+Wait, no, the dimensions are:
+
+After Swish: (N, C, D, H, W) → max over dim=1 (C) → (N, D, H, W).
+
+Wait, the first dimension is batch, the second is channels. So max over channels gives a tensor of (N, D, H, W).
+
+Wait:
+
+The dimensions after Swish are (batch, C, D, H, W). Taking the max over C (dim=1), the result is (batch, D, H, W).
+
+Wait, perhaps I made a mistake here.
+
+Wait, let's clarify:
+
+Suppose tensor shape is (N, C, D, H, W).
+
+After applying max over dim=1 (channels), the result is (N, D, H, W), where each element is the maximum across the C channels for that spatial position.
+
+So the final output of the model is a tensor of shape (128, 16,32,32) ?
+
+Wait, depth was 16 after the max_pool, so D=16, H=32, W=32.
+
+Thus, the final output is (128, 16, 32,32)?
+
+Wait, no:
+
+Wait the max is over the channel dimension (dim=1):
+
+Original shape after Swish: (128,16,16,32,32).
+
+Max over dim=1 gives (128, 16, 32, 32). Because:
+
+The dimensions are:
+
+dim0: batch (128)
+
+dim1: channels (16)
+
+dim2: depth (16)
+
+dim3: height (32)
+
+dim4: width (32)
+
+Taking max over dim=1, the resulting dimensions are:
+
+dim0: 128
+
+dim1: 16 (depth)
+
+dim2: 32 (height)
+
+dim3:32 (width)
+
+So the output is (128,16,32,32).
+
+Okay, now back to the kernels.
+
+Next, the second fused kernel for Swish and Max.
+
+The sequence is:
+
+x = torch.sigmoid(x) * x → Swish activation.
+
+Then, x = torch.max(x, dim=1)[0].
+
+So the Swish is element-wise, then the max over channels.
+
+To combine these into a single kernel:
+
+For each spatial position (d, h, w) in each batch:
+
+Compute Swish(x[n, c, d, h, w]) for all channels c,
+
+then find the maximum over c for each (n, d, h, w).
+
+The result is the maximum of the Swish values across the channels.
+
+This can be done in a single kernel, avoiding storing the intermediate Swish tensor.
+
+The plan for the kernel:
+
+Each block processes a (n, d, h, w) position.
+
+Each thread in the block handles a channel c.
+
+Compute the Swish value for that channel, then find the maximum across all channels in the block.
+
+The steps:
+
+- Each thread computes Swish(x) = x * sigmoid(x).
+
+- Use shared memory to store all Swish values for the block's channels.
+
+- Then compute the maximum across all the Swish values in the block.
+
+- Write the maximum value to the output for this (n, d, h, w).
+
+The kernel structure:
+
+Kernel fused_swish_max:
+
+Inputs:
+
+- input: tensor of shape (N, C, D, H, W)
+
+Output: tensor of shape (N, D, H, W)
+
+The kernel would be:
+
+__global__ void fused_swish_max_kernel(
+    const float* input, float* output,
+    int N, int C, int D, int H, int W) {
+
+    // Each block corresponds to (n, d, h, w)
+    int idx = blockIdx.x;
+    int n = idx / (D * H * W);
+    int rem = idx % (D * H * W);
+    int d = rem / (H * W);
+    rem %= (H * W);
+    int h = rem / W;
+    int w = rem % W;
+
+    // Each thread handles a channel c = threadIdx.x
+    int c = threadIdx.x;
+    if (c >= C) return;
+
+    // Load the input value for this channel
+    int input_offset = n * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+    float x = input[input_offset];
+
+    // Compute Swish: x * sigmoid(x)
+    float sigmoid_x = 1.0f / (1.0f + expf(-x));
+    float swish_val = x * sigmoid_x;
+
+    // Store in shared memory
+    __shared__ float swish_values[16];
+    swish_values[c] = swish_val;
+    __syncthreads();
+
+    // Compute the maximum across all channels in the block
+    float max_val = -INFINITY;
+    for (int i = 0; i < C; ++i) {
+        if (swish_values[i] > max_val) {
+            max_val = swish_values[i];
+        }
+    }
+    __syncthreads();
+
+    // Only one thread (e.g., thread 0) writes the result
+    if (c == 0) {
+        int output_offset = n * D * H * W + d * H * W + h * W + w;
+        output[output_offset] = max_val;
+    }
+}
+
+Wait, but in this case, each block has C threads (16). Each thread stores their swish value, then all threads can loop over all C values to compute the max, but that's O(C) for each thread. Alternatively, a reduction approach with threads participating in the reduction.
+
+Wait, but for small C (16), the loop is manageable.
+
+Alternatively, using a parallel reduction in shared memory.
+
+For example:
+
+First, each thread stores their swish value in shared memory.
+
+Then, perform a reduction across the shared memory array.
+
+But let me think of the steps:
+
+After storing swish_values, the threads can perform a parallel reduction:
+
+Initialize max_val as the first element, then each thread can compare and update.
+
+Alternatively, for 16 elements, a binary reduction can be done in log2(16)=4 steps.
+
+But for simplicity, given that C is 16, a simple loop might be acceptable.
+
+In the code above, each thread computes the max over all elements. However, all threads are doing the same computation, which is redundant. Only one thread needs to compute the max and write it.
+
+Therefore, in the kernel:
+
+After loading swish_values into shared memory, we can have thread 0 compute the max and write it.
+
+Thus, the code can be adjusted:
+
+    // ... previous steps ...
+
+    __syncthreads();
+
+    float max_val = -INFINITY;
+    if (c == 0) {
+        for (int i = 0; i < C; ++i) {
+            if (swish_values[i] > max_val) {
+                max_val = swish_values[i];
+            }
+        }
+    }
+    __syncthreads();
+
+    // Write only once
+    if (c == 0) {
+        int output_offset = ...;
+        output[output_offset] = max_val;
+    }
+
+This way, only thread 0 does the max computation and writes the result.
+
+This is more efficient.
+
+Thus, this kernel would process each (n, d, h, w) block with 16 threads (C=16), and only thread 0 does the reduction and write.
+
+The kernel launch would be:
+
+block_size = C (16)
+
+num_blocks = N * D * H * W.
+
+Same as before.
+
+Now, in Python, the function would be:
+
+def fused_swish_max_cuda(input):
+    N, C, D, H, W = input.shape
+    assert C == 16, "Only C=16 supported"
+    output_shape = (N, D, H, W)
+    output = torch.empty(output_shape, device=input.device)
+    block_size = C
+    num_blocks = N * D * H * W
+    fused_swish_max_kernel[blocks, block_size](
+        input.data_ptr(), output.data_ptr(), 
+        N, C, D, H, W)
+    return output
+
+Now, putting it all together.
+
+The original forward function:
+
+def forward(self, x):
+    x = self.conv_transpose(x)
+    x = self.max_pool(x)
+    x = torch.softmax(x, dim=1)
+    x = x - self.subtract.view(1, -1, 1, 1, 1)
+    x = torch.sigmoid(x) * x
+    x = torch.max(x, dim=1)[0]
+    return x
+
+The new forward function would replace the softmax-subtract with the fused kernel, and the swish-max with the other fused kernel.
+
+Thus:
+
+In the new ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, pool_kernel_size, pool_stride, pool_padding):
+        super().__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.max_pool = nn.MaxPool3d(kernel_size=pool_kernel_size, stride=pool_stride, padding=pool_padding)
+        self.subtract = nn.Parameter(torch.randn(out_channels))  # same as before
+
+        # Load the fused CUDA kernels
+        self.fused_softmax_subtract = ...  # the compiled CUDA function
+        self.fused_swish_max = ...         # the compiled CUDA function
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.max_pool(x)
+        # Apply fused_softmax_subtract
+        x = self.fused_softmax_subtract(x, self.subtract)
+        # Apply fused_swish_max
+        x = self.fused_swish_max(x)
+        return x
+
+Now, I need to write the CUDA code for the two fused kernels and compile them using load_inline.
+
+Let me proceed step by step.
+
+First, the fused_softmax_subtract kernel.
+
+First, define the CUDA source code for this kernel.
+
+The CUDA code for the fused_softmax_subtract:
+
+elementwise_add_source was the example's name, but here, let's call them:
+
+fused_softmax_subtract_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_softmax_subtract_kernel(
+    const float* input, float* output,
+    const float* subtract_param,
+    int N, int C, int D, int H, int W) {
+
+    int idx = blockIdx.x;
+    int n = idx / (D * H * W);
+    int rem = idx % (D * H * W);
+    int d = rem / (H * W);
+    rem %= (H * W);
+    int h = rem / W;
+    int w = rem % W;
+
+    int c = threadIdx.x;
+    if (c >= C) return;
+
+    // Compute input offset
+    int input_offset = n * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+    float x = input[input_offset];
+
+    float exp_x = expf(x);
+
+    // Use shared memory to store exponents
+    __shared__ float exp_values[16]; // C is 16
+    exp_values[c] = exp_x;
+    __syncthreads();
+
+    // Compute sum of exponents
+    float sum = 0.0f;
+    for (int i = 0; i < C; ++i) {
+        sum += exp_values[i];
+    }
+    __syncthreads();
+
+    float softmax_val = exp_x / sum;
+    float subtract_val = subtract_param[c];
+    float result = softmax_val - subtract_val;
+
+    output[input_offset] = result;
+}
+
+// Wrapper function
+torch::Tensor fused_softmax_subtract_cuda(
+    torch::Tensor input,
+    torch::Tensor subtract_param) {
+
+    const int C = 16;
+    const int N = input.size(0);
+    const int D = input.size(2);
+    const int H = input.size(3);
+    const int W = input.size(4);
+
+    auto output = torch::empty_like(input);
+
+    const int block_size = C;
+    const int num_blocks = N * D * H * W;
+
+    // Launch kernel
+    fused_softmax_subtract_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        subtract_param.data_ptr<float>(),
+        N, C, D, H, W
+    );
+
+    return output;
+}
+"""
+
+Wait, but in the kernel, I assumed that C is 16. However, in the problem statement, out_channels is fixed to 16. So this is okay.
+
+But the kernel's __shared__ array is hardcoded to 16. Need to make sure that the code is correct for the given problem.
+
+Next, the fused_swish_max kernel:
+
+fused_swish_max_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_swish_max_kernel(
+    const float* input, float* output,
+    int N, int C, int D, int H, int W) {
+
+    int idx = blockIdx.x;
+    int n = idx / (D * H * W);
+    int rem = idx % (D * H * W);
+    int d = rem / (H * W);
+    rem %= (H * W);
+    int h = rem / W;
+    int w = rem % W;
+
+    int c

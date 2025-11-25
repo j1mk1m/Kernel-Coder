@@ -1,0 +1,93 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D convolution
+conv3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the 3D convolution kernel here
+"""
+
+conv3d_cpp_source = (
+    "torch::Tensor conv3d_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for 3D convolution
+conv3d = load_inline(
+    name="conv3d",
+    cpp_sources=conv3d_cpp_source,
+    cuda_sources=conv3d_source,
+    functions=["conv3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for Softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the Softmax kernel here
+"""
+
+softmax_cpp_source = (
+    "torch::Tensor softmax_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for Softmax
+softmax = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for Max Pooling
+max_pooling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the Max Pooling kernel here
+"""
+
+max_pooling_cpp_source = (
+    "torch::Tensor max_pooling_cuda(torch::Tensor input, int kernel_size);"
+)
+
+# Compile the inline CUDA code for Max Pooling
+max_pooling = load_inline(
+    name="max_pooling",
+    cpp_sources=max_pooling_cpp_source,
+    cuda_sources=max_pooling_source,
+    functions=["max_pooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = conv3d
+        self.pool1 = max_pooling
+        self.pool2 = max_pooling
+
+    def forward(self, x):
+        x = self.conv(x, weight)  # You need to define the weight tensor
+        x = self.softmax(x)
+        x = self.pool1(x, pool_kernel_size)
+        x = self.pool2(x, pool_kernel_size)
+        return x
+
+# Example usage
+model_new = ModelNew(in_channels, out_channels, kernel_size, pool_kernel_size)
+input_tensor = get_inputs()[0].cuda()
+output_tensor = model_new(input_tensor)
+print(output_tensor.shape)

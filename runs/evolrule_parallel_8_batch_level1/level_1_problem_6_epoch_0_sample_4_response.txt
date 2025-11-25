@@ -1,0 +1,1330 @@
+The problem requires optimizing a matrix multiplication operation where the input tensors have dimensions M=256, K=131072*4, and N=256. The goal is to create a custom CUDA kernel to replace the existing `torch.matmul` operation for better performance. The key considerations here include efficiently handling large K dimensions, optimizing memory access patterns, and leveraging CUDA's parallelism effectively.
+
+First, understanding the matrix multiplication operation: Given matrices A (MxK) and B (KxN), the result C (MxN) is computed such that each element C[i][j] is the dot product of the i-th row of A and the j-th column of B. The challenge with large K (in this case, over half a million elements) is that each dot product requires a lot of memory accesses, which can be a bottleneck. Traditional matrix multiplication can have high arithmetic intensity, but when K is very large, the memory bandwidth might become the limiting factor.
+
+CUDA kernel design for matrix multiplication typically involves blocking (tiling) to improve cache utilization. Since CUDA cores access global memory much more efficiently when multiple threads in a warp access consecutive addresses, using shared memory to hold tiles of A and B matrices can reduce global memory latency. The kernel can be designed using the tiling method where each block of threads computes a tile of the output matrix, loading tiles of A and B into shared memory, then performing the computation.
+
+Given the dimensions: M=256, N=256, K=524,288 (131072*4), the output matrix C is 256x256. Each element of C requires K multiplications and accumulations. The total number of operations is M*N*K, which is significant, so optimizing this is crucial.
+
+The standard `torch.matmul` is highly optimized (using cuBLAS under the hood), but for very large K, perhaps a custom kernel can exploit specific properties or be tuned for the given problem size. Alternatively, perhaps the input dimensions allow for certain optimizations. Let me think through possible approaches.
+
+First, note that the standard matrix multiplication in cuBLAS is already highly optimized, especially for large matrices. However, in some cases, custom kernels can outperform cuBLAS if the problem size is fixed and can be tuned precisely. For example, using the optimal block size and tile dimensions for the given matrix dimensions might give a slight edge. Alternatively, if the matrix dimensions are multiples of certain numbers (like 32 or 16), we can align the tiles accordingly.
+
+Another consideration is the order of operations. The standard approach is to tile both matrices A and B into shared memory blocks, then compute the dot products using those tiles. The tile size (e.g., 16x16) is a common choice, but this can vary. Let's consider a tile size of 16x16 for shared memory. However, given the large K dimension (524,288), which is the number of elements in each row of A and each column of B, the number of tiles along the K dimension will be large, so efficient coalesced accesses and minimizing shared memory usage might be important.
+
+Wait, but for the given problem, the K dimension is 524,288 (since 131072 * 4 is 524,288). The matrices are A (256x524,288) and B (524,288x256). The output is 256x256.
+
+The standard approach would be to use the matrix multiplication kernel with tiling. Let me recall the standard tiled matrix multiplication kernel.
+
+In such a kernel, each thread block is responsible for computing a tile of the output matrix C. The tile dimensions (blockDim.x and blockDim.y) determine how much each block can handle. The shared memory is used to store tiles of A and B so that threads can access them multiple times without going to global memory.
+
+The general steps are:
+
+1. Each thread block is assigned a block of C (e.g., 16x16 tile). The block dimensions (blockDim.x, blockDim.y) need to be chosen such that they can cover this tile efficiently.
+
+2. The block divides the work among threads. Each thread is responsible for a small portion of the tile (e.g., a 4x4 area).
+
+3. The K dimension is processed in tiles as well. For each tile of A and B loaded into shared memory, the threads compute their portion of the dot product.
+
+4. The number of tiles along the K dimension determines how many times we have to load the A and B tiles into shared memory.
+
+Given that K is so large (half a million), this could be a problem. However, since each tile of K (let's say tile_size) requires a shared memory allocation, the size of the tiles must be chosen such that the shared memory usage is manageable. The maximum shared memory per block in modern GPUs is 96KB (for example, on Ampere architecture). So, if we use 16x16 tiles for A and B, the shared memory required would be 16*16*4 bytes (for floats) for each matrix, so 16*16*2*4 = 2048 bytes per tile, but if we have more tiles along the K direction, it's unclear.
+
+Wait, actually, the standard tiled matrix multiplication uses a tile size (e.g., 16x16) for the block. The tile size for K is typically the same as the block's tile size. For example, if the block is processing a 16x16 tile of C, then each iteration processes a tile of size 16 in K. The number of iterations would be K / tile_size_K, which for K=524,288 and tile_size=16 would be 32,768 iterations. That seems computationally heavy, but it might still be manageable given the high parallelism of the GPU.
+
+Wait, perhaps the tile size for K should be larger. Let me think again.
+
+Let me structure the kernel as follows. Suppose we have a block size of (blockDim.x, blockDim.y) = (16,16), so each block can process a 16x16 tile of C. Each thread in the block is responsible for a 1x1 element in the tile (so each thread handles one element). The K dimension is divided into chunks of size TILE_SIZE, say 16. For each chunk of K, we load a 16x16 tile from A and a 16x16 tile from B into shared memory. Then, each thread in the block computes the contribution of that chunk to its element in C. We loop over all chunks of K, accumulating the results.
+
+This requires that the shared memory can hold two tiles of size 16x16 (for A and B). For each tile of K, we do this.
+
+But with K=524,288 and tile size 16, there are 32,768 tiles. Each iteration of the loop over K tiles requires loading the A and B tiles into shared memory, which could be a lot of traffic. The performance might be limited by the memory bandwidth here.
+
+Alternatively, increasing the tile size would reduce the number of iterations but require more shared memory. For example, if we use a tile size of 32, the number of iterations would be 524,288 /32 = 16,384, which is still a large number but perhaps manageable. The shared memory required would be 32x32 * 2 * 4 bytes = 8KB per block. Since the maximum is 96KB, that's acceptable.
+
+Alternatively, maybe even larger tiles, but need to balance between shared memory usage and the number of iterations.
+
+Alternatively, perhaps the matrix multiplication can be optimized by taking into account that M and N are small (256). Since the output matrix is 256x256, each thread can be responsible for a single element, and loop over K. But that would require 256*256 threads, which is 65,536 threads, which is too many for a single block (max 1024 threads per block). So this approach is not feasible.
+
+Hence, the tiling approach is better.
+
+So, let's proceed with the tiling approach. Let me structure the code step by step.
+
+First, the kernel will be launched with a grid of blocks, each responsible for a tile of the output matrix C. The block dimensions (blockDim.x, blockDim.y) should be chosen such that the tile size matches, e.g., 16x16. Each block's tile in C is of size (blockDim.x)x(blockDim.y).
+
+Each thread in the block is responsible for a single element in the tile. The tile's position in the matrix is determined by the block's index.
+
+First, compute the tile coordinates:
+
+blockIdx.x determines the x (column) tile in C.
+
+blockIdx.y determines the y (row) tile in C.
+
+Each thread (threadIdx.x, threadIdx.y) within the block computes one element of the tile.
+
+The total number of blocks needed is ceil(M / blockDim.y) x ceil(N / blockDim.x).
+
+Wait, actually, the block indices are 2D, so:
+
+The block grid is divided such that each block's tile is at position (blockDim.y * blockIdx.y, blockDim.x * blockIdx.x) in the C matrix.
+
+Wait, perhaps it's better to think in terms of:
+
+Let’s assume the tile size is (TS blockDim.x, blockDim.y). So each block computes a tile of size TSxTS in C.
+
+Hence, the grid dimensions would be:
+
+dim3 dimGrid(ceil(N / TS), ceil(M / TS), 1)
+
+Each block is responsible for a tile starting at row = blockIdx.y * TS,
+
+ column = blockIdx.x * TS.
+
+Each thread in the block is responsible for a position (row + threadIdx.y, column + threadIdx.x).
+
+Now, for each of these tiles, we need to compute the value by looping over the K dimension in chunks.
+
+The chunks of K will be of size TILE_K, which can be the same as TS or a different value. Let's choose TILE_K = TS.
+
+Wait, the standard approach uses the same tile size for K as for the block's tile. Let me see.
+
+Let me proceed with the code structure.
+
+First, the shared memory arrays for the tiles of A and B:
+
+__shared__ float sA[TS][TS];
+
+__shared__ float sB[TS][TS];
+
+Wait, actually, the tile size for K can be the same as the block's tile size. Let me see.
+
+Suppose the tile size for K is TILE_K = TS.
+
+Each iteration processes a chunk of K of size TILE_K.
+
+The total number of chunks is (K + TILE_K -1)/TILE_K.
+
+For each chunk, we load a tile of A (TS rows, TILE_K columns) and a tile of B (TILE_K rows, TS columns).
+
+Wait, actually, the tile of A is TS rows (since each block is responsible for TS rows in C) and TILE_K columns (the current chunk of K). The tile of B is TILE_K rows (same chunk of K) and TS columns (since each block is responsible for TS columns in C).
+
+Therefore, the shared memory for A would be TS x TILE_K, and for B, it's TILE_K x TS. To have them both fit in shared memory, the total size must be <= the available shared memory.
+
+Choosing TS=16 and TILE_K=16 would require 16x16 + 16x16 = 512 bytes per block. That's very small. But with K=524,288, the number of chunks would be 524288 /16 = 32768. That is a lot of iterations, which may be too slow.
+
+Alternatively, increasing TILE_K to 32, then the chunks would be 524288 /32 = 16384, and shared memory per block would be 16x32 (for A) + 32x16 (for B) = 16*32*4 + 32*16*4 = 2048 bytes. Still manageable.
+
+Alternatively, perhaps a larger TILE_K, like 64, which would reduce the number of chunks to 8192, and shared memory usage would be 16*64*4 +64*16*4 = 8192 bytes (for TS=16). Still okay.
+
+Alternatively, perhaps using a larger TS. Let's see.
+
+Suppose we use TS=32. Then TILE_K=32. The shared memory would be 32x32 + 32x32 = 4096 bytes. The chunks would be 524288 /32 =16384.
+
+Alternatively, TS=32 and TILE_K=64:
+
+sA would be 32x64 (32 rows, 64 columns, which is the chunk of K). sB would be 64x32 (64 rows, 32 columns). The shared memory would be 32*64*4 +64*32*4 = 32768 bytes. That's 32KB per block, which is acceptable.
+
+The number of chunks would be 524288/64 =8192.
+
+Hmm, perhaps a balance between the number of chunks and the shared memory. Let's try with TS=32 and TILE_K=32 first.
+
+Alternatively, let's pick TS=16, TILE_K=32. Then sA is 16x32, sB is 32x16. That would give 16*32 +32*16 = 1024 floats, which is 4KB.
+
+So the number of chunks would be 524288 /32 = 16384.
+
+But the number of chunks is still large. So the kernel might have a lot of iterations.
+
+Alternatively, perhaps increasing the TILE_K further. Let me think of the maximum possible shared memory.
+
+Suppose we use TS=16, and set TILE_K to 1024 (so that the chunks are 512). Let me see:
+
+sA would be 16 x 1024 = 16384 floats, sB 1024 x16 = 16384. Total is 32768 floats, which is 131072 bytes (128KB), but this exceeds the shared memory per block (if it's 96KB). So this might not be possible.
+
+Alternatively, using TS=16 and TILE_K= 512:
+
+sA is 16*512 =8192 floats, sB is 512*16=8192. Total 16384 floats, which is 65536 bytes (64KB). That would fit in 96KB.
+
+Thus, with TS=16, TILE_K=512, each chunk is 512 elements of K. The number of chunks is 524288 /512=1024. That reduces the number of iterations significantly.
+
+The shared memory per block would be (16*512 +512*16)*4 bytes = (16384)*4 = 65KB, which is under 96KB. So this seems better.
+
+Therefore, perhaps choosing TS=16 and TILE_K=512 is better, as it reduces the number of iterations while keeping shared memory usage manageable.
+
+Wait, but the TILE_K must divide K exactly? Not necessarily, but it's easier to handle if it does. Since 524288 divided by 512 is exactly 1024, that works.
+
+Alternatively, using a tile size of 1024 for K, but the shared memory would be 16*1024 + 1024*16 = 32KB, so total 128KB, which exceeds 96KB. So not possible.
+
+Hence, 512 is a good candidate.
+
+Thus, the plan is:
+
+- Use a block tile size of TS=16x16 for the output matrix C.
+
+- Each block processes a 16x16 tile.
+
+- The K dimension is divided into chunks of size TILE_K=512.
+
+- Each block's shared memory holds a tile of A (16 rows x 512 columns) and a tile of B (512 rows x 16 columns).
+
+Wait, but A is MxK, so the tile of A for the current block's rows (16 rows) and the current K chunk (512 columns) would be 16x512.
+
+Similarly, B's tile is K chunk rows (512 rows) x block's tile columns (16 columns), so 512x16.
+
+Therefore, the shared memory for sA would be a 16x512 array, and sB a 512x16 array.
+
+But storing these as 2D arrays in shared memory requires that they can be addressed properly.
+
+Alternatively, we can use row-major storage. For sA, the dimensions would be [TS][TILE_K], which is 16 rows by 512 columns. For sB, it would be [TILE_K][TS], which is 512 rows by 16 columns.
+
+The total size in bytes is (16*512 + 512*16)*4 bytes = (16384)*4 = 65536 bytes (64KB), which is acceptable.
+
+This reduces the number of chunks from K / TILE_K to 524288 /512 = 1024 chunks. So each thread has to loop over 1024 iterations, which is manageable.
+
+Now, the kernel structure:
+
+The kernel will be launched with a grid of blocks. Each block computes a 16x16 tile of C.
+
+Each thread in the block is responsible for a single element in this tile. The element's coordinates in the global C matrix are:
+
+global_row = blockIdx.y * TS + threadIdx.y
+
+global_col = blockIdx.x * TS + threadIdx.x
+
+The element C[global_row][global_col] is the dot product of the global_row-th row of A and the global_col-th column of B.
+
+To compute this, the kernel loops over all chunks of K (each of size TILE_K=512). For each chunk, the block loads a tile of A (rows global_row's block rows, columns chunk's K) into sA, and a tile of B (rows chunk's K, columns global_col's block columns) into sB.
+
+Then, each thread computes the contribution of this chunk to its element in C, and accumulates it.
+
+The steps in the kernel:
+
+1. Initialize the element's value to 0.
+
+2. For each chunk in 0 to num_chunks-1:
+
+   a. Load the corresponding tiles of A and B into shared memory.
+
+   b. Synchronize threads to ensure shared memory is loaded.
+
+   c. Compute the partial sum for this chunk.
+
+   d. Synchronize again before next iteration.
+
+3. Write the accumulated value to global memory.
+
+Now, the code.
+
+First, define the kernel function:
+
+__global__ void matmul_kernel(const float* __restrict__ A, const float* __restrict__ B, float* C,
+
+                             int M, int N, int K, int TS, int TILE_K) {
+
+    // TS is the tile size for the block (e.g., 16)
+
+    // TILE_K is the chunk size for K (e.g., 512)
+
+    // Each thread computes C[row][col]
+
+    int block_row = blockIdx.y * TS;
+
+    int block_col = blockIdx.x * TS;
+
+    int row = block_row + threadIdx.y;
+
+    int col = block_col + threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    float Cval = 0.0f;
+
+    for (int chunk = 0; chunk < (K + TILE_K -1)/TILE_K; chunk++) {
+
+        // Compute the start and end of the current K chunk
+
+        int k_start = chunk * TILE_K;
+
+        int k_end = min(k_start + TILE_K, K);
+
+        // Load the tile of A into shared memory
+
+        // Each thread in the block loads a portion of A's tile.
+
+        // A is stored in row-major, so for row 'row', the elements from k_start to k_end are in A[row * K + k]
+
+        // The tile is TS rows (block_row to block_row + TS -1) and TILE_K columns (k_start to k_end -1).
+
+        // Each thread can load a part of the A tile.
+
+        // Since A is TS rows x TILE_K columns, each thread can load a row or column?
+
+        // Let's have each thread load a portion of the A tile.
+
+        // Since the block has TSxTS threads (since blockDim is TSxTS), but the A tile is TS rows by TILE_K columns.
+
+        // Maybe each thread loads one element from A. For a 16x16 block, and A tile of 16x512, each thread in the block can load 512 / 16 elements? Not sure.
+
+        // Alternatively, we can use 2D thread indices to cover the A tile's rows and columns.
+
+        // For the A tile: the tile's row is threadIdx.y (since each row of the tile is handled by a thread's y-coordinate), and column is threadIdx.x * (TILE_K / blockDim.x) + ... ?
+
+        // Hmm, perhaps it's better to have each thread load a single element from A and B's tiles.
+
+        // For A's tile:
+
+        // The A tile has TS rows and TILE_K columns. Each thread in the block can be assigned to a position (ty, tx) in the block's threads.
+
+        // Since the block has blockDim.x = TS and blockDim.y = TS, the total threads are TS^2.
+
+        // To cover the A tile's TS rows and TILE_K columns, each thread can be assigned to a row and a portion of the columns.
+
+        // For example, each thread in the block can take responsibility for a column of the A tile. Since the A tile has TILE_K columns, and there are TS^2 threads, it's possible to distribute the load.
+
+        // Alternatively, the loading can be done using a strided pattern.
+
+        // To simplify, perhaps use the following:
+
+        // Each thread loads a single element from A and B's tiles.
+
+        // For A's tile:
+
+        // The row in the tile is threadIdx.y (since the block's rows correspond to the tile's rows).
+
+        // The column in the tile is threadIdx.x + threadIdx.y * blockDim.x ?
+
+        // Wait, perhaps a better approach is to have each thread load a single element from the A tile and a single element from the B tile.
+
+        // Let's see:
+
+        // For the A tile:
+
+        // The tile starts at row = block_row, column = k_start.
+
+        // Each element in the A tile is at position (block_row + ty, k_start + tx), where ty is threadIdx.y, tx is threadIdx.x.
+
+        // However, the A tile has TILE_K columns, so if TILE_K is larger than blockDim.x, each thread has to load multiple elements? Not sure.
+
+        // Alternatively, since the threads are in a 2D grid, we can tile the loading.
+
+        // Let me try to structure the loading as follows.
+
+        // For the A tile:
+
+        // The tile has TS rows (block_row to block_row + TS -1) and TILE_K columns (k_start to k_end -1).
+
+        // Each thread in the block can be assigned to load a part of this tile.
+
+        // Let’s divide the TILE_K columns into blocks of blockDim.x (since blockDim.x is TS, which may not divide TILE_K). Hmm, perhaps need to use a loop.
+
+        // Alternatively, each thread is responsible for a row of the A tile (ty) and a column in steps of blockDim.x.
+
+        // For example, each thread (ty, tx) loads A[block_row + ty][k_start + tx + blockDim.x * i], for i such that it covers all columns.
+
+        // This might get complicated.
+
+        // Alternatively, use a single loop where each thread loads one element per iteration.
+
+        // Wait, perhaps this is getting too complex. Maybe the standard approach uses a 2D thread grid to load the tiles.
+
+        // Let me look up a standard tiled matrix multiplication kernel for reference.
+
+        // Wait, perhaps the following approach is better:
+
+        // For each thread in the block:
+
+        // The tile of A has TS rows (the block's rows) and TILE_K columns.
+
+        // Each thread in the block can load a single element from A's tile:
+
+        // The row is threadIdx.y (since there are TS rows, and blockDim.y is TS).
+
+        // The column is threadIdx.x + blockDim.x * (iteration number?), but this might not cover all columns.
+
+        // Hmm, this is tricky. Alternatively, using a for loop to iterate over the columns in chunks.
+
+        // Let me try to proceed with code.
+
+        // First, define the shared memory arrays:
+
+        __shared__ float sA[TS][TILE_K]; // 16x512
+
+        __shared__ float sB[TILE_K][TS]; // 512x16
+
+        // Load the A tile into shared memory:
+
+        // The row in the A tile is threadIdx.y (since the block has TS rows, and each thread's y-coordinate corresponds to the row).
+
+        // The column in the A tile is threadIdx.x + blockDim.x * i, but since TILE_K may be larger than blockDim.x, we need to loop.
+
+        // Alternatively, each thread can load a column in the A tile's columns.
+
+        // Wait, the A tile has TS rows and TILE_K columns.
+
+        // Each thread (ty, tx) can load one element per column block.
+
+        // Since the number of threads per block is TS * TS, perhaps each thread can load multiple elements.
+
+        // Wait, perhaps it's better to use the following approach:
+
+        // For the A tile:
+
+        // Each thread is responsible for a row in the tile (ty), and a column in the tile in steps of blockDim.x.
+
+        // The column index is tx + blockDim.x * i, but this may exceed the TILE_K.
+
+        // Alternatively, use a loop over the columns in the chunk:
+
+        // For the current chunk's A tile (TS rows x TILE_K columns):
+
+        // Each thread (ty, tx) can load sA[ty][tx] = A[block_row + ty][k_start + tx], but only if tx < TILE_K.
+
+        // Wait, but blockDim.x is TS, so if TILE_K > TS, then this would not cover all columns.
+
+        // Thus, we need multiple passes or a more complex approach.
+
+        // Hmm, perhaps this approach is not feasible for large TILE_K.
+
+        // Maybe using a tiled loading approach with a loop.
+
+        // Let's think differently: each thread can load a single element from A and B per iteration.
+
+        // For A's tile:
+
+        // The starting global row is block_row + ty.
+
+        // The starting column is k_start.
+
+        // The number of columns in the tile is k_end - k_start.
+
+        // Each thread (ty, tx) can load A's element at (block_row + ty, k_start + tx) if tx < (k_end - k_start).
+
+        // But if TILE_K is larger than blockDim.x (e.g., 512 vs 16), then this won't cover all columns. So we need multiple iterations.
+
+        // Alternatively, loop over the columns in the chunk in steps of blockDim.x.
+
+        // For example, for each i in 0 to (TILE_K / blockDim.x):
+
+        // tx = threadIdx.x + i * blockDim.x;
+
+        // but this would require looping over the columns.
+
+        // This complicates the kernel.
+
+        // Perhaps a better way is to use a 1D thread block instead of 2D, but then the indexing becomes different.
+
+        // Alternatively, use a 1D thread block.
+
+        // Let me try to rework the kernel with a 1D thread block.
+
+        // Suppose the block is 1D with blockDim.x = TS*TS = 256 (since TS=16). Each thread corresponds to a single element in the tile (ty, tx).
+
+        // But this might complicate things.
+
+        // Alternatively, let me look for a standard implementation.
+
+        // Upon checking, the standard tiled matrix multiplication kernel uses a 2D block, and each thread is responsible for a portion of the tile.
+
+        // For example, in the CUDA samples, the matrix multiplication example uses a block size of 16x16, and a tile size of 16. The shared memory is 16x16 for each of A and B.
+
+        // However, in that case, the K dimension is processed in chunks of 16.
+
+        // But in our case, we can adjust the tile size for K to be larger, thereby reducing the number of chunks.
+
+        // Let's try to follow the standard approach but with larger tile sizes.
+
+        // Let's use the following parameters:
+
+        // Block size: TSxTS = 16x16
+
+        // TILE_K = 512
+
+        // Shared memory for A: TS rows x TILE_K columns (16x512)
+
+        // Shared memory for B: TILE_K rows x TS columns (512x16)
+
+        // Now, each thread in the block can load a portion of the A and B tiles.
+
+        // For loading A into shared memory:
+
+        // Each thread is assigned to load a row of the A tile (ty) and a column in the A tile.
+
+        // The A tile's columns are from k_start to k_end-1.
+
+        // Since there are blockDim.x (16) threads in x and blockDim.y (16) in y, total 256 threads.
+
+        // To cover 512 columns, each thread can be responsible for 2 columns (since 512 /16 =32, so 16 threads can handle 512 columns in 32 steps).
+
+        // Wait, perhaps the following:
+
+        // Each thread's x index can cover multiple columns.
+
+        // Let’s compute the number of columns each thread needs to load per iteration:
+
+        // Each thread (ty, tx) in the block can load the A tile's element at (ty, k_start + tx + blockDim.x * loop):
+
+        // But this requires a loop over the columns in steps of blockDim.x.
+
+        // For example, in the A load loop:
+
+        for (int i = 0; i < (TILE_K / blockDim.x); i++) {
+
+            int col = k_start + tx + blockDim.x * i;
+
+            if (col < k_end) {
+
+                sA[ty][col - k_start] = A[row_global_A][col];
+
+            }
+
+        }
+
+        // But the row_global_A is block_row + ty.
+
+        // However, this requires that the blockDim.x divides TILE_K. Since 512 is divisible by 16 (512/16=32), this works.
+
+        // Thus, in this way, each thread (ty, tx) will load 32 elements (since 512 /16=32) along the columns.
+
+        // Wait, no, for each thread, tx is from 0 to 15, so for each i from 0 to 31 (since 512/16=32), the col would be tx + 16*i.
+
+        // So each thread (ty, tx) will load 32 elements for their row (ty).
+
+        // However, this would require multiple loops inside the kernel, which might add complexity.
+
+        // Alternatively, since the TILE_K is 512 and the blockDim.x is 16, the number of columns per thread is 512/16 =32.
+
+        // Thus, each thread can load 32 elements along the column direction.
+
+        // But this would require a loop inside the kernel for loading.
+
+        // This seems manageable.
+
+        // Let me proceed with code.
+
+        // For the A tile:
+
+        int a_row = block_row + threadIdx.y;
+
+        int a_col = k_start + threadIdx.x;
+
+        for (int i = 0; i < (TILE_K / blockDim.x); i++) {
+
+            a_col = k_start + threadIdx.x + i * blockDim.x;
+
+            if (a_col < k_end) {
+
+                sA[threadIdx.y][a_col - k_start] = A[a_row * K + a_col];
+
+            }
+
+        }
+
+        // Similarly for B:
+
+        // The B tile has TILE_K rows (from k_start to k_end-1) and TS columns (block_col to block_col + TS -1).
+
+        // Each thread (ty, tx) is responsible for loading a row in the B tile (tx) and a column in the B tile.
+
+        // Wait, B is stored in row-major, so B's element at (row_B, col_B) is located at B[row_B * N + col_B].
+
+        // The B tile is k_start to k_end-1 rows (since B is KxN), and block_col to block_col + TS -1 columns.
+
+        // Each thread (ty, tx) can load B's element at (k_start + ty, block_col + tx).
+
+        // But the B tile has rows from k_start to k_end-1 (TILE_K rows) and columns from block_col to block_col + TS -1 (TS columns).
+
+        // So for the B tile:
+
+        int b_row = k_start + threadIdx.y;
+
+        int b_col = block_col + threadIdx.x;
+
+        for (int i = 0; i < (TILE_K / blockDim.y); i++) {
+
+            b_row = k_start + threadIdx.y + i * blockDim.y;
+
+            if (b_row < k_end) {
+
+                sB[threadIdx.y + i * blockDim.y - k_start][threadIdx.x] = B[b_row * N + b_col];
+
+            }
+
+        }
+
+        // Wait, this is getting too complicated. Maybe another approach is needed.
+
+        // Let me consider that the shared memory for A is TS rows (block's rows) by TILE_K columns (current chunk).
+
+        // Each thread in the block is responsible for a row in the A tile (ty) and a column in steps of blockDim.x.
+
+        // For example, each thread (ty, tx) can load sA[ty][tx] for the first blockDim.x columns, then tx + blockDim.x for the next.
+
+        // But with TILE_K=512 and blockDim.x=16, this would require 512/16 =32 iterations.
+
+        // So for the A tile, each thread can load 32 elements along the columns.
+
+        // The code would be:
+
+        for (int i = 0; i < (TILE_K / blockDim.x); i++) {
+
+            int a_col = k_start + tx + i * blockDim.x;
+
+            if (a_col < k_end) {
+
+                sA[ty][a_col - k_start] = A[ (block_row + ty) * K + a_col ];
+
+            }
+
+        }
+
+        // Similarly for B's tile:
+
+        // The B tile has rows from k_start to k_end-1 (TILE_K rows), and columns from block_col to block_col + TS-1.
+
+        // Each thread (ty, tx) can load a row in steps of blockDim.y (since there are blockDim.y rows in B's tile per thread's ty).
+
+        // Since B's rows are along the first dimension, each thread (ty, tx) can load sB[ty + i * blockDim.y][tx] = B's element.
+
+        // For example:
+
+        for (int i = 0; i < (TILE_K / blockDim.y); i++) {
+
+            int b_row = k_start + ty + i * blockDim.y;
+
+            if (b_row < k_end) {
+
+                sB[b_row - k_start][tx] = B[ b_row * N + (block_col + tx) ];
+
+            }
+
+        }
+
+        // However, this requires that TILE_K is divisible by blockDim.y (16). Since 512 /16 =32, this is okay.
+
+        // So, after these loops, the shared memory tiles are loaded.
+
+        // Then we need to synchronize threads to ensure that all threads have loaded their data into shared memory.
+
+        __syncthreads();
+
+        // Now compute the partial sum for this chunk.
+
+        for (int k = 0; k < (k_end - k_start); k++) {
+
+            Cval += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+
+        }
+
+        // Synchronize again to proceed to next chunk.
+
+        __syncthreads();
+
+    }
+
+    // After all chunks are processed, write the result to global memory.
+
+    C[row * N + col] = Cval;
+
+}
+
+Wait, but in this case, the inner loop over k would be 512 iterations per chunk, which might be slow. Since each chunk is 512, but the loop over k is 512 elements, the total number of operations would be TS^2 * K = 16*16*524288 = 136,314,880 operations. The inner loop per chunk is 512 iterations per thread.
+
+Alternatively, perhaps the inner loop can be vectorized or optimized.
+
+Alternatively, maybe the inner loop can be unrolled or use warp-level parallelism.
+
+Alternatively, perhaps the multiplication can be done in parallel within the thread's portion.
+
+Wait, let's think of the partial sum:
+
+The partial sum for the current chunk is the sum over k in [k_start, k_end) of A_row[k] * B_col[k].
+
+Each thread in the block has access to their row in sA and their column in sB.
+
+Wait, in the code above, for the A tile:
+
+sA has rows 0..TS-1 (block's rows) and columns 0..TILE_K-1 (chunk).
+
+Each thread's sA[threadIdx.y][k] is the element in row threadIdx.y (of the block's rows) and column k (of the chunk).
+
+Similarly, sB has rows 0..TILE_K-1 (chunk) and columns 0..TS-1 (block's columns).
+
+Each thread's sB[k][threadIdx.x] is the element in row k (of the chunk) and column threadIdx.x (of the block's columns).
+
+Thus, the product for thread (ty, tx) is sA[ty][k] * sB[k][tx].
+
+Summing over k from 0 to TILE_K-1 (within the chunk).
+
+Wait, but in the code above, the loop over k is from 0 to (k_end -k_start), which is exactly the chunk size.
+
+The code's inner loop is per-thread, so each thread does this loop.
+
+With TILE_K=512, each thread would have to loop 512 times per chunk, which is expensive.
+
+This could be a bottleneck.
+
+Hmm, that's a problem. Because 512 iterations per thread, 1024 chunks, would mean 512 *1024 = 524,288 iterations per thread. That's a lot.
+
+Wait, but each chunk is processed in the outer loop. For each chunk, the threads load the tiles into shared memory, then perform the 512 iterations in the inner loop.
+
+This is going to be slow because of the high number of iterations and the loop overhead.
+
+Alternative Idea: Instead of looping over each k in the chunk, use vectorized operations or unroll the loop.
+
+Alternatively, perhaps the inner loop can be parallelized within the thread.
+
+Wait, but each thread is responsible for a single element's contribution. So each thread has to compute the sum over k of A[row][k] * B[k][col], where row and col are their element's coordinates.
+
+The current approach for the inner loop is per-thread and per-chunk.
+
+Perhaps a better way is to compute the inner loop across all threads in the block.
+
+Wait, the shared memory tiles are already loaded, so perhaps we can have each thread compute a portion of the sum.
+
+For example, in the inner loop over k, each thread can compute a portion of the products and accumulate them.
+
+Wait, but the loop over k is the same for all threads in the block. Since the threads are working on different elements, but the k loop is over the same indices, perhaps it's better to compute the product for all k and accumulate in parallel.
+
+Alternatively, unroll the loop over k.
+
+But with 512 iterations, that's not feasible.
+
+Hmm, perhaps the initial approach is not optimal. Maybe I should try a different tile size.
+
+Alternatively, go back to the original idea where the TILE_K is 16, which would require many chunks but the inner loop is only 16 iterations per chunk.
+
+With TILE_K=16:
+
+Each chunk's inner loop would have 16 iterations.
+
+Number of chunks would be 524288 /16 = 32,768.
+
+Thus, each thread would have 32,768 *16 = 524,288 iterations. That's the same total operations but distributed across more chunks.
+
+The inner loop would be shorter, which might be better for loop overhead, but the number of chunks is higher, leading to more shared memory loads.
+
+Hmm.
+
+Alternatively, a balance between the two. Let's choose TILE_K=32.
+
+Then:
+
+Inner loop iterations per chunk:32.
+
+Number of chunks: 524288/32=16,384.
+
+Total iterations per thread: 16,384 *32 = 524,288.
+
+Same total, but the loop overhead per chunk is manageable.
+
+The shared memory for sA and sB would be TS=16, so sA is 16x32 (512 elements), sB is 32x16 (512 elements). Total 2048 floats (8KB), which is better.
+
+This might be a better approach.
+
+Thus, let me re-calculate with TILE_K=32:
+
+TS=16, TILE_K=32.
+
+Shared memory for sA: 16x32 = 512 floats.
+
+Shared memory for sB:32x16 =512 floats.
+
+Total shared memory per block: 2048 floats *4 bytes = 8KB.
+
+This is very small, so it's better.
+
+Now, the inner loop for each chunk would be 32 iterations, which is manageable.
+
+Thus, let's proceed with this configuration.
+
+Now, revising the code:
+
+Kernel parameters:
+
+TS=16, TILE_K=32.
+
+Each block is 16x16 threads.
+
+Shared memory for A:16x32 (TS rows x TILE_K cols)
+
+Shared memory for B:32x16 (TILE_K rows x TS cols)
+
+Loading A's tile into shared memory:
+
+Each thread (ty, tx) in the block can be responsible for a row in the A tile (ty) and a column in the chunk (tx).
+
+But with TILE_K=32 and blockDim.x=16, the columns per thread would need to be covered in steps.
+
+Since 32 columns, and 16 threads in x-direction:
+
+Each thread can handle two columns.
+
+So:
+
+for (int i = 0; i < (TILE_K / blockDim.x); i++) {
+
+    int col_in_A = k_start + tx + i * blockDim.x;
+
+    if (col_in_A < k_end) {
+
+        sA[ty][tx + i * blockDim.x] = A[ (block_row + ty) * K + col_in_A ];
+
+    }
+
+}
+
+Wait, but with blockDim.x=16, and TILE_K=32, the loop runs twice (32/16=2). So each thread can handle two columns.
+
+Alternatively, each thread can load two elements per iteration.
+
+Alternatively, the code could be:
+
+int col = k_start + tx + i * blockDim.x;
+
+if (col < k_end) {
+
+    sA[ty][tx + i * blockDim.x] = A[ ... ];
+
+}
+
+But for i=0: tx goes from 0-15, so columns 0-15.
+
+For i=1: tx + 16 (but blockDim.x=16, so tx can go beyond 15? No, tx is threadIdx.x, which is 0-15.
+
+Thus, tx + i * blockDim.x would be 0+0*16=0, 1+0*16=1,...,15+0*16=15 for i=0,
+
+and 0+16=16, ...,15+16=31 for i=1.
+
+Thus, each thread (ty, tx) handles column tx for i=0 and tx+16 for i=1.
+
+This way, all 32 columns are loaded.
+
+Similarly for B's tile.
+
+For B's tile:
+
+Each thread (ty, tx) can load rows in the chunk's rows (k_start to k_end-1) and columns in the block's column direction.
+
+The B tile has dimensions TILE_K rows x TS columns.
+
+Each thread (ty, tx) can load sB[ty + i * blockDim.y][tx], where i is the loop over the rows.
+
+Since blockDim.y is 16, and TILE_K=32, we need 2 iterations.
+
+Thus:
+
+for (int i =0; i < (TILE_K / blockDim.y); i++) {
+
+    int row_in_B = k_start + ty + i * blockDim.y;
+
+    if (row_in_B < k_end) {
+
+        sB[ty + i * blockDim.y][tx] = B[ row_in_B * N + (block_col + tx) ];
+
+    }
+
+}
+
+This way, each thread (ty, tx) loads two rows (ty and ty+16) into the sB array.
+
+After loading both tiles into shared memory, we perform the inner loop over the current chunk's K elements (32):
+
+for (int k =0; k < (k_end -k_start); k++) {
+
+    Cval += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+
+}
+
+This loop has 32 iterations, which is manageable.
+
+Thus, the kernel code can be written with these parameters.
+
+Now, compiling this into code.
+
+First, in the Python code, we need to define the kernel, load it inline, and then use it.
+
+The kernel function would be written in CUDA C++.
+
+The parameters for the kernel would be:
+
+- A and B as pointers to const float
+
+- C as pointer to float
+
+- M, N, K as integers (the matrix dimensions)
+
+- TS and TILE_K as the tile sizes.
+
+Wait, but in CUDA kernels, constants can be passed as template parameters or defined as #defines.
+
+Alternatively, hardcode TS and TILE_K in the kernel for simplicity, since they are fixed for the given problem dimensions.
+
+Given that M=256, N=256, K=524288, the tile sizes TS=16 and TILE_K=32 are fixed.
+
+Thus, we can hardcode TS and TILE_K in the kernel.
+
+Thus, in the kernel code:
+
+#define TS 16
+
+#define TILE_K 32
+
+Then, the kernel:
+
+__global__ void matmul_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+
+                             int M, int N, int K) {
+
+    int block_row = blockIdx.y * TS;
+
+    int block_col = blockIdx.x * TS;
+
+    int row = block_row + threadIdx.y;
+
+    int col = block_col + threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    float Cval = 0.0f;
+
+    for (int chunk =0; chunk < (K + TILE_K -1)/TILE_K; chunk++) {
+
+        int k_start = chunk * TILE_K;
+
+        int k_end = min(k_start + TILE_K, K);
+
+        __shared__ float sA[TS][TILE_K]; // 16x32
+
+        __shared__ float sB[TILE_K][TS]; // 32x16
+
+        // Load A tile into sA
+
+        for (int i =0; i < (TILE_K / blockDim.x); i++) {
+
+            int col_A = k_start + threadIdx.x + i * blockDim.x;
+
+            if (col_A < k_end) {
+
+                sA[threadIdx.y][threadIdx.x + i * blockDim.x] = A[ (block_row + threadIdx.y)*K + col_A ];
+
+            }
+
+        }
+
+        // Load B tile into sB
+
+        for (int i =0; i < (TILE_K / blockDim.y); i++) {
+
+            int row_B = k_start + threadIdx.y + i * blockDim.y;
+
+            if (row_B < k_end) {
+
+                sB[threadIdx.y + i * blockDim.y][threadIdx.x] = B[ row_B * N + (block_col + threadIdx.x) ];
+
+            }
+
+        }
+
+        __syncthreads();
+
+        // Compute the partial sum
+
+        for (int k =0; k < (k_end -k_start); k++) {
+
+            Cval += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    if (row < M && col < N) {
+
+        C[row * N + col] = Cval;
+
+    }
+
+}
+
+Wait, but in the loading loops, the blockDim.x and blockDim.y are set to TS=16. Since the block is dim3(blockDim.x, blockDim.y) = (16,16), so blockDim.x is 16, blockDim.y is 16.
+
+The TILE_K / blockDim.x is 32 /16=2 for the A loop, and similarly for B.
+
+This should work.
+
+Now, in the Python code, we need to compile this kernel.
+
+The kernel requires the block dimensions to be TSxTS = 16x16.
+
+The grid dimensions are ceil(M/TS) x ceil(N/TS).
+
+Since M and N are both 256, which is divisible by 16 (256/16=16), the grid dimensions are 16x16.
+
+The kernel launch would be:
+
+dimGrid = (ceil(N/TS), ceil(M/TS)) → since blockIdx.x is for columns (N direction), and blockIdx.y for rows (M direction).
+
+Wait, in the kernel, block_col is blockIdx.x * TS,
+
+block_row is blockIdx.y * TS.
+
+So the grid dimensions should be (ceil(N/TS), ceil(M/TS)), so that the blocks cover the entire N and M dimensions.
+
+Thus, for N=256, ceil(256/16)=16, so gridDim.x=16,
+
+M=256 → gridDim.y=16.
+
+So the grid is 16x16.
+
+Now, in the Python code:
+
+The user-provided code has M=256, N=256, K=131072*4=524288.
+
+The inputs A and B are passed to the model.
+
+The forward function would replace the torch.matmul with a call to the custom kernel.
+
+First, the Python code would need to define the kernel and load it.
+
+The kernel source code would be written in CUDA C++, and the wrapper function would call it.
+
+Here's the full code:
+
+First, the CUDA kernel code:
+
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define TS 16
+#define TILE_K 32
+
+__global__ void matmul_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+                             int M, int N, int K) {
+    int block_row = blockIdx.y * TS;
+    int block_col = blockIdx.x * TS;
+    int row = block_row + threadIdx.y;
+    int col = block_col + threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    float Cval = 0.0f;
+
+    for (int chunk = 0; chunk < (K + TILE_K - 1) / TILE_K; chunk++) {
+        int k_start = chunk * TILE_K;
+        int k_end = min(k_start + TILE_K, K);
+
+        __shared__ float sA[TS][TILE_K];
+        __shared__ float sB[TILE_K][TS];
+
+        // Load A tile into shared memory
+        for (int i = 0; i < (TILE_K / blockDim.x); i++) {
+            int col_A = k_start + threadIdx.x + i * blockDim.x;
+            if (col_A < k_end) {
+                sA[threadIdx.y][threadIdx.x + i * blockDim.x] = A[(block_row + threadIdx.y) * K + col_A];
+            }
+        }
+
+        // Load B tile into shared memory
+        for (int i = 0; i < (TILE_K / blockDim.y); i++) {
+            int row_B = k_start + threadIdx.y + i * blockDim.y;
+            if (row_B < k_end) {
+                sB[threadIdx.y + i * blockDim.y][threadIdx.x] = B[row_B * N + (block_col + threadIdx.x)];
+            }
+        }
+
+        __syncthreads();
+
+        // Compute partial sum
+        for (int k = 0; k < (k_end - k_start); k++) {
+            Cval += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = Cval;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B, int M, int N, int K) {
+    // Check dimensions
+    auto output = torch::empty({M, N}, A.options());
+
+    dim3 threads(TS, TS);
+    dim3 blocks( (N + TS -1)/TS, (M + TS -1)/TS );
+
+    matmul_kernel<<<blocks, threads>>>(A.data_ptr<float>(), B.data_ptr<float>(), output.data_ptr<float>(),
+                                      M, N, K);
+
+    return output;
+}
+"""
+
+matmul_cpp_source = "torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B, int M, int N, int K);"
+
+Then, in the Python code:
+
+from torch.utils.cpp_extension import load_inline
+
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.M = 256
+        self.N = 256
+        self.K = 131072 *4
+
+    def forward(self, A, B):
+        # Ensure A is MxK and B is KxN
+        assert A.shape == (self.M, self.K)
+        assert B.shape == (self.K, self.N)
+        return matmul.matmul_cuda(A, B, self.M, self.N, self.K)
+
+But wait, in the Python code, the dimensions are fixed, so the model can store M, N, K as attributes.
+
+However, in the provided get_inputs() function, the inputs are generated as A=rand(M, K), B=rand(K, N).
+
+Hence, the code should work.
+
+But let me check the CUDA kernel's parameters:
+
+The kernel expects A to be MxK, B KxN, and the output is MxN.
+
+The kernel's parameters are M, N, K passed as integers.
+
+In the Python wrapper function, the user must pass these values.
+
+In the ModelNew's forward function, the parameters are fixed (since M, N, K are fixed in the problem statement).
+
+Thus, the code is correct.
+
+Potential issues:
+
+- The shared memory declarations inside the kernel: In CUDA, shared memory arrays must be declared outside loops. However, in the current code, the shared memory is declared inside the chunk loop, which is not allowed. Shared memory must be declared at the top of the kernel function.
+
+This is a critical error in the code.
+
+Ah, right! The shared memory must be declared outside the loop. My mistake.
+
+Thus, the shared memory declarations must be moved outside the chunk loop.
+
+Revised kernel:
+
+__global__ void matmul_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+
+                             int M, int N, int K) {
+
+    __shared__ float sA[TS][TILE_K];
+
+    __shared__ float sB[TILE_K][TS];
+
+    int block_row = blockIdx.y * TS;
+
+    int block_col = blockIdx.x * TS;
+
+    int row = block_row + threadIdx.y;
+
+    int col = block_col + threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    float Cval = 0.0f;
+
+    for (int chunk = 0; chunk < (K + TILE_K - 1)/TILE_K; chunk++) {
+
+        int k_start = chunk * TILE_K;
+
+        int k_end = min(k_start + TILE_K, K);
+
+        // Load A tile into shared memory
+
+        for (int i=0; i < (TILE_K / blockDim.x); i++) {
+
+            int col_A = k_start + threadIdx.x + i * blockDim.x;
+
+            if (col_A < k_end) {
+
+                sA[threadIdx.y][threadIdx.x + i * blockDim.x] = A[ (block_row + threadIdx.y)*K + col_A ];
+
+            }
+
+        }
+
+        // Load B tile into shared memory
+
+        for (int i=0; i < (TILE_K / blockDim.y); i++) {
+
+            int row_B = k_start + threadIdx.y + i * blockDim.y;
+
+            if (row_B < k_end) {
+
+                sB[threadIdx.y + i * blockDim.y][threadIdx.x] = B[ row_B * N + (block_col + threadIdx.x) ];
+
+            }
+
+        }
+
+        __syncthreads();
+
+        // Compute partial sum
+
+        for (int k=0; k < (k_end -k_start); k++) {
+
+            Cval += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    if (row < M && col < N) {
+
+        C[row*N + col] = Cval;
+
+    }
+
+}
+
+Now, the shared memory arrays are declared at the top of the kernel.
+
+This should work.
+
+Another thing to check: the B tile's loading.
+
+The B matrix has dimensions K x N, so B's element at row_B, column is stored at B[row_B * N + column].
+
+The block_col is the starting column for the block's tile in the output matrix (C), so the B's column is block_col + threadIdx.x (since each thread in the block is responsible for a column in the block's tile).
+
+Yes.
+
+Now, compiling this code.
+
+The CUDA code should be correct.
+
+Thus, the final code in Python would be as follows:
+
+The complete code is enclosed in a code block.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define TS 16
+#define TILE_K 32
+
+__global__ void matmul_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+                             int M, int N, int K) {
+    __shared__ float sA[TS][TILE_K];
+    __shared__ float sB[TILE_K][TS];
+
+    int block_row = blockIdx.y * TS;
+    int block_col = blockIdx.x * TS;
+    int row = block_row + threadIdx.y;
+    int col = block_col + threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    float Cval = 0.0f;
+
+    for (int chunk = 0; chunk < (K + TILE_K - 1) / TILE_K; chunk++) {
+        int k_start = chunk * TILE_K;
+        int k_end = min(k_start + TILE_K, K);
+
+        // Load A tile into shared memory
+        for (int i = 0; i < (TILE_K / blockDim.x); i++) {
+            int col_A = k_start + threadIdx.x + i * blockDim.x;
+            if (col_A < k_end) {
+                sA[threadIdx.y][threadIdx.x + i * blockDim.x] = A[(block_row + threadIdx.y) * K + col_A];
+            }
+        }
+
+        // Load B tile into shared memory
+        for (int i = 0; i < (TILE_K / blockDim.y); i++) {
+            int row_B = k_start + threadIdx.y + i * blockDim.y;
+            if (row_B < k_end) {
+                sB[threadIdx.y + i * blockDim.y][threadIdx.x] = B[row_B * N + (block_col + threadIdx.x)];
+            }
+        }
+
+        __syncthreads();
+
+        // Compute partial sum
+        for (int k = 0; k < (k_end - k_start); k++) {
+            Cval += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = Cval;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B, int M, int N, int K) {
+    auto output = torch::empty({M, N}, A.options());
+
+    dim3 threads(TS, TS);
+    dim3 blocks((N + TS - 1) / TS, (M + TS - 1) / TS);
+
+    matmul_kernel<<<blocks, threads>>>(A.data_ptr<float>(), B.data_ptr<float>(), output.data_ptr<float>(), M, N, K);
+
+    return output;
+}
+"""
+
+matmul_cpp_source = "torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B, int M, int N, int K);"
+
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.M = 256
+        self.N = 256
+        self.K = 131072 * 4
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        assert A.shape == (self.M, self.K), f"Expected A shape {self.M}x{self.K}, got {A.shape}"
+        assert B.shape == (self.K, self.N), f"Expected B shape {self.K}x{self.N}, got {B.shape}"
+        return matmul.matmul_cuda(A, B, self.M, self.N, self.K)
+
+def get_inputs():
+    A = torch.randn(256, 131072 * 4).cuda()
+    B = torch.randn(131072 * 4, 256).cuda()
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization needed
+```
+
+This code defines a custom CUDA kernel for matrix multiplication optimized for the given dimensions. It uses tiling to improve memory access efficiency and parallelism, reducing the number of global memory accesses by utilizing shared memory. The kernel is designed with tile sizes of 16x16 for the output matrix and chunks of 32 along the K dimension to balance shared memory usage and computational load. The Python interface compiles the CUDA code on the fly and integrates it into PyTorch's ModelNew class.
+</think>

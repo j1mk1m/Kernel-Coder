@@ -1,0 +1,64 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D convolution
+conv3d_source = """
+// Implement the custom CUDA kernel for 3D convolution here
+"""
+
+conv3d_cpp_source = (
+    // Implement the custom CUDA function signature here
+)
+
+# Compile the inline CUDA code for 3D convolution
+conv3d = load_inline(
+    name="conv3d",
+    cpp_sources=conv3d_cpp_source,
+    cuda_sources=conv3d_source,
+    functions=["conv3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Group Normalization
+group_norm_source = """
+// Implement the custom CUDA kernel for Group Normalization here
+"""
+
+group_norm_cpp_source = (
+    // Implement the custom CUDA function signature here
+)
+
+# Compile the inline CUDA code for Group Normalization
+group_norm = load_inline(
+    name="group_norm",
+    cpp_sources=group_norm_cpp_source,
+    cuda_sources=group_norm_source,
+    functions=["group_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups):
+        super(ModelNew, self).__init__()
+        self.conv = conv3d
+        self.group_norm = group_norm
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.group_norm(x)
+        x = x.mean(dim=[1, 2, 3, 4])
+        return x
+
+# Example usage
+model_new = ModelNew(in_channels, out_channels, kernel_size, num_groups)
+input_tensor = get_inputs()[0].cuda()
+output_tensor = model_new(input_tensor)
+print(output_tensor.shape)

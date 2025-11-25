@@ -1,0 +1,87 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_kernel(const float* input, const float* weight, float* output, int input_height, int input_width, int output_height, int output_width, int channels, int kernel_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < output_height && col < output_width) {
+        float sum = 0.0f;
+        for (int c = 0; c < channels; ++c) {
+            for (int ky = 0; ky < kernel_size; ++ky) {
+                for (int kx = 0; kx < kernel_size; ++kx) {
+                    int i_row = row * kernel_size + ky - kernel_size / 2;
+                    int i_col = col * kernel_size + kx - kernel_size / 2;
+                    if (i_row >= 0 && i_row < input_height && i_col >= 0 && i_col < input_width) {
+                        sum += input[(i_row * input_width + i_col) * channels + c] * weight[(ky * kernel_size + kx) * channels + c];
+                    }
+                }
+            }
+        }
+        output[row * output_width + col] = sum;
+    }
+}
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto input_shape = input.size();
+    auto weight_shape = weight.size();
+    auto output_shape = torch::IntArrayRef({input_shape[0], input_shape[2] - weight_shape[2] + 1, input_shape[3] - weight_shape[3] + 1, weight_shape[0]});
+    auto output = torch::zeros(output_shape, input.options());
+
+    const int block_size = 16;
+    dim3 grid((output_shape[3] + block_size - 1) / block_size, (output_shape[2] + block_size - 1) / block_size);
+    dim3 block(block_size, block_size);
+
+    convolution_kernel<<<grid, block>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), input_shape[2], input_shape[3], output_shape[2], output_shape[3], input_shape[1], weight_shape[2]);
+
+    return output;
+}
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.subtract_value = subtract_value
+        self.pool = nn.MaxPool2d(pool_kernel_size)
+
+    def forward(self, x):
+        x = self.conv.convolution_cuda(x, self.weight)
+        x = x - self.subtract_value
+        x = torch.nn.functional.hardswish(x)
+        x = self.pool(x)
+        x = torch.nn.functional.mish(x)
+        return x
+
+# Initialize weights for the convolution layer
+model_new = ModelNew(in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size)
+model_new.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size))
+
+# Get inputs
+inputs = get_inputs()
+
+# Forward pass
+output = model_new(inputs[0])
+print(output.shape)

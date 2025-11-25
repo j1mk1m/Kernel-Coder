@@ -1,0 +1,6 @@
+## Explanation
+
+- **Operator Replacements**: Explain which operators were replaced with custom CUDA kernels and why.
+- **Algorithmic Changes**: If any algorithmic changes were made, describe them.
+- **Fusion Opportunities**: If any operator fusion was done, explain how it improves performance.
+- **Performance Improvements**: Discuss expected performance improvements compared to the original architecture.

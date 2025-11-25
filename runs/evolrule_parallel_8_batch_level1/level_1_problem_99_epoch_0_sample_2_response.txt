@@ -1,0 +1,790 @@
+Consider that the input shapes are large (e.g. batch_size = 32768, input_shape = (8192,)), so that the optimization is non-trivial. 
+
+The key idea is to **fuse multiple operations into a single kernel to reduce memory traffic and synchronization overhead**, and optimize the computation of Triplet Margin Loss. 
+
+The TripletMarginLoss function can be written as:
+
+loss = max(d(a, p) - d(a, n) + margin, 0)
+
+where d(a,p) is the distance between anchor and positive, etc. 
+
+The distance function d is by default L2 distance, but could also be squared L2 distance. In our case, we use squared L2 distance (since the default in PyTorch's TripletMarginLoss is L2 distance, but when the input dimensions are large, squaring could be better? Let me confirm: the user says "default in PyTorch's TripletMarginLoss is L2 distance" so in our case we need to compute L2 distance.
+
+Wait, the user's code uses TripletMarginLoss which by default is L2 distance. So, in their code, the loss is computed as the triplet margin loss with L2 distance between the vectors.
+
+The steps involved in TripletMarginLoss (with reduction='none') are as follows:
+
+Compute the pairwise distances between anchor and positive (d_ap) and anchor and negative (d_an).
+
+The loss for each sample is max(d_ap - d_an + margin, 0).
+
+Then, the final loss is the mean (or sum) of these losses, depending on the reduction parameter. However, in the given code, the user's Model uses the default reduction (mean).
+
+Therefore, the computation steps are:
+
+1. Compute d_ap = ||anchor - positive||_2
+2. Compute d_an = ||anchor - negative||_2
+3. Compute the element-wise loss: (d_ap - d_an + margin).clamp(min=0)
+4. Take the mean (since default reduction is mean)
+
+But the question is, how to compute these distances efficiently in a single fused kernel.
+
+Breaking down each distance:
+
+d_ap = sqrt( sum_{i=1}^D (a_i - p_i)^2 ), where D is the input dimension (dim = 1, but in the input_shape (8192,), the actual dimension may be 8192? Wait, the input_shape is (8192,), so each sample is of dimension 8192.
+
+Wait, in the given architecture, the input_shape is (8192,), but the dim parameter is set to 1. Wait, no, looking at the code:
+
+Wait in the given Model class, the input is anchor, positive, negative. The default TripletMarginLoss in PyTorch computes pairwise distances between the embeddings. The input shape is batch_size x D, where D is the embedding dimension. The code in the given architecture says:
+
+input_shape = (8192,)
+dim = 1
+
+Wait, perhaps there is a confusion here. The TripletMarginLoss in PyTorch requires that the embeddings are vectors (so the last dimension is the embedding dimension). The default dim in PyTorch's TripletMarginLoss is 1, which is the standard for embeddings (so each sample is a vector of shape (embedding_dim,)). But in the given code, the input_shape is (8192,), which suggests that each sample is a vector of dimension 8192, and the batch size is 32768. So the inputs are tensors of shape [32768, 8192].
+
+Therefore, the distance computation for each triplet (anchor, positive, negative) is done over the 8192-dimensional vectors.
+
+Computing d_ap and d_an for each sample involves:
+
+For each sample in the batch:
+
+Compute the squared differences between anchor and positive, sum over the features, then take sqrt. Similarly for negative.
+
+But sqrt is a non-linear operation, so perhaps fusing the distance computation and the loss computation can save some steps.
+
+The key is to compute for each sample:
+
+loss_i = max( sqrt( sum( (a_i - p_i)^2 )) - sqrt( sum( (a_i - n_i)^2 )) + margin, 0 )
+
+But sqrt is an expensive operation. If the default in the PyTorch implementation uses squared distances, then the loss would be:
+
+loss_i = max( (d_ap^2 - d_an^2) + margin, 0 )
+
+Wait, no, because the original TripletMarginLoss uses L2 distance, so it's the sqrt, so the margin is applied on the square roots. 
+
+Alternatively, if we can compute the squared distances, but then the loss would be different. So we must adhere to the original computation to maintain correctness.
+
+Therefore, the operations are:
+
+For each sample i in the batch:
+
+Compute the squared differences between anchor and positive:
+
+diff_ap = anchor[i] - positive[i]
+
+squared_diff_ap = diff_ap ** 2
+
+sum_squared_ap = sum(squared_diff_ap)
+
+d_ap = sqrt(sum_squared_ap)
+
+Similarly for diff_an and d_an.
+
+Then compute (d_ap - d_an + margin).clamp(min=0)
+
+Sum all these terms, then average.
+
+The problem is that these operations involve per-element computations, reductions (sum over features), sqrt, and then the max with zero.
+
+The goal is to implement this in a single kernel to minimize memory traffic and reduce overhead.
+
+The standard approach in PyTorch might involve multiple kernel launches for each of these steps, which can introduce overhead. By fusing these steps into a single kernel, we can avoid these overheads and reduce memory transfers.
+
+First, the plan is to:
+
+- Compute the difference between anchor and positive, compute squared differences, sum over the features to get d_ap squared, then take sqrt.
+
+Wait, no: the difference is per-element, so for each element in the feature dimension, compute (a_p_j - p_j)^2 for each j from 1 to D, then sum all those to get the squared distance. Then sqrt gives the L2 distance.
+
+Similarly for the negative.
+
+Then, compute the loss for each sample.
+
+The steps can be done in a single kernel:
+
+For each sample i:
+
+1. Compute the squared difference between anchor and positive for each feature.
+
+2. Sum all squared differences to get sum_ap_squared.
+
+3. Take sqrt to get d_ap.
+
+4. Compute the squared difference between anchor and negative, sum, sqrt to get d_an.
+
+5. Compute loss_i = max(d_ap - d_an + margin, 0)
+
+Then, accumulate all loss_i and divide by batch size.
+
+Wait, but for a batch size of 32768, and each sample has 8192 features, the total data is 32768 * 8192 * 4 bytes (assuming float32) which is ~ 1GB per tensor (anchor, positive, negative), so 3GB total. That's manageable on a GPU, but the computation needs to be optimized.
+
+Now, the key is to perform all these steps in a single kernel. Let's think about how to structure the kernel.
+
+Each thread can handle a single sample. Since the batch size is 32768, we can have a grid of blocks where each block processes some samples. The number of threads per block can be chosen to have coalesced memory access.
+
+Wait, but processing each sample independently, so each thread can process one sample. Let's see:
+
+The total number of samples is 32768. The number of threads per block should be chosen to be a multiple of the warp size (32), say 256 or 512. Let's say 256 threads per block. Then the number of blocks needed is 32768 / 256 = 128 blocks. That's manageable.
+
+Each thread would process one sample. For each sample:
+
+- The thread needs to compute the sum of squared differences between the anchor and positive vectors, and similarly for the anchor and negative vectors.
+
+The vectors are of length 8192. So for each thread, this involves looping over 8192 elements.
+
+But 8192 is a large number of elements. So, per-thread, this would be a loop over 8192 elements. That could be slow. Alternatively, we can vectorize the computation.
+
+Alternatively, maybe we can process the features in parallel using shared memory or other techniques, but with each sample being independent, it's better to process each sample in a thread, but the per-thread computation is O(D), which may be expensive.
+
+Alternatively, maybe we can process the features in parallel per thread. Wait, but each thread is handling a single sample. So for each sample, the thread must compute the sum over D elements.
+
+Hmm. Let me think: for each sample, the thread can load the anchor, positive, and negative vectors, compute the squared differences for each element, accumulate the sums, then compute d_ap and d_an, then compute the loss.
+
+This would require that each thread reads 3 vectors of length D (8192), which is 24KB per thread (since 8192 * 4 bytes * 3 = 98304 bytes). For 32768 threads, this would be a lot of memory access.
+
+But with the batch size being 32768, this might be challenging. However, since each thread is processing a different sample, the memory access might be scattered, leading to poor memory coalescing. Wait, no: the samples are stored in contiguous memory. So for example, the anchor tensor is a 32768 x 8192 matrix stored in row-major order. Each sample is a row. So for thread i, it would access the i-th row of anchor, positive, and negative.
+
+Therefore, accessing the elements for a single sample would be contiguous in memory for that sample's row, but across threads, each thread is accessing a different row, so the memory accesses are not coalesced. This may lead to poor memory performance.
+
+An alternative is to process the features in parallel across threads. Let me think differently:
+
+Suppose we have a grid of blocks, each block processes a set of features, and across threads, each thread processes a sample. Wait, this is getting complicated.
+
+Alternatively, perhaps we can reorganize the computation to compute the sum over features more efficiently.
+
+Let me think of the steps again.
+
+For each sample i:
+
+Compute sum_ap = sum_{j=1}^D (a[i][j] - p[i][j])^2
+
+Similarly sum_an = sum_{j=1}^D (a[i][j] - n[i][j])^2
+
+Then d_ap = sqrt(sum_ap)
+
+d_an = sqrt(sum_an)
+
+loss_i = max(d_ap - d_an + margin, 0.0)
+
+Then, the total loss is the average of loss_i over all i.
+
+The critical part is computing sum_ap and sum_an for each sample.
+
+Computing sum_ap for a single sample requires O(D) operations. Since D is 8192, this is a lot per sample.
+
+Therefore, the total computational work is O(batch_size * D) for the sum operations, plus O(batch_size) for the sqrt and the loss computation.
+
+Given that batch_size is 32768 and D is 8192, that's 32768 * 8192 = ~268 million operations for each of sum_ap and sum_an. That's a lot, but manageable on a GPU if parallelized properly.
+
+The key is to structure the kernel so that each thread can process one sample, and the memory accesses are efficient.
+
+Let me consider the following kernel structure:
+
+Each thread is responsible for one sample. The kernel loops over all features for that sample, accumulating the sum.
+
+The kernel code would look like:
+
+__global__ void triplet_loss_kernel(
+    const float* anchor,
+    const float* positive,
+    const float* negative,
+    float* loss,
+    int batch_size,
+    int dim,
+    float margin) {
+
+    int sample_idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (sample_idx >= batch_size) return;
+
+    float sum_ap = 0.0f;
+    float sum_an = 0.0f;
+
+    for (int j = 0; j < dim; ++j) {
+        float a = anchor[sample_idx * dim + j];
+        float p = positive[sample_idx * dim + j];
+        float n = negative[sample_idx * dim + j];
+
+        float diff_ap = a - p;
+        sum_ap += diff_ap * diff_ap;
+
+        float diff_an = a - n;
+        sum_an += diff_an * diff_an;
+    }
+
+    float d_ap = sqrt(sum_ap);
+    float d_an = sqrt(sum_an);
+
+    float loss_i = d_ap - d_an + margin;
+    loss[sample_idx] = (loss_i > 0) ? loss_i : 0.0f;
+}
+
+Then, after computing all loss_i, we can compute the mean by summing all loss_i and dividing by batch_size.
+
+However, this approach has a problem: the per-thread loop over D elements (8192) is going to be very slow, because for each thread, it has to loop 8192 times. This is a problem because the loop is sequential and each iteration is doing a small amount of work. 
+
+Therefore, this approach is not efficient because the per-thread computation is too large. 
+
+Alternative approach: use a tiled approach where multiple threads in a block collaborate to compute the sum for a single sample. 
+
+Suppose that for each sample, we use a block of threads to compute the sum. Let's say the block size is 256 threads. Each thread in the block handles a portion of the features. 
+
+So for a sample with D=8192 features, and a block size of 256 threads, each thread would process 8192 / 256 = ~32 elements.
+
+The steps would be:
+
+For a given sample (assigned to a block), the block's threads divide the features among themselves. Each thread computes the partial sum for its portion, then perform a reduction within the block to get the total sum.
+
+This way, each thread's work per sample is O(D / threads_per_block), which is manageable.
+
+Let me structure the kernel this way.
+
+Let me define the kernel such that each block handles one sample. The block has, say, 256 threads. 
+
+The kernel would be:
+
+__global__ void triplet_loss_kernel(
+    const float* anchor,
+    const float* positive,
+    const float* negative,
+    float* loss,
+    int batch_size,
+    int dim,
+    float margin) {
+
+    // Each block handles one sample
+    int sample_idx = blockIdx.x;
+
+    if (sample_idx >= batch_size) return;
+
+    // Each thread in the block handles a chunk of features
+    int tid = threadIdx.x;
+    __shared__ float shared_sums[2][256]; // [0] for ap, [1] for an
+
+    float sum_ap = 0.0f;
+    float sum_an = 0.0f;
+
+    for (int j = tid; j < dim; j += blockDim.x) {
+        float a = anchor[sample_idx * dim + j];
+        float p = positive[sample_idx * dim + j];
+        float n = negative[sample_idx * dim + j];
+
+        float diff_ap = a - p;
+        sum_ap += diff_ap * diff_ap;
+
+        float diff_an = a - n;
+        sum_an += diff_an * diff_an;
+    }
+
+    // Write partial sums to shared memory
+    shared_sums[0][tid] = sum_ap;
+    shared_sums[1][tid] = sum_an;
+
+    __syncthreads();
+
+    // Perform block reduction for sum_ap and sum_an
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sums[0][tid] += shared_sums[0][tid + s];
+            shared_sums[1][tid] += shared_sums[1][tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum_ap = shared_sums[0][0];
+        float total_sum_an = shared_sums[1][0];
+
+        float d_ap = sqrt(total_sum_ap);
+        float d_an = sqrt(total_sum_an);
+
+        float loss_i = d_ap - d_an + margin;
+        loss[sample_idx] = (loss_i > 0) ? loss_i : 0.0f;
+    }
+}
+
+This way, each block processes one sample. The threads in the block divide the feature dimensions among themselves, compute partial sums, then reduce those sums to get the total.
+
+The number of blocks needed is equal to the batch size (32768). The number of threads per block is, say, 256.
+
+This approach reduces the per-thread loop count from 8192 to 8192/256 = ~32 iterations, which is better. 
+
+The shared memory usage is 2 * blockDim.x floats. For 256 threads, that's 512 floats, which is manageable.
+
+The reduction is done via a standard block reduction.
+
+Then, after computing all the loss_i values, we need to compute the mean by summing all loss_i and dividing by batch_size.
+
+This final step can be done in another kernel, but that would require an additional kernel launch. To minimize kernel launches, perhaps we can compute the total loss in the same kernel and use atomic operations. But atomic operations can be slow. Alternatively, we can do a reduction over the loss array in a separate kernel.
+
+Alternatively, we can compute the total loss in the same kernel by having each block contribute its loss_i to a global sum. However, this may require atomic operations or a separate reduction step.
+
+Alternatively, after the first kernel computes all loss_i into the loss array, we can perform a kernel to compute the sum of loss array elements, then divide by batch_size to get the final loss value.
+
+But since the user's code requires the loss to be returned as a tensor (since the original code returns self.loss_fn(...)), which is a scalar tensor, we need to return the mean.
+
+Therefore, the steps are:
+
+1. Launch the kernel to compute loss_i for each sample, storing them in an array.
+
+2. Compute the sum of the loss array elements, then divide by batch_size to get the mean.
+
+The sum can be done via a reduction kernel. However, to further reduce overhead, perhaps the first kernel can be modified to compute the total loss in shared memory, but that may complicate things.
+
+Alternatively, for the purposes of the problem, perhaps we can first focus on fusing the computation of loss_i into a single kernel, then handle the summation as a separate step. Since the problem allows replacing multiple operators, the summation can be handled by another kernel or using PyTorch's mean function.
+
+Wait, in the original code, the TripletMarginLoss returns the mean of the losses. Therefore, after computing all loss_i in an array, we can simply call loss.mean() in PyTorch, which is a fast operation.
+
+Therefore, the plan is:
+
+- Implement the kernel to compute all loss_i for each sample, storing in a tensor.
+
+- Then, compute the mean of that tensor using PyTorch's .mean() method.
+
+However, in the fused kernel approach, we can also compute the total sum in the kernel and return it as a scalar, but that requires using atomicAdd for the sum, which may be slower than using PyTorch's reduction.
+
+Alternatively, let's proceed with the first approach.
+
+Now, in code, the kernel would be written in CUDA, and the Python code would launch it.
+
+First, let's define the kernel.
+
+The input tensors are anchor, positive, negative, which are all of shape (batch_size, dim).
+
+The output is a tensor of shape (batch_size, ) containing the loss_i for each sample.
+
+The kernel requires:
+
+- The pointers to the input tensors.
+
+- The batch_size and dim as parameters.
+
+- The margin as a parameter.
+
+The code would be as follows.
+
+First, the CUDA source code:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <int BlockSize>
+__global__ void triplet_loss_kernel(
+    const float* __restrict__ anchor,
+    const float* __restrict__ positive,
+    const float* __restrict__ negative,
+    float* loss,
+    int batch_size,
+    int dim,
+    float margin) {
+
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    extern __shared__ float shared_sums[];
+    // shared_sums is size 2 * BlockSize (for ap and an)
+
+    float* sum_ap = &shared_sums[0 * BlockSize];
+    float* sum_an = &shared_sums[1 * BlockSize];
+
+    int tid = threadIdx.x;
+
+    sum_ap[tid] = 0.0f;
+    sum_an[tid] = 0.0f;
+
+    for (int j = tid; j < dim; j += BlockSize) {
+        int idx = sample_idx * dim + j;
+        float a = anchor[idx];
+        float p = positive[idx];
+        float n = negative[idx];
+
+        float diff_ap = a - p;
+        sum_ap[tid] += diff_ap * diff_ap;
+
+        float diff_an = a - n;
+        sum_an[tid] += diff_an * diff_an;
+    }
+
+    __syncthreads();
+
+    // Reduction in shared memory
+    for (int s = BlockSize / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum_ap[tid] += sum_ap[tid + s];
+            sum_an[tid] += sum_an[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum_ap = sum_ap[0];
+        float total_sum_an = sum_an[0];
+
+        float d_ap = sqrt(total_sum_ap);
+        float d_an = sqrt(total_sum_an);
+
+        float loss_i = d_ap - d_an + margin;
+        loss[sample_idx] = loss_i > 0 ? loss_i : 0.0f;
+    }
+}
+
+torch::Tensor triplet_loss_cuda(
+    torch::Tensor anchor,
+    torch::Tensor positive,
+    torch::Tensor negative,
+    float margin) {
+
+    const int batch_size = anchor.size(0);
+    const int dim = anchor.size(1);
+
+    auto loss = torch::empty({batch_size}, torch::device("cuda"));
+
+    const int block_size = 256; // Tune this
+    int num_blocks = batch_size;
+
+    // The shared memory needed is 2 * block_size floats (ap and an)
+    size_t shared_mem_size = 2 * block_size * sizeof(float);
+
+    triplet_loss_kernel<block_size><<<num_blocks, block_size, shared_mem_size>>>(
+        anchor.data_ptr<float>(),
+        positive.data_ptr<float>(),
+        negative.data_ptr<float>(),
+        loss.data_ptr<float>(),
+        batch_size,
+        dim,
+        margin);
+
+    cudaDeviceSynchronize(); // Ensure completion
+
+    return loss.mean(); // Compute mean as per PyTorch's TripletMarginLoss default
+}
+
+Wait, but in this code, the kernel returns the individual loss_i in the loss tensor, then the function returns the mean of that tensor. That's correct.
+
+But in the kernel, each block processes one sample. The number of blocks is equal to the batch_size (32768). The number of threads per block is block_size (256). The shared memory is 2 * block_size floats.
+
+Wait, but for the kernel, the __shared__ memory is allocated via the extern __shared__ syntax. The total shared memory per block is 2 * block_size * sizeof(float). Since block_size is 256, this is 2*256*4 bytes = 2KB per block, which is acceptable.
+
+The kernel is parameterized with the block_size as a template parameter. This allows tuning. The function triplet_loss_cuda is responsible for choosing the block size (here, 256), and launching the kernel with the appropriate parameters.
+
+Now, in Python code, we can compile this CUDA code using load_inline, and then use it in the ModelNew class.
+
+But wait, the original Model uses the TripletMarginLoss module, which is initialized with a margin. The new ModelNew should take the margin as a parameter, just like the original.
+
+Therefore, the code would be structured as follows.
+
+First, define the CUDA kernel code as a string.
+
+Then, compile it into a Python function using load_inline.
+
+Then, create a ModelNew class that takes the margin and uses the CUDA function.
+
+Let's proceed.
+
+The full Python code would look like this:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+triplet_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <int BlockSize>
+__global__ void triplet_loss_kernel(
+    const float* __restrict__ anchor,
+    const float* __restrict__ positive,
+    const float* __restrict__ negative,
+    float* loss,
+    int batch_size,
+    int dim,
+    float margin) {
+
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    extern __shared__ float shared_sums[];
+    float* sum_ap = &shared_sums[0 * BlockSize];
+    float* sum_an = &shared_sums[1 * BlockSize];
+
+    int tid = threadIdx.x;
+
+    sum_ap[tid] = 0.0f;
+    sum_an[tid] = 0.0f;
+
+    for (int j = tid; j < dim; j += BlockSize) {
+        int idx = sample_idx * dim + j;
+        float a = anchor[idx];
+        float p = positive[idx];
+        float n = negative[idx];
+
+        float diff_ap = a - p;
+        sum_ap[tid] += diff_ap * diff_ap;
+
+        float diff_an = a - n;
+        sum_an[tid] += diff_an * diff_an;
+    }
+
+    __syncthreads();
+
+    for (int s = BlockSize / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum_ap[tid] += sum_ap[tid + s];
+            sum_an[tid] += sum_an[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum_ap = sum_ap[0];
+        float total_sum_an = sum_an[0];
+
+        float d_ap = sqrt(total_sum_ap);
+        float d_an = sqrt(total_sum_an);
+
+        float loss_i = d_ap - d_an + margin;
+        loss[sample_idx] = loss_i > 0 ? loss_i : 0.0f;
+    }
+}
+
+torch::Tensor triplet_loss_cuda(
+    torch::Tensor anchor,
+    torch::Tensor positive,
+    torch::Tensor negative,
+    float margin) {
+
+    const int batch_size = anchor.size(0);
+    const int dim = anchor.size(1);
+
+    auto loss = torch::empty({batch_size}, torch::device("cuda"));
+
+    const int block_size = 256;
+    int num_blocks = batch_size;
+
+    size_t shared_mem_size = 2 * block_size * sizeof(float);
+
+    triplet_loss_kernel<block_size><<<num_blocks, block_size, shared_mem_size>>>(
+        anchor.data_ptr<float>(),
+        positive.data_ptr<float>(),
+        negative.data_ptr<float>(),
+        loss.data_ptr<float>(),
+        batch_size,
+        dim,
+        margin);
+
+    cudaDeviceSynchronize(); // Ensure completion
+
+    return loss.mean();
+}
+"""
+
+triplet_loss_header = """
+torch::Tensor triplet_loss_cuda(
+    torch::Tensor anchor,
+    torch::Tensor positive,
+    torch::Tensor negative,
+    float margin);
+"""
+
+triplet_loss_cuda = load_inline(
+    name="triplet_loss",
+    cpp_sources=triplet_loss_header,
+    cuda_sources=triplet_loss_source,
+    functions=["triplet_loss_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, anchor, positive, negative):
+        return triplet_loss_cuda.triplet_loss_cuda(
+            anchor, positive, negative, self.margin
+        )
+
+```
+
+Wait, but in the original code, the Model class's loss_fn is initialized with margin, so in ModelNew, the __init__ should take the margin and store it, then pass it to the CUDA function.
+
+The code above does this correctly.
+
+However, there are a few points to check:
+
+1. The CUDA kernel's template parameter BlockSize is set to 256. The kernel is defined as a template so that the block size can be adjusted. However, in the current setup, the block size is fixed to 256. If needed, this could be parameterized, but for the given problem, this is acceptable.
+
+2. The kernel uses __restrict__ on the input pointers to inform the compiler that these pointers do not alias, which can help with optimizations.
+
+3. The shared memory is allocated via extern __shared__ and its size is computed as 2 * block_size * sizeof(float). This is correct because sum_ap and sum_an each require block_size floats.
+
+4. The kernel uses blockIdx.x to index the sample, so each block processes one sample. The number of blocks is set to batch_size, which is 32768. This is acceptable, as modern GPUs can handle that many blocks.
+
+5. The kernel uses __syncthreads() after the accumulation loop and after each reduction step to ensure synchronization.
+
+6. The final loss is computed as the mean of the loss array using PyTorch's .mean() method, which is efficient.
+
+Now, we need to ensure that the input tensors are contiguous and on the same device (CUDA). Since the user's get_inputs() generates tensors on CUDA, this should be okay.
+
+Potential issues:
+
+- The kernel's block size must divide the number of features (dim) evenly. Since dim is 8192, and block_size is 256, 8192 / 256 = 32, which is an integer, so that's okay. If dim were not a multiple of block_size, the loop would still work but may process some extra elements (which are beyond the array, but since j < dim is checked, that's okay).
+
+Wait, in the loop:
+
+for (int j = tid; j < dim; j += BlockSize)
+
+This will iterate over all j up to dim-1, even if dim is not a multiple of BlockSize. So that's safe.
+
+- The shared memory calculation is correct. Each thread's contribution is stored in the shared arrays, then reduced.
+
+- The kernel must be launched with the correct shared memory size. The shared_mem_size variable is set to 2 * block_size * sizeof(float), which is correct.
+
+- The CUDA kernel's template is instantiated with BlockSize = 256. The kernel is defined as a template, and when calling triplet_loss_kernel<block_size>, it uses that value.
+
+Now, compiling this code should work, assuming the CUDA architecture is compatible.
+
+Another possible optimization is to unroll the reduction loop or use warp-level primitives, but for brevity, this is sufficient.
+
+Testing this code would require verifying that it produces the same result as the original PyTorch implementation. However, since the problem states not to output testing code, this is acceptable.
+
+Therefore, the final code for ModelNew is as above.
+
+However, in the original problem, the input_shape is (8192,), so the dimension is 8192, which is the second dimension of the tensors. The code above uses anchor.size(1) for dim, which is correct.
+
+The code for the ModelNew class replaces the TripletMarginLoss module with a direct call to the CUDA kernel function.
+
+Thus, the final code is as written above.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+triplet_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <int BlockSize>
+__global__ void triplet_loss_kernel(
+    const float* __restrict__ anchor,
+    const float* __restrict__ positive,
+    const float* __restrict__ negative,
+    float* loss,
+    int batch_size,
+    int dim,
+    float margin) {
+
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    extern __shared__ float shared_sums[];
+    float* sum_ap = &shared_sums[0 * BlockSize];
+    float* sum_an = &shared_sums[1 * BlockSize];
+
+    int tid = threadIdx.x;
+
+    sum_ap[tid] = 0.0f;
+    sum_an[tid] = 0.0f;
+
+    for (int j = tid; j < dim; j += BlockSize) {
+        int idx = sample_idx * dim + j;
+        float a = anchor[idx];
+        float p = positive[idx];
+        float n = negative[idx];
+
+        float diff_ap = a - p;
+        sum_ap[tid] += diff_ap * diff_ap;
+
+        float diff_an = a - n;
+        sum_an[tid] += diff_an * diff_an;
+    }
+
+    __syncthreads();
+
+    for (int s = BlockSize / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum_ap[tid] += sum_ap[tid + s];
+            sum_an[tid] += sum_an[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum_ap = sum_ap[0];
+        float total_sum_an = sum_an[0];
+
+        float d_ap = sqrt(total_sum_ap);
+        float d_an = sqrt(total_sum_an);
+
+        float loss_i = d_ap - d_an + margin;
+        loss[sample_idx] = loss_i > 0 ? loss_i : 0.0f;
+    }
+}
+
+torch::Tensor triplet_loss_cuda(
+    torch::Tensor anchor,
+    torch::Tensor positive,
+    torch::Tensor negative,
+    float margin) {
+
+    const int batch_size = anchor.size(0);
+    const int dim = anchor.size(1);
+
+    auto loss = torch::empty({batch_size}, torch::device("cuda"));
+
+    const int block_size = 256;
+    int num_blocks = batch_size;
+
+    size_t shared_mem_size = 2 * block_size * sizeof(float);
+
+    triplet_loss_kernel<block_size><<<num_blocks, block_size, shared_mem_size>>>(
+        anchor.data_ptr<float>(),
+        positive.data_ptr<float>(),
+        negative.data_ptr<float>(),
+        loss.data_ptr<float>(),
+        batch_size,
+        dim,
+        margin);
+
+    cudaDeviceSynchronize();
+
+    return loss.mean();
+}
+"""
+
+triplet_loss_header = """
+torch::Tensor triplet_loss_cuda(
+    torch::Tensor anchor,
+    torch::Tensor positive,
+    torch::Tensor negative,
+    float margin);
+"""
+
+triplet_loss_cuda = load_inline(
+    name="triplet_loss",
+    cpp_sources=triplet_loss_header,
+    cuda_sources=triplet_loss_source,
+    functions=["triplet_loss_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, anchor, positive, negative):
+        return triplet_loss_cuda.triplet_loss_cuda(
+            anchor, positive, negative, self.margin
+        )
+```

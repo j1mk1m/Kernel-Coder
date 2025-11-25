@@ -1,0 +1,57 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for batch normalization
+batch_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void batch_norm_forward_kernel(const float* x, const float* mean, const float* var, const float* weight, const float* bias, float* y, int n, int c, int h, int w) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n * c * h * w) {
+        int i = idx / (c * h * w);
+        int j = idx % (c * h * w);
+        y[idx] = weight[i] * ((x[idx] - mean[j]) / sqrt(var[j] + 1e-5)) + bias[j];
+    }
+}
+
+torch::Tensor batch_norm_forward_cuda(torch::Tensor x, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias) {
+    auto n = x.size(0);
+    auto c = x.size(1);
+    auto h = x.size(2);
+    auto w = x.size(3);
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (n * c * h * w + block_size - 1) / block_size;
+
+    batch_norm_forward_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), y.data_ptr<float>(), n, c, h, w);
+
+    return y;
+}
+"""
+
+batch_norm_cpp_source = (
+    "torch::Tensor batch_norm_forward_cuda(torch::Tensor x, torch::Tensor mean, torch::Tensor var, torch::Tensor weight, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code for batch normalization
+batch_norm = load_inline(
+    name="batch_norm",
+    cpp_sources=batch_norm_cpp_source,
+    cuda_sources=batch_norm_source,
+    functions=["batch_norm_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelBatchNorm(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_norm = batch_norm
+
+    def forward(self, x):
+        return self.batch_norm.batch_norm_forward_cuda(x, x.mean(dim=[0, 2, 3]), x.var(dim=[0, 2, 3], unbiased=False), torch.ones_like(x[:, 0, :, :]), torch.zeros_like(x[:, 0, :, :]))

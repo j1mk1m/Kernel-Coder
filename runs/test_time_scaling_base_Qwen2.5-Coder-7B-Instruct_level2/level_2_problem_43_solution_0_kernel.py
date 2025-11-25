@@ -1,0 +1,56 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D convolution
+conv3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the 3D convolution kernel here
+"""
+
+conv3d_cpp_source = (
+    "torch::Tensor conv3d_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int kernel_size, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for 3D convolution
+conv3d = load_inline(
+    name="conv3d",
+    cpp_sources=conv3d_cpp_source,
+    cuda_sources=conv3d_source,
+    functions=["conv3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = conv3d
+        self.max_pool = nn.MaxPool3d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = self.conv(x, self.weight, self.bias, kernel_size, stride, padding)
+        x = self.max_pool(x)
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        x = torch.relu(x)
+        return x
+
+# Initialize weights and biases
+weight = torch.randn(out_channels, in_channels, kernel_size, kernel_size, kernel_size)
+bias = torch.randn(out_channels)
+
+# Assign weights and biases to the model
+model_new = ModelNew(in_channels, out_channels, kernel_size, stride, padding)
+model_new.weight = nn.Parameter(weight.cuda())
+model_new.bias = nn.Parameter(bias.cuda())
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding]

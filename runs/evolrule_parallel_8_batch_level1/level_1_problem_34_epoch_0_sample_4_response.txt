@@ -1,0 +1,1705 @@
+Your code must import `from torch.utils.cpp_extension import load_inline` to use inline CUDA kernels. You must not use any other PyTorch extensions except the ones provided in the original code. 
+
+You must only define a single ModelNew class, and replace the `nn.InstanceNorm2d` layer with your own implementation. You may choose to either replace the InstanceNorm2d operator with your own CUDA implementation, or fuse it with other operators, but given the architecture, there are no other operators to fuse with. So your ModelNew must have a custom CUDA implementation of InstanceNorm2d. 
+
+The get_inputs() and get_init_inputs() functions must stay the same. You must not modify the input shapes or the way inputs are generated. The output tensor must have the same shape as the original Model's output.
+
+
+<think>
+Okay, I need to optimize the given PyTorch model which uses an InstanceNorm2d layer. The task is to replace the nn.InstanceNorm2D with a custom CUDA kernel. Let me think about how to approach this.
+
+First, I should recall how Instance Normalization works. It normalizes each instance (sample) in a batch separately, and for each channel. The formula is similar to batch norm but per instance. For each channel in each sample, we compute the mean and variance, then subtract the mean and divide by the sqrt(variance + eps). The parameters gamma and beta are learned per channel.
+
+The existing PyTorch implementation uses nn.InstanceNorm2d, so I need to reimplement this with CUDA. The key steps are:
+
+1. Compute the mean for each instance and channel.
+2. Compute the variance for each instance and channel.
+3. Normalize using these statistics.
+4. Apply the affine transformation (scale and shift) using gamma and beta.
+
+The challenge is to implement this efficiently in CUDA, handling all the dimensions correctly. Let me consider the dimensions.
+
+The input is (batch_size, channels, height, width). For each instance (sample in the batch) and each channel, compute mean and variance over the spatial dimensions (height and width). So for each (batch, channel), the data is a 2D tensor, and we need the mean and variance over all elements in that 2D tensor.
+
+First, I need to compute the mean for each (batch, channel). Let me see how to parallelize this. Maybe for each element in the batch and channel, the threads can compute the sum, then reduce.
+
+Alternatively, the kernel can process each instance and channel in parallel. Let's think of the computation steps:
+
+- For each instance (b) in batch, and each channel (c):
+   - Compute the sum over all elements in x[b, c, :, :]
+   - Mean = sum / (H * W)
+   - Then compute the sum of squared differences (sum (x - mean)^2)
+   - Variance = sum_sq_diff / (H * W)
+   - Then, compute the normalized x: (x - mean) / sqrt(var + eps)
+   - Apply gamma[c] and beta[c]
+
+The problem is how to efficiently compute these sums. Since each instance and channel can be handled independently, we can launch a thread block for each (b, c) pair. 
+
+The number of threads per block can be such that each thread handles a portion of the spatial dimensions. Alternatively, we can use shared memory for reduction.
+
+Let me think of the kernel structure. Let's have a grid where each block corresponds to a (b, c) pair. Each block will compute the mean and variance for that (b, c).
+
+In each block, the threads can process elements of the spatial dimensions. For example, if the spatial size is H*W, we can have each thread process a single element. Then, compute the sum across all threads in the block. Similarly for sum of squares.
+
+Alternatively, using atomic operations might be slow, so better to use shared memory for reduction.
+
+Let me outline the steps for each block (b, c):
+
+1. Compute the sum over all elements in the (H, W) spatial dimensions for x[b, c, :, :].
+2. Compute the mean as sum / (H*W)
+3. Compute the sum of squared differences: sum((x - mean)^2) over all elements.
+4. Compute variance = sum_sq_diff / (H*W)
+5. Compute the inverse sqrt of (var + eps)
+6. Apply the transformation: (x - mean) * inv_sqrt_var * gamma[c] + beta[c]
+
+The main challenge is efficiently performing the reductions (sum and sum of squares). Let's see how to structure this in CUDA.
+
+First, the grid and block dimensions:
+
+- The number of blocks should be batch_size * channels. Because each block handles a (b, c) pair.
+- The block size can be, say, 256 threads. But the spatial size (H*W) may be larger than the number of threads, so need to handle that.
+
+Wait, H and W are 512 each in the problem's given dimensions. So for each (b, c), the spatial elements are 512*512 = 262,144 elements. So per block, handling 262k elements. Need to process this efficiently.
+
+Hmm, perhaps each thread in the block can process a chunk of elements. Let me think of each thread as processing a certain number of elements. For example, with 256 threads per block, each thread would process 262k / 256 ≈ 1024 elements each. That might be manageable.
+
+Alternatively, using a tiling approach with shared memory. Let's see:
+
+The plan for the kernel:
+
+- For each block (b, c):
+   - Initialize shared memory for partial sums.
+   - Each thread reads a portion of the spatial elements, computes their contribution to the sum and sum of squares.
+   - Use shared memory to accumulate the partial sums.
+   - After reduction, compute mean, variance, etc.
+   - Then, write back the normalized values.
+
+Wait, but the normalization also requires applying to each element, so after computing the mean and variance, each thread would need to process each element again to apply the transformation. 
+
+Alternatively, perhaps it's better to process the elements in two passes: one to compute the mean/variance, and another to apply the transformation. But that would require storing intermediate results, which could be memory intensive. Maybe better to do it in one pass with shared memory.
+
+Alternatively, first compute the sum and sum_sq for the (b,c) using the threads, then have each thread process elements again for the output.
+
+Wait, but how to structure the kernel.
+
+Let me think step by step.
+
+First, for a given (b, c), the spatial dimensions are HxW. Let's have each block handle (b, c). Each block has H*W elements to process.
+
+The block can have a number of threads, say 256. Each thread is responsible for processing (H*W / 256) elements. Let's see:
+
+Each thread i in the block will process elements from index i * stride to (i+1)*stride. The stride would be (H*W) / blockDim.x.
+
+Each thread computes the sum of its portion, and the sum of squares. Then, perform a reduction in shared memory to get the total sum and sum_sq for (b, c).
+
+Once the block has the total sum and sum_sq, it can compute mean and variance. Then, each thread can process each of its elements again to compute (x - mean) * inv_sqrt_var * gamma + beta.
+
+Wait, but the threads would need to read the data again. Alternatively, after computing the mean and variance, the same threads can apply the transformation to their portion of the spatial elements.
+
+So, the steps per block are:
+
+1. Each thread loads its portion of the input data for (b, c) and computes the local sum and sum of squares.
+2. Use shared memory to reduce these to get the total sum and sum_sq.
+3. Compute mean = sum / (H*W)
+4. var = sum_sq / (H*W) - mean^2 (Wait, actually the variance is (sum_sq_diff)/N. Let me recheck.
+
+Wait, variance is E[(x - mu)^2]. So sum_sq_diff = sum( (x_i - mu)^2 ). But this can be written as sum(x_i^2) - 2 mu sum(x_i) + N mu^2. Since sum(x_i) is N mu, so:
+
+sum_sq_diff = sum(x_i^2) - N mu^2.
+
+So, sum_sq_x = sum(x_i^2), then variance = (sum_sq_x - N mu^2) / N.
+
+Alternatively, to compute sum_sq_diff, it's better to compute sum(x_i^2) and then subtract N mu^2. That might be more numerically stable.
+
+Wait, but in any case, to compute the variance, the correct way is:
+
+var = (sum of squares - (sum)^2 / N) / N
+
+So for the variance computation, we can compute sum and sum_sq.
+
+So in step 1, each thread should compute both the sum of x_i and the sum of x_i squared for their portion.
+
+Once the total sum and sum_sq are known, then the variance is (sum_sq - (sum)^2 / N) / N.
+
+Once that is computed, the inverse sqrt can be calculated, then the output is (x - mean) * inv_sqrt * gamma + beta.
+
+So, the steps for each block (b,c) would be:
+
+1. Compute the total sum and sum_sq over all elements in x[b,c,:,:].
+
+To do this, each thread in the block processes a chunk of the spatial elements. The block has a shared memory array to accumulate the partial sums and sum_sq.
+
+Then, after the reduction, compute mean, variance, etc.
+
+2. Once the mean and variance are known, each thread applies the transformation to their chunk of elements.
+
+Now, the problem is that each thread in the block has to process their portion of the spatial elements again.
+
+Alternatively, the first pass can be to compute the mean and variance, then the second pass can compute the output.
+
+But in CUDA, how to structure this? Let's see.
+
+The kernel can be structured as follows:
+
+Each block is responsible for a (b, c). The block has a gridDim of batch_size * channels.
+
+Within each block:
+
+- The block uses shared memory to store partial sums for sum and sum_sq.
+
+- Each thread reads its portion of the spatial elements (H*W elements). For each element, the thread contributes to the sum and sum_sq.
+
+- After the reduction (using shared memory), compute mean and variance.
+
+- Then, each thread can process their elements again to compute the normalized value.
+
+Wait, but the elements are in the input tensor. The output tensor is also arranged in the same way.
+
+So the steps in code would be something like:
+
+for each block (b, c):
+
+   sum = 0, sum_sq =0
+
+   for each element in spatial:
+
+      x_val = x[b][c][h][w]
+
+      sum += x_val
+
+      sum_sq += x_val * x_val
+
+   compute mean, variance, etc.
+
+   then for each element in spatial:
+
+      out_val = (x_val - mean) * inv_sqrt_var * gamma[c] + beta[c]
+
+      write to output[b][c][h][w]
+
+But this requires each thread to process their elements again.
+
+Alternatively, the threads can process the elements in parallel in the second step.
+
+So, in code, the kernel would have two loops: one for the sum and sum_sq, and another for the output.
+
+But how to do this in a kernel.
+
+Alternatively, after computing the mean and variance, the same threads can process their portion of the spatial elements to compute the output.
+
+So, in the kernel code:
+
+__global__ void instance_norm_kernel(...) {
+
+   int b = blockIdx.x / channels;
+
+   int c = blockIdx.x % channels;
+
+   // get the spatial indices for this thread
+
+   int tid = threadIdx.x;
+
+   // total elements in spatial is H*W
+
+   int num_elements = H * W;
+
+   // each thread processes elements starting at start to end.
+
+   int start = tid * (num_elements / blockDim.x);
+
+   int end = start + (num_elements / blockDim.x);
+
+   if (tid == blockDim.x -1) end = num_elements; // handle remainder
+
+   // first pass: compute sum and sum_sq
+
+   float local_sum = 0;
+
+   float local_sum_sq =0;
+
+   for (int i = start; i < end; i++) {
+
+      // compute h and w from i (flatten spatial to 1D)
+
+      int h = i / W;
+
+      int w = i % W;
+
+      float x_val = x[b][c][h][w]; // need to handle memory access
+
+      local_sum += x_val;
+
+      local_sum_sq += x_val * x_val;
+
+   }
+
+   // reduce to block-level sum and sum_sq using shared memory
+
+   __shared__ float s_sum[THREADS_PER_BLOCK]; // size equal to block size?
+
+   s_sum[threadIdx.x] = local_sum;
+
+   // perform reduction steps (like in a sum kernel)
+
+   // similar for sum_sq
+
+   ... // after reduction, get block_sum and block_sum_sq
+
+   // then write to a global memory location? Or store in registers?
+
+   // Wait, but each block is handling a (b,c), so each block can store their own sum and sum_sq in registers.
+
+   // After reduction, the block can compute mean and variance.
+
+   // Once all threads in the block have the same values via synchronization.
+
+   // So after the first reduction, we can compute the total_sum and total_sum_sq for (b,c).
+
+   // Then compute mean and variance.
+
+   // Then, in the second pass, each thread processes their elements again.
+
+   // ... but how to get the mean and variance known to all threads in the block?
+
+   // So after the first reduction steps, the block can compute the mean and variance, and store them in shared memory or registers accessible to all threads.
+
+   // So after the reduction steps, synchronize, then compute mean and variance.
+
+   // Then, each thread can proceed to compute their portion of the output.
+
+   // So in code:
+
+   // after reduction steps, compute mean and variance.
+
+   // Let's say the block's total sum is stored in a variable.
+
+   float total_sum = ...;
+
+   float total_sum_sq = ...;
+
+   float N = H * W;
+
+   float mean = total_sum / N;
+
+   float var = (total_sum_sq - (total_sum * total_sum)/N) / N;
+
+   float inv_sqrt_var = rsqrtf(var + eps);
+
+   // Then, process the elements again.
+
+   for (int i = start; i < end; i++) {
+
+      int h = ...;
+
+      int w = ...;
+
+      float x_val = x[b][c][h][w];
+
+      float normalized = (x_val - mean) * inv_sqrt_var;
+
+      // apply gamma and beta
+
+      normalized *= gamma[c];
+
+      normalized += beta[c];
+
+      out[b][c][h][w] = normalized;
+
+   }
+
+}
+
+Wait, but the problem is that the threads in the block can't all read the same total_sum and mean unless they are stored in shared memory or a register that's broadcasted.
+
+Wait, in the kernel, after the first phase (summing), all threads in the block can compute the mean and variance once, but how to get that value to all threads.
+
+Alternatively, after the reduction steps, the block can compute the mean and variance in a single thread (like thread 0), and then broadcast it to all threads via shared memory.
+
+Hmm, perhaps the following steps:
+
+After the first reduction (sum and sum_sq):
+
+- Each thread in the block has their partial sums stored in shared memory.
+
+- Then, we need to perform a reduction within the block to get the total sum and sum_sq.
+
+- For example, using a parallel reduction method.
+
+Once the total sum and sum_sq are known (e.g., in thread 0's registers), then thread 0 can compute the mean and variance, and then write these to shared memory so all threads can read them.
+
+Wait, but all threads need to have the same mean and variance.
+
+Alternatively, after the reduction, each thread can calculate the mean and variance based on the total_sum and total_sum_sq stored in shared memory. Since they are the same for all threads in the block.
+
+So, after the first reduction steps, the block can have the total_sum and total_sum_sq stored in shared memory variables, accessible to all threads.
+
+So the steps would be:
+
+1. Each thread reads their portion of the data and computes local sums.
+
+2. Use shared memory to perform a block-wide reduction to get total_sum and total_sum_sq.
+
+3. Compute mean and variance using these totals.
+
+4. Then, each thread processes their portion again, using the computed mean and variance.
+
+Now, the key is to implement the reduction efficiently.
+
+Implementing the reduction:
+
+Let me think of the first step, for sum and sum_sq:
+
+We can do a parallel reduction for each of the two values (sum and sum_sq) in shared memory.
+
+Alternatively, combine them.
+
+Let me structure the kernel code:
+
+First, the shared memory:
+
+__shared__ float s_sum[THREADS_PER_BLOCK];
+
+__shared__ float s_sum_sq[THREADS_PER_BLOCK];
+
+Each thread writes their local_sum and local_sum_sq to s_sum and s_sum_sq arrays.
+
+Then, perform a reduction over the block.
+
+But how?
+
+Perhaps a standard block reduction:
+
+After writing to s_sum and s_sum_sq, we do a loop where each step halves the number of active threads.
+
+Alternatively, let's think of a block size of 256. The first step is to have each thread add their s_sum[their index] with the thread next to them, and so on until only one thread holds the total.
+
+But this would require multiple steps. For example:
+
+int tid = threadIdx.x;
+
+for (int stride=1; stride <= blockDim.x; stride *=2) {
+
+   if (tid % (2*stride) ==0) {
+
+      s_sum[tid] += s_sum[tid + stride];
+
+   }
+
+   __syncthreads();
+
+}
+
+But this might be a bit complicated, but manageable.
+
+Alternatively, using a more efficient approach.
+
+Alternatively, perhaps use a warp-based reduction first, then combine the warps.
+
+But this might get complex.
+
+Alternatively, since the block is 256 threads, the maximum number of steps would be log2(256)=8 steps. Let's say.
+
+Alternatively, let's proceed step by step.
+
+Suppose the block size is 256, and each thread initially has their partial sum in s_sum[threadIdx.x].
+
+After the first step, each pair of threads (0-1, 2-3, etc.) will add their sums, so after first iteration, the first 128 threads have the sum of pairs, etc.
+
+Wait, perhaps a better way is to have each thread first add their local_sum to s_sum[threadIdx.x], then do a reduction:
+
+for (int s = blockDim.x/2; s >0; s >>=1) {
+
+   if (tid < s) {
+
+      s_sum[tid] += s_sum[tid + s];
+
+   }
+
+   __syncthreads();
+
+}
+
+After this loop, s_sum[0] holds the total sum. Similarly for s_sum_sq.
+
+So, for the sum:
+
+First, each thread's local_sum is stored in s_sum[tid].
+
+Then, we run the loop where each thread with tid < s adds s_sum[tid + s] to s_sum[tid].
+
+This reduces the array by half each step until s becomes 1.
+
+After this, s_sum[0] holds the total sum. Same for sum_sq.
+
+So, after the loop, the total_sum is s_sum[0], total_sum_sq is s_sum_sq[0].
+
+Once that is done, thread 0 can compute the mean and variance:
+
+float mean = total_sum / (H * W);
+
+float var = (total_sum_sq - (total_sum * total_sum)/(H * W)) / (H * W);
+
+float inv_sqrt_var = rsqrtf(var + eps);
+
+Then, all threads can read the mean, variance, etc. from thread 0's computation?
+
+Wait, but how do other threads get the values? Since all threads have to have access to mean and inv_sqrt_var.
+
+One way is to write these to shared memory variables accessible to all threads.
+
+So, in the kernel:
+
+After the reduction steps:
+
+if (threadIdx.x ==0) {
+
+   mean = total_sum / (H * W);
+
+   var = (total_sum_sq - (total_sum * total_sum)/ (H * W)) / (H * W);
+
+   inv_sqrt_var = rsqrtf(var + eps);
+
+}
+
+__syncthreads();
+
+// Then broadcast the variables to all threads via shared memory
+
+__shared__ float s_mean, s_inv_sqrt_var;
+
+if (threadIdx.x ==0) {
+
+   s_mean = mean;
+
+   s_inv_sqrt_var = inv_sqrt_var;
+
+}
+
+__syncthreads();
+
+Then, all threads can read s_mean and s_inv_sqrt_var.
+
+Once that is done, the threads can process their portion of the spatial elements again.
+
+Now, the problem is the spatial indices.
+
+Wait, the input tensor is 4D: [batch_size, channels, height, width]. So in CUDA, accessing it would require knowing how the data is stored.
+
+Assuming it's stored in C order (row-major), the layout would be:
+
+x[b][c][h][w] is stored as a contiguous array.
+
+So the memory layout for the tensor is:
+
+stride_b = channels * height * width,
+
+stride_c = height * width,
+
+stride_h = width,
+
+stride_w = 1.
+
+So to access an element, the pointer would be:
+
+float *x_data = x.data<float>();
+
+index = b * stride_b + c * stride_c + h * stride_h + w * stride_w;
+
+x_val = x_data[index];
+
+Thus, in the kernel, we need to compute the index for each element.
+
+But for the first pass (summing) and the second pass (writing output), the threads need to loop over their portion of the spatial elements (h,w).
+
+Alternatively, the kernel can process the elements in a flattened spatial index (i from 0 to H*W-1), and compute h and w as i / W and i % W.
+
+Thus, in the kernel, for each element in the spatial dimensions:
+
+for (int i = start; i < end; i++) {
+
+   int h = i / W;
+
+   int w = i % W;
+
+   // compute x_val
+
+}
+
+But the problem is that for large H and W (like 512x512), this loop could be time-consuming if done in threads. Alternatively, using a loop unrolling or other optimizations.
+
+But given the time, perhaps this is manageable.
+
+Now, putting all this together.
+
+The kernel function would be something like:
+
+__global__ void instance_norm_kernel(const float* x, float* out,
+
+                                const float* gamma, const float* beta,
+
+                                int batch_size, int channels,
+
+                                int height, int width,
+
+                                float eps) {
+
+    // Compute the batch and channel indices for this block
+
+    int c = blockIdx.x % channels;
+
+    int b = blockIdx.x / channels;
+
+    // spatial dimensions
+
+    int H = height;
+
+    int W = width;
+
+    int N = H * W;
+
+    // Each thread processes a chunk of the spatial elements
+
+    int tid = threadIdx.x;
+
+    int num_threads = blockDim.x;
+
+    int num_elements = H * W;
+
+    int start = tid * (num_elements / num_threads);
+
+    int end = start + (num_elements / num_threads);
+
+    if (tid == num_threads -1) {
+
+        end = num_elements;
+
+    }
+
+    // Step 1: Compute local sum and sum_sq for this thread's chunk
+
+    float local_sum = 0.0f;
+
+    float local_sum_sq = 0.0f;
+
+    for (int i = start; i < end; i++) {
+
+        int h = i / W;
+
+        int w = i % W;
+
+        // Compute the index into the x array
+
+        int idx = b * channels * H * W +
+
+                  c * H * W +
+
+                  h * W + w;
+
+        float x_val = x[idx];
+
+        local_sum += x_val;
+
+        local_sum_sq += x_val * x_val;
+
+    }
+
+    // Step 2: Reduce to get block's total sum and sum_sq
+
+    __shared__ float s_sum[256]; // assuming blockDim.x <=256
+
+    __shared__ float s_sum_sq[256];
+
+    s_sum[tid] = local_sum;
+
+    s_sum_sq[tid] = local_sum_sq;
+
+    __syncthreads();
+
+    // Reduce the sums
+
+    for (int s = blockDim.x /2; s >0; s >>=1) {
+
+        if (tid < s) {
+
+            s_sum[tid] += s_sum[tid + s];
+
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    float total_sum = s_sum[0];
+
+    float total_sum_sq = s_sum_sq[0];
+
+    // Compute mean and variance
+
+    float mean = total_sum / N;
+
+    float var = (total_sum_sq - (total_sum * total_sum)/N)/N;
+
+    float inv_sqrt_var = rsqrtf(var + eps);
+
+    // Broadcast mean and inv_sqrt_var to all threads via shared memory
+
+    __shared__ float s_mean, s_inv_sqrt_var;
+
+    if (tid == 0) {
+
+        s_mean = mean;
+
+        s_inv_sqrt_var = inv_sqrt_var;
+
+    }
+
+    __syncthreads();
+
+    // Step 3: Apply normalization and write to output
+
+    for (int i = start; i < end; i++) {
+
+        int h = i / W;
+
+        int w = i % W;
+
+        int idx = b * channels * H * W +
+
+                  c * H * W +
+
+                  h * W + w;
+
+        float x_val = x[idx];
+
+        float normalized = (x_val - s_mean) * s_inv_sqrt_var;
+
+        // Apply gamma and beta (gamma and beta are per channel)
+
+        normalized *= gamma[c];
+
+        normalized += beta[c];
+
+        out[idx] = normalized;
+
+    }
+
+}
+
+Wait, but the gamma and beta are per-channel parameters. In the original model, the InstanceNorm layer has learnable parameters. So in the kernel, we need to have access to gamma and beta tensors, which are of size (channels,).
+
+Therefore, in the kernel function's parameters, we need to pass pointers to gamma and beta tensors, which are 1D arrays.
+
+Now, in the Python code, when creating the CUDA function, the gamma and beta will be parameters of the model. So in the new ModelNew class, we need to have gamma and beta as parameters, just like the original InstanceNorm2d.
+
+Wait, the original Model uses nn.InstanceNorm2d, which includes the learnable parameters. Therefore, in the custom implementation, the ModelNew must have the parameters gamma (weight) and beta (bias) for the instance norm.
+
+Therefore, in the ModelNew class, I need to initialize these parameters.
+
+Wait, the original code's Model class has:
+
+self.inorm = nn.InstanceNorm2d(num_features=num_features)
+
+The InstanceNorm2d layer has parameters: weight (gamma) and bias (beta), which are of size num_features.
+
+Therefore, in the custom ModelNew class, I need to have parameters gamma and beta of size (num_features,).
+
+So in the __init__ of ModelNew:
+
+self.gamma = nn.Parameter(torch.ones(num_features))
+
+self.beta = nn.Parameter(torch.zeros(num_features))
+
+Then, in the forward pass, the kernel will take gamma and beta as inputs.
+
+Putting this together, the CUDA kernel will need to have access to gamma and beta as input tensors.
+
+Now, in the Python code, the CUDA kernel is compiled as a function that takes the inputs: x, gamma, beta, and returns the output.
+
+Now, in the kernel function's parameters, the gamma and beta are passed as pointers, so in the Python code, we have to pass them as tensors.
+
+Now, let's structure the code.
+
+First, the CUDA source code:
+
+The kernel function as above, but need to define it properly.
+
+The CUDA source code would have the kernel, and a host function that calls it.
+
+The host function would handle the kernel launch.
+
+So, the CUDA code would be:
+
+#include <torch/extension.h>
+
+#include <cuda_runtime.h>
+
+template <int BLOCK_SIZE>
+
+__global__ void instance_norm_kernel(const float* x, float* out,
+
+                                    const float* gamma, const float* beta,
+
+                                    int batch_size, int channels,
+
+                                    int height, int width,
+
+                                    float eps) {
+
+    // ... kernel code as above, but using template for block size?
+
+    // Wait, but in the code above, the block size is determined at runtime. Hmm, but in CUDA, the block size is fixed at kernel launch.
+
+    // Alternatively, perhaps define the kernel for a fixed block size.
+
+    // Let's choose a block size of 256.
+
+    // So the code can use a fixed block size.
+
+    // Let me adjust the code accordingly.
+
+    // So the block size is 256, so the __shared__ arrays can be of size 256.
+
+    // Assuming blockDim.x is 256.
+
+    // So the kernel would be written with a fixed block size.
+
+    // Let's define the block size as a constant.
+
+    // Let me rewrite the kernel with block size 256.
+
+    // Wait, but the user can choose any block size, but for the sake of example, set it to 256.
+
+    // So in the kernel, use blockDim.x as 256, but actually the kernel is launched with that.
+
+    // Wait, the kernel can be written with the block size as a template parameter, but that complicates things.
+
+    // Maybe better to write it with a fixed block size of 256.
+
+    // Let me proceed with that.
+
+    // So the code:
+
+    int c = blockIdx.x % channels;
+
+    int b = blockIdx.x / channels;
+
+    int H = height;
+
+    int W = width;
+
+    int N = H * W;
+
+    int tid = threadIdx.x;
+
+    int num_threads = blockDim.x; // which is 256.
+
+    int num_elements = H * W;
+
+    int start = tid * (num_elements / num_threads);
+
+    int end = start + (num_elements / num_threads);
+
+    if (tid == num_threads -1) {
+
+        end = num_elements;
+
+    }
+
+    // ... the rest as before.
+
+}
+
+Wait, but the block size is fixed to 256, so the kernel must be launched with blocks of 256 threads. So in the host function, when launching the kernel, we need to set the block size to 256.
+
+Therefore, in the CUDA code:
+
+extern "C" {
+
+    __global__ void instance_norm_kernel(const float* x, float* out,
+
+                                        const float* gamma, const float* beta,
+
+                                        int batch_size, int channels,
+
+                                        int height, int width,
+
+                                        float eps) {
+
+        // code as above, but with blockDim.x assumed to be 256.
+
+    }
+
+    torch::Tensor instance_norm_cuda(torch::Tensor x,
+
+                                    torch::Tensor gamma,
+
+                                    torch::Tensor beta,
+
+                                    int channels,
+
+                                    int height,
+
+                                    int width,
+
+                                    float eps) {
+
+        // Get dimensions
+
+        int batch_size = x.size(0);
+
+        // Check that x has dimensions (B, C, H, W)
+
+        // Assuming that the input is already in the right dimensions.
+
+        // Compute output tensor.
+
+        auto out = torch::empty_like(x);
+
+        // Define block and grid dimensions.
+
+        const int block_size = 256;
+
+        int num_blocks = batch_size * channels;
+
+        // Launch kernel
+
+        instance_norm_kernel<<<num_blocks, block_size>>>(
+
+            x.data_ptr<float>(),
+
+            out.data_ptr<float>(),
+
+            gamma.data_ptr<float>(),
+
+            beta.data_ptr<float>(),
+
+            batch_size, channels, height, width,
+
+            eps
+
+        );
+
+        return out;
+
+    }
+
+}
+
+Wait, but in the kernel code, the block size is fixed at 256. So the launch uses 256 threads per block.
+
+Now, in the host function, the parameters are x, gamma, beta (which are tensors), and the other parameters.
+
+Wait, the gamma and beta are 1D tensors of size (C,).
+
+Now, the CUDA code in Python would need to include this code as a string.
+
+Putting all together, the code for the CUDA kernel would be written as a string in Python.
+
+Now, in the ModelNew class, we need to have the gamma and beta parameters, which are initialized similarly to the original InstanceNorm2d layer.
+
+Wait, the original code has:
+
+class Model(nn.Module):
+
+    def __init__(self, num_features: int):
+
+        super().__init__()
+
+        self.inorm = nn.InstanceNorm2d(num_features=num_features)
+
+The InstanceNorm2d layer has parameters weight (gamma) and bias (beta). So when replacing with our own implementation, we need to have those parameters.
+
+Thus, in ModelNew:
+
+class ModelNew(nn.Module):
+
+    def __init__(self, num_features):
+
+        super().__init__()
+
+        self.gamma = nn.Parameter(torch.ones(num_features))
+
+        self.beta = nn.Parameter(torch.zeros(num_features))
+
+    def forward(self, x):
+
+        # call the CUDA kernel, passing gamma and beta
+
+        # dimensions: channels=num_features, height and width from x's shape.
+
+        # assuming the input x has shape (B, C, H, W)
+
+        C = x.size(1)
+
+        H = x.size(2)
+
+        W = x.size(3)
+
+        # call the CUDA function.
+
+        # The CUDA function requires channels, H, W, and the epsilon value.
+
+        # The original InstanceNorm uses eps=1e-5 by default.
+
+        return instance_norm_cuda(x, self.gamma, self.beta, C, H, W, 1e-5)
+
+Wait, but the instance_norm_cuda function is the one we define in the CUDA code.
+
+Now, putting this all together in code.
+
+First, the CUDA code as a string in Python:
+
+instance_norm_source = """
+
+#include <torch/extension.h>
+
+#include <cuda_runtime.h>
+
+__global__ void instance_norm_kernel(const float* x, float* out,
+
+                                    const float* gamma, const float* beta,
+
+                                    int batch_size, int channels,
+
+                                    int height, int width,
+
+                                    float eps) {
+
+    int c = blockIdx.x % channels;
+
+    int b = blockIdx.x / channels;
+
+    int H = height;
+
+    int W = width;
+
+    int N = H * W;
+
+    int tid = threadIdx.x;
+
+    int num_threads = blockDim.x;
+
+    int num_elements = H * W;
+
+    int start = tid * (num_elements / num_threads);
+
+    int end = start + (num_elements / num_threads);
+
+    if (tid == num_threads -1) {
+
+        end = num_elements;
+
+    }
+
+    // Step 1: Compute local sums
+
+    float local_sum = 0.0f;
+
+    float local_sum_sq = 0.0f;
+
+    for (int i = start; i < end; i++) {
+
+        int h = i / W;
+
+        int w = i % W;
+
+        int idx = b * channels * H * W +
+
+                  c * H * W +
+
+                  h * W + w;
+
+        float x_val = x[idx];
+
+        local_sum += x_val;
+
+        local_sum_sq += x_val * x_val;
+
+    }
+
+    // Step 2: reduce to block's total
+
+    __shared__ float s_sum[256]; // assuming blockDim.x is 256
+
+    __shared__ float s_sum_sq[256];
+
+    s_sum[tid] = local_sum;
+
+    s_sum_sq[tid] = local_sum_sq;
+
+    __syncthreads();
+
+    // Reduction steps
+
+    for (int s = blockDim.x /2; s >0; s >>=1) {
+
+        if (tid < s) {
+
+            s_sum[tid] += s_sum[tid + s];
+
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+
+        }
+
+        __syncthreads();
+
+    }
+
+    float total_sum = s_sum[0];
+
+    float total_sum_sq = s_sum_sq[0];
+
+    // Compute mean and variance
+
+    float mean = total_sum / N;
+
+    float var = (total_sum_sq - (total_sum * total_sum)/N) / N;
+
+    float inv_sqrt_var = rsqrtf(var + eps);
+
+    // Broadcast mean and inv_sqrt_var to all threads
+
+    __shared__ float s_mean, s_inv_sqrt_var;
+
+    if (tid == 0) {
+
+        s_mean = mean;
+
+        s_inv_sqrt_var = inv_sqrt_var;
+
+    }
+
+    __syncthreads();
+
+    // Step 3: Apply normalization and write output
+
+    for (int i = start; i < end; i++) {
+
+        int h = i / W;
+
+        int w = i % W;
+
+        int idx = b * channels * H * W +
+
+                  c * H * W +
+
+                  h * W + w;
+
+        float x_val = x[idx];
+
+        float normalized = (x_val - s_mean) * s_inv_sqrt_var;
+
+        normalized *= gamma[c];
+
+        normalized += beta[c];
+
+        out[idx] = normalized;
+
+    }
+
+}
+
+torch::Tensor instance_norm_cuda(torch::Tensor x,
+
+                                torch::Tensor gamma,
+
+                                torch::Tensor beta,
+
+                                int channels,
+
+                                int height,
+
+                                int width,
+
+                                float eps) {
+
+    auto batch_size = x.size(0);
+
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+
+    int num_blocks = batch_size * channels;
+
+    dim3 threads(block_size);
+
+    dim3 blocks(num_blocks);
+
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "instance_norm_cuda", ([&] {
+
+        instance_norm_kernel<<<blocks, threads>>>(
+            x.data_ptr<float>(),
+            out.data_ptr<float>(),
+            gamma.data_ptr<float>(),
+            beta.data_ptr<float>(),
+            batch_size, channels, height, width,
+            eps
+        );
+    }));
+
+    return out;
+}
+"""
+
+Wait, but in the kernel launch, the kernel is written for float types. So need to dispatch the kernel for the actual type of the input tensor. However, the code above uses x.data_ptr<float>(), which assumes that the input is float. The original problem uses torch.randn, which is float32. But if the code needs to support other types, it would require more handling. But given the problem statement, maybe it's okay to assume float32.
+
+Alternatively, using AT_DISPATCH_FLOATING_TYPES to handle different types.
+
+In the instance_norm_cuda function, the code should use ATen's dispatch to handle different types. So the code inside the function should be wrapped in AT_DISPATCH_FLOATING_TYPES.
+
+The code above does that, using the lambda with AT_DISPATCH_FLOATING_TYPES.
+
+Wait, in the code I wrote earlier, the kernel is written as a float kernel. But in the AT_DISPATCH_FLOATING_TYPES block, the kernel is launched with the same code. That would cause a type mismatch if the tensors are not float.
+
+Hmm, perhaps I need to have the kernel be templated on the data type, but that complicates things. Since the problem's input is generated with torch.randn which is float32, maybe we can proceed with assuming float, and not use dispatch.
+
+Alternatively, let's adjust the code to use float32.
+
+Alternatively, to make it work, perhaps the kernel code should be written for a generic type, but that's more complex.
+
+Alternatively, given the problem's context, we can assume that the input is float, so we can proceed without the dispatch.
+
+So, modifying the code:
+
+Remove the AT_DISPATCH_FLOATING_TYPES and just proceed with float.
+
+Thus, the instance_norm_cuda function would be:
+
+torch::Tensor instance_norm_cuda(torch::Tensor x,
+
+                                torch::Tensor gamma,
+
+                                torch::Tensor beta,
+
+                                int channels,
+
+                                int height,
+
+                                int width,
+
+                                float eps) {
+
+    auto batch_size = x.size(0);
+
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+
+    int num_blocks = batch_size * channels;
+
+    dim3 threads(block_size);
+
+    dim3 blocks(num_blocks);
+
+    instance_norm_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        batch_size, channels, height, width,
+        eps
+    );
+
+    return out;
+}
+
+This assumes that all tensors are float32.
+
+Therefore, the full CUDA code string would be as above, but with the dispatch removed.
+
+Wait, but the kernel is written to handle float, so the tensors must be float.
+
+Thus, the CUDA code can be written as:
+
+Now, putting all together.
+
+The Python code will have:
+
+from torch.utils.cpp_extension import load_inline
+
+Then, define the CUDA source as a string, and the CPP source.
+
+Wait, the CPP sources would be the function declarations.
+
+The CPP source for the instance_norm_cuda function would be:
+
+instance_norm_cpp_source = """
+    torch::Tensor instance_norm_cuda(torch::Tensor x,
+                                    torch::Tensor gamma,
+                                    torch::Tensor beta,
+                                    int channels,
+                                    int height,
+                                    int width,
+                                    float eps);
+"""
+
+Then, the load_inline function is called with the CUDA and CPP sources.
+
+Now, the ModelNew class will have the gamma and beta parameters, and the forward function calls the CUDA function.
+
+Putting it all together in code:
+
+```python
+import torch
+import torch.nn as nn
+
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for InstanceNorm2D
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void instance_norm_kernel(const float* x, float* out,
+                                    const float* gamma, const float* beta,
+                                    int batch_size, int channels,
+                                    int height, int width,
+                                    float eps) {
+    int c = blockIdx.x % channels;
+    int b = blockIdx.x / channels;
+    int H = height;
+    int W = width;
+    int N = H * W;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int num_elements = H * W;
+    int start = tid * (num_elements / num_threads);
+    int end = start + (num_elements / num_threads);
+    if (tid == num_threads - 1) {
+        end = num_elements;
+    }
+
+    // Step 1: Compute local sums
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+    for (int i = start; i < end; i++) {
+        int h = i / W;
+        int w = i % W;
+        int idx = b * channels * H * W + c * H * W + h * W + w;
+        float x_val = x[idx];
+        local_sum += x_val;
+        local_sum_sq += x_val * x_val;
+    }
+
+    // Step 2: Reduce to block's total
+    __shared__ float s_sum[256];
+    __shared__ float s_sum_sq[256];
+    s_sum[tid] = local_sum;
+    s_sum_sq[tid] = local_sum_sq;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float total_sum = s_sum[0];
+    float total_sum_sq = s_sum_sq[0];
+
+    // Compute mean and variance
+    float mean = total_sum / N;
+    float var = (total_sum_sq - (total_sum * total_sum) / N) / N;
+    float inv_sqrt_var = rsqrtf(var + eps);
+
+    // Broadcast mean and inv_sqrt_var to all threads
+    __shared__ float s_mean, s_inv_sqrt_var;
+    if (tid == 0) {
+        s_mean = mean;
+        s_inv_sqrt_var = inv_sqrt_var;
+    }
+    __syncthreads();
+
+    // Step 3: Apply normalization and write output
+    for (int i = start; i < end; i++) {
+        int h = i / W;
+        int w = i % W;
+        int idx = b * channels * H * W + c * H * W + h * W + w;
+        float x_val = x[idx];
+        float normalized = (x_val - s_mean) * s_inv_sqrt_var;
+        normalized *= gamma[c];
+        normalized += beta[c];
+        out[idx] = normalized;
+    }
+}
+
+torch::Tensor instance_norm_cuda(torch::Tensor x,
+                                torch::Tensor gamma,
+                                torch::Tensor beta,
+                                int channels,
+                                int height,
+                                int width,
+                                float eps) {
+    auto batch_size = x.size(0);
+    auto out = torch::empty_like(x);
+    const int block_size = 256;
+    int num_blocks = batch_size * channels;
+    dim3 threads(block_size);
+    dim3 blocks(num_blocks);
+    instance_norm_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        batch_size, channels, height, width,
+        eps
+    );
+    return out;
+}
+"""
+
+instance_norm_cpp_source = """
+torch::Tensor instance_norm_cuda(torch::Tensor x,
+                                torch::Tensor gamma,
+                                torch::Tensor beta,
+                                int channels,
+                                int height,
+                                int width,
+                                float eps);
+"""
+
+# Compile the inline CUDA code
+instance_norm = load_inline(
+    name="instance_norm",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Get dimensions
+        C = x.size(1)
+        H = x.size(2)
+        W = x.size(3)
+        # Call the CUDA function
+        return instance_norm.instance_norm_cuda(
+            x, self.gamma, self.beta, C, H, W, 1e-5
+        )
+
+# The get_inputs and get_init_inputs remain the same as in the original code
+batch_size = 112  # heavier workload
+features = 64
+dim1 = 512
+dim2 = 512
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2).cuda()
+    return [x]
+
+def get_init_inputs():
+    return [features]
+```
+
+Wait, but in the original code, get_inputs() and get_init_inputs() must stay the same. However, in the problem statement, the original code has get_inputs() returning tensors on CPU. The user's example added .cuda() in the example. But in the problem's given architecture, the original get_inputs() uses torch.rand which is on CPU. However, in the problem's example code for the Model, the forward function takes tensors as inputs, but the user's example added .cuda() in get_inputs(). The problem states that the code must not modify the input shapes or the way inputs are generated. So the given code for get_inputs() is:
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2)
+    return [x]
+
+Thus, in the new code, the ModelNew must accept inputs on CPU? Or perhaps the problem expects that the inputs are on the same device as the model.
+
+Wait, the original Model uses nn.InstanceNorm2d, which is on the CPU unless moved to GPU. The user's example in the problem's example code added .cuda() to the inputs. But according to the problem's given code, the get_inputs() function returns tensors on CPU. However, in the problem's instructions, it says that the code must not modify the input shapes or the way inputs are generated. Therefore, the ModelNew must work with inputs generated by get_inputs() as given, which are on CPU. But if the CUDA code requires the inputs to be on GPU, then there's a problem.
+
+Wait, the original problem's example for the code with the elementwise addition had the get_inputs() function generate tensors on CUDA. But in the given architecture for the problem, the get_inputs() uses torch.rand without .cuda(), so the inputs are on CPU.
+
+However, in the optimized code with CUDA kernels, the tensors must be on the GPU. Therefore, the problem might expect that the inputs are moved to the GPU in the forward function, or that the get_inputs() is allowed to be modified.
+
+But the problem states: "The get_inputs() and get_init_inputs() functions must stay the same. You must not modify the input shapes or the way inputs are generated."
+
+Thus, the inputs are generated on CPU. But the CUDA code requires the input to be on GPU. Therefore, the ModelNew's forward function must move the input to GPU.
+
+Therefore, in the forward function:
+
+def forward(self, x):
+
+    x = x.cuda()
+
+    ... call the CUDA function ...
+
+But the original code's forward function doesn't do this, so the original Model would have to have its parameters on CPU. The problem states that the new ModelNew must have the same interface and inputs.
+
+Alternatively, perhaps the problem expects that the inputs are passed as CUDA tensors, but the get_inputs() function must not be changed. Since the original code's get_inputs() returns CPU tensors, the ModelNew must handle moving them to GPU internally.
+
+Therefore, in the forward function, we first move x to GPU:
+
+x = x.cuda()
+
+Then proceed.
+
+Therefore, in the ModelNew's forward function:
+
+def forward(self, x):
+
+    x = x.cuda()
+
+    C = x.size(1)
+
+    H = x.size(2)
+
+    W = x.size(3)
+
+    return instance_norm.instance_norm_cuda( x, self.gamma, self.beta, C, H, W, 1e-5 )
+
+Wait, but the gamma and beta parameters are also on the CPU initially, so they need to be on the GPU.
+
+Wait, the parameters self.gamma and self.beta are initialized on CPU (since the model is initialized on CPU unless moved). So, to use them in the CUDA kernel, they must be on the GPU.
+
+Therefore, the parameters should be moved to the GPU when the model is initialized.
+
+Alternatively, in the __init__ function of ModelNew, after initializing gamma and beta as parameters, move them to the same device as the input.
+
+Wait, but the model can be moved to a device using .cuda(), so the parameters will be on the same device as the model.
+
+Therefore, the forward function can assume that the model is on the GPU, and the input x is moved to the same device as the model.
+
+Alternatively, perhaps the code should first move the input to the same device as the parameters.
+
+Therefore, modifying the forward function:
+
+def forward(self, x):
+
+    device = self.gamma.device
+
+    x = x.to(device)
+
+    C = x.size(1)
+
+    H = x.size(2)
+
+    W = x.size(3)
+
+    return instance_norm.instance_norm_cuda( x, self.gamma, self.beta, C, H, W, 1e-5 )
+
+This way, the model can be moved to GPU, and the inputs are moved to the same device.
+
+Thus, in the code, the ModelNew's parameters (gamma and beta) are on the GPU, and the input is moved to the GPU.
+
+Therefore, the code in the forward function needs to handle device placement.
+
+Therefore, adjusting the code:
+
+```python
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Move input to the same device as parameters
+        device = self.gamma.device
+        x = x.to(device)
+        # Get dimensions
+        C = x.size(1)
+        H = x.size(2)
+        W = x.size(3)
+        # Call the CUDA function
+        return instance_norm.instance_norm_cuda(
+            x, self.gamma, self.beta, C, H, W, 1e-5
+        )
+```
+
+This way, the model can be moved to GPU via .cuda() and the input is moved to that device.
+
+Therefore, the full code is as above.
+
+Now, checking for possible issues:
+
+- The CUDA kernel must be launched with enough blocks. The block size is 256, and the number of blocks is batch_size * channels. Since batch_size can be up to 112, and channels 64, the total blocks would be 112 *64 = 7168, which is acceptable.
+
+- The kernel's blockDim.x is fixed to 256. For spatial dimensions of 512x512, each thread in a block handles 512*512 /256 = 1024 elements in the first pass. That's manageable.
+
+- The reduction steps are correct.
+
+- The gamma and beta are accessed via their indices in the kernel.
+
+- The parameters are initialized correctly in the ModelNew.
+
+Potential bugs:
+
+- In the kernel, the block index is blockIdx.x, which is computed as channels * batch_size. The block index should be blockIdx.x, and for each block, the b and c are computed as:
+
+c = blockIdx.x % channels
+
+b = blockIdx.x // channels
+
+This is correct.
+
+- The indices in the input tensor: the formula for the index is correct.
+
+- The variance computation: yes, as (sum_sq - (sum^2)/N) / N.
+
+- The inverse sqrt: using rsqrtf, which is correct.
+
+- The gamma and beta are multiplied and added correctly.
+
+Thus, this should work.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void instance_norm_kernel(const float* x, float* out,
+                                    const float* gamma, const float* beta,
+                                    int batch_size, int channels,
+                                    int height, int width,
+                                    float eps) {
+    int c = blockIdx.x % channels;
+    int b = blockIdx.x / channels;
+    int H = height;
+    int W = width;
+    int N = H * W;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    int num_elements = H * W;
+    int start = tid * (num_elements / num_threads);
+    int end = start + (num_elements / num_threads);
+    if (tid == num_threads - 1) {
+        end = num_elements;
+    }
+
+    // Step 1: Compute local sums
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+    for (int i = start; i < end; i++) {
+        int h = i / W;
+        int w = i % W;
+        int idx = b * channels * H * W + c * H * W + h * W + w;
+        float x_val = x[idx];
+        local_sum += x_val;
+        local_sum_sq += x_val * x_val;
+    }
+
+    // Step 2: Reduce to block's total
+    __shared__ float s_sum[256];
+    __shared__ float s_sum_sq[256];
+    s_sum[tid] = local_sum;
+    s_sum_sq[tid] = local_sum_sq;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float total_sum = s_sum[0];
+    float total_sum_sq = s_sum_sq[0];
+
+    // Compute mean and variance
+    float mean = total_sum / N;
+    float var = (total_sum_sq - (total_sum * total_sum) / N) / N;
+    float inv_sqrt_var = rsqrtf(var + eps);
+
+    // Broadcast mean and inv_sqrt_var to all threads
+    __shared__ float s_mean, s_inv_sqrt_var;
+    if (tid == 0) {
+        s_mean = mean;
+        s_inv_sqrt_var = inv_sqrt_var;
+    }
+    __syncthreads();
+
+    // Step 3: Apply normalization and write output
+    for (int i = start; i < end; i++) {
+        int h = i / W;
+        int w = i % W;
+        int idx = b * channels * H * W + c * H * W + h * W + w;
+        float x_val = x[idx];
+        float normalized = (x_val - s_mean) * s_inv_sqrt_var;
+        normalized *= gamma[c];
+        normalized += beta[c];
+        out[idx] = normalized;
+    }
+}
+
+torch::Tensor instance_norm_cuda(torch::Tensor x,
+                                torch::Tensor gamma,
+                                torch::Tensor beta,
+                                int channels,
+                                int height,
+                                int width,
+                                float eps) {
+    auto batch_size = x.size(0);
+    auto out = torch::empty_like(x);
+    const int block_size = 256;
+    int num_blocks = batch_size * channels;
+    dim3 threads(block_size);
+    dim3 blocks(num_blocks);
+    instance_norm_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        batch_size, channels, height, width,
+        eps
+    );
+    return out;
+}
+"""
+
+instance_norm_cpp_source = """
+torch::Tensor instance_norm_cuda(torch::Tensor x,
+                                torch::Tensor gamma,
+                                torch::Tensor beta,
+                                int channels,
+                                int height,
+                                int width,
+                                float eps);
+"""
+
+# Compile the inline CUDA code
+instance_norm = load_inline(
+    name="instance_norm",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = self.gamma.device
+        x = x.to(device)
+        C = x.size(1)
+        H = x.size(2)
+        W = x.size(3)
+        return instance_norm.instance_norm_cuda(
+            x, self.gamma, self.beta, C, H, W, 1e-5
+        )
+
+batch_size = 112
+features = 64
+dim1 = 512
+dim2 = 512
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [features]
+```

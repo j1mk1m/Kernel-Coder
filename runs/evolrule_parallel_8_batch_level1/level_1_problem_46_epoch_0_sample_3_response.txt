@@ -1,0 +1,1668 @@
+The kernel needs to implement 3D average pooling with the following specifications: 
+
+- The kernel must support 3D input tensors of dimensions (N, C, D, H, W), where N is batch size, C is channels, D is depth, H is height, W is width.
+- The kernel must handle kernel_size, stride, and padding parameters.
+- The kernel must perform the average pooling computation for each input region.
+- The kernel should compute the average without using any existing PyTorch operators, i.e., you must implement the average calculation directly in CUDA.
+- The kernel should be memory efficient, avoiding unnecessary allocations and coalesced memory access.
+- You must implement the backward pass kernel as well, to compute gradients with respect to the input. 
+
+The problem requires careful handling of 3D spatial dimensions and their indices, along with efficient parallelization across the batch, channels, and spatial dimensions. The backward pass requires distributing gradients appropriately across the pooling regions. 
+
+When designing the CUDA kernels, ensure that all necessary parameters are handled (kernel_size, stride, padding), and that the kernel dimensions and indices are correctly computed. Use shared memory if beneficial, and ensure coalesced memory access patterns. 
+
+**Note: The code must be written in Python with inline CUDA extensions using torch.utils.cpp_extension.load_inline.**
+
+
+<think>
+
+Okay, I need to optimize the given 3D Average Pooling model using custom CUDA kernels. Let's see. The original model uses PyTorch's nn.AvgPool3d, which I have to replace with my own forward and backward kernels.
+
+First, the forward pass. The kernel_size is 3, stride 2, padding 1. The input is 5D: N, C, D, H, W. The output dimensions need to be computed based on these parameters. The formula for output spatial dimensions is (input_dim + 2*padding - kernel_size)/stride + 1. So for each dimension D, H, W, the output size would be calculated.
+
+The plan for the forward kernel is to compute each output element by averaging the kernel window in the input. Each thread can handle one output element. The threads need to loop over the kernel dimensions (d, h, w) and sum the corresponding input elements, then divide by the kernel volume (kernel_size^3).
+
+But wait, for efficiency, maybe using shared memory to load the input block and then each thread can compute its own position. Hmm, but 3D pooling might have a large kernel, but in this case kernel_size is 3. Maybe using shared memory isn't necessary here, but let's think: for 3x3x3 kernel, each thread would need to access all 27 elements. But with 3D indexing, maybe each thread can process a single output point, and accumulate the sum by iterating over the kernel indices.
+
+Alternatively, maybe each thread handles an output element, and for that element, loops over the kernel's depth, height, and width, accumulating the sum from the input. That might be straightforward.
+
+The steps for the forward kernel:
+
+1. Calculate the output dimensions (OD, OH, OW) based on input dimensions and parameters.
+2. Each thread is responsible for an output element (n, c, od, oh, ow).
+3. For each output element, compute the starting and ending indices in the input's D, H, W dimensions (considering padding and stride).
+4. Sum all the input elements within the kernel window for this output position, then divide by the kernel volume to get the average.
+
+For the backward pass, each input element's gradient is the sum of the gradients from all overlapping output regions. So for each input position (d, h, w), we need to find which output regions cover it and accumulate the gradient.
+
+The backward kernel needs to compute the gradient with respect to the input. The gradient from the output is distributed back over the kernel window where each input element was part of.
+
+The steps for the backward kernel:
+
+1. For each input position (n, c, d, h, w), determine which output regions (od, oh, ow) include this point in their kernel window.
+2. For each such output region, add the corresponding output gradient divided by the kernel volume (since the forward averaged) to the input gradient at (d, h, w).
+
+But how to efficiently compute this? The backward kernel will need to iterate over the input dimensions and compute which outputs they contribute to.
+
+Alternatively, in the backward kernel, each thread can handle an output element's gradient and distribute it to the input positions in its kernel window. This might be more efficient since it avoids having to compute for all input positions which outputs they belong to.
+
+Wait, yes. So the backward can be structured similarly to the forward, but in reverse. Each output's gradient is spread over the kernel area. So each thread can process an output element, compute the corresponding input window, and then distribute the gradient divided by kernel volume to each position in that window.
+
+So for backward:
+
+- For each output (n, c, od, oh, ow), compute the input window's start and end indices (with padding).
+- The gradient for this output element (grad_out) is divided by kernel_size^3 (since that's the number of elements in the window contributing to it in the forward step).
+- Each element in the input window gets this value added to their gradient.
+
+This approach is better because it's more parallelizable. Each output element can be processed in parallel, and their contributions to the input gradients are accumulated.
+
+Now, the challenge is to implement both kernels efficiently with CUDA.
+
+Let me outline the CUDA kernel structures.
+
+First, for the forward kernel:
+
+The kernel will have threads mapped to each output element. The grid and block dimensions need to be set appropriately. The output has dimensions N x C x OD x OH x OW, so the total number of elements is N*C*OD*OH*OW. The kernel can be launched with a 1D grid where each block handles a chunk of these elements.
+
+But handling 5D indices in CUDA can be a bit tricky. Let's see. The threads can be mapped in a 1D linear index, and we can compute the indices for N, C, OD, OH, OW from the linear index.
+
+The parameters passed to the kernel will be:
+
+- input: the input tensor
+- output: the output tensor
+- kernel_size, stride, padding
+- input dimensions (N, C, D, H, W)
+- output dimensions (OD, OH, OW)
+
+Wait, perhaps it's better to pass the kernel parameters as constants. Alternatively, the kernel can compute the output dimensions on the fly, but that might be redundant. Maybe better to compute them in the Python code and pass as parameters.
+
+Wait, in the forward function, when we call the CUDA kernel, we can precompute the output sizes and pass them as arguments.
+
+So steps for the forward function:
+
+1. Compute the output dimensions (OD, OH, OW) using the input size and the parameters.
+2. Allocate the output tensor with these dimensions.
+3. Launch the kernel with appropriate grid and block dimensions.
+
+Now, the kernel function:
+
+__global__ void avg_pool3d_forward(...) {
+
+   // compute the linear index
+   int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+   if (idx >= total_elements) return;
+
+   // compute the indices N, C, OD, OH, OW from idx
+   int ow = idx % OW;
+   int tmp = idx / OW;
+   int oh = tmp % OH;
+   tmp = tmp / OH;
+   int od = tmp % OD;
+   tmp = tmp / OD;
+   int c = tmp % C;
+   int n = tmp / C;
+
+   // compute the input indices start and end for D, H, W
+   int d_start = od * stride - padding;
+   int d_end = d_start + kernel_size;
+   // similar for h_start, h_end and w_start, w_end.
+
+   // clamp the start and end to input dimensions (0 to D-1 etc.)
+   // but since the padding is handled, maybe the start can be negative, but in that case, we start at 0.
+
+   // compute the sum over the kernel window
+   float sum = 0.0f;
+   for (int d = d_start; d < d_end; d++) {
+       int id = d;
+       if (id <0 || id >= D) continue;
+       for (int h = h_start; h < h_end; h++) {
+           int ih = h;
+           if (ih <0 || ih >= H) continue;
+           for (int w = w_start; w < w_end; w++) {
+               int iw = w;
+               if (iw <0 || iw >= W) continue;
+               sum += input[n][c][id][ih][iw];
+           }
+       }
+   }
+
+   // divide by kernel elements (kernel_size^3)
+   int kernel_vol = kernel_size * kernel_size * kernel_size;
+   output[n][c][od][oh][ow] = sum / kernel_vol;
+
+}
+
+Wait, but in CUDA, accessing the tensor data as pointers would be better. So we need to handle the memory layout.
+
+The input tensor is stored in a contiguous format. For a 5D tensor (N, C, D, H, W), the linear index for (n,c,d,h,w) would be n*stride_n + c*stride_c + d*stride_d + h*stride_h + w*stride_w, but in PyTorch, the tensors are stored in C order (row-major), so the strides are based on that.
+
+Alternatively, the data is stored in the order N, C, D, H, W, so each element can be addressed as:
+
+input_data[ n * C*D*H*W + c * D*H*W + d * H*W + h * W + w ]
+
+Similarly for the output.
+
+But in the kernel, it's better to use pointers and compute the offsets directly.
+
+So, in the kernel code, the input and output pointers are accessed via data_ptr<float>(), and the indices are computed as:
+
+float* in_ptr = input.data_ptr<float>();
+float* out_ptr = output.data_ptr<float>();
+
+Then for each element's position, compute the offset:
+
+int input_offset = n * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+sum += in_ptr[input_offset];
+
+But this could be time-consuming for loops. Maybe better to precompute the dimensions' strides.
+
+Alternatively, perhaps precompute the dimensions and pass them as arguments to the kernel.
+
+Wait, the kernel parameters would include the input dimensions (D, H, W), output dimensions (OD, OH, OW), kernel_size, stride, padding.
+
+So in the CUDA kernel function, these parameters are passed as arguments, so they can be used in calculations.
+
+Now, the start and end indices for each dimension:
+
+The output's od is computed based on the input's d. The formula for output indices is:
+
+od = floor( (d' - padding) / stride ), but the kernel is sliding with stride. Wait, actually, the output index corresponds to the starting position in the input. Let me think again.
+
+Wait, the output position (od, oh, ow) corresponds to a window in the input starting at:
+
+d_start = od * stride - padding;
+
+Similarly for h and w.
+
+But we need to clamp these values to be within 0 to D-1, etc. However, the padding is already considered in the input's size (since the input is padded, but in PyTorch, padding is added automatically when using the AvgPool3d, but in our case, perhaps the input is not pre-padded, so the code must handle the padding by checking the indices.
+
+Wait, in the problem description, the kernel must handle padding. So the input is not pre-padded. So when computing the start indices, if they are negative, we start at 0, and similarly, if the end exceeds the input dimension, we cap at the input dimension.
+
+Thus, for each dimension:
+
+d_start = od * stride - padding;
+
+d_end = d_start + kernel_size;
+
+But d_start could be negative, so the actual start is max(d_start, 0).
+
+d_end could exceed D, so the actual end is min(d_end, D).
+
+Same for h and w.
+
+So in code:
+
+int d_start = od * stride - padding;
+int h_start = oh * stride - padding;
+int w_start = ow * stride - padding;
+
+int d_end = d_start + kernel_size;
+int h_end = h_start + kernel_size;
+int w_end = w_start + kernel_size;
+
+Then clamp:
+
+d_start = max(d_start, 0);
+d_end = min(d_end, D);
+h_start = max(h_start, 0);
+h_end = min(h_end, H);
+w_start = max(w_start, 0);
+w_end = min(w_end, W);
+
+Then, loop over d from d_start to d_end -1, h from h_start to h_end-1, etc.
+
+Wait, but in the loops, the variables d, h, w should iterate from the start to end, but not exceeding the input dimensions.
+
+Wait, the loops would be:
+
+for (int d = d_start; d < d_end; d++) {
+    for (int h = h_start; h < h_end; h++) {
+        for (int w = w_start; w < w_end; w++) {
+            // accumulate input[n][c][d][h][w]
+        }
+    }
+}
+
+But the problem is that for each iteration of d, h, w, we have to check if those are within the input's dimensions. However, since we clamped d_start, d_end, etc., the loops are already within the valid ranges, so no need for further checks.
+
+Therefore, the loops can proceed safely.
+
+Now, the calculation of the sum:
+
+Each thread computes the sum over the kernel window for their output element, then divides by the kernel volume (which is (kernel_size)^3).
+
+The division by kernel_vol is done once per output element.
+
+Now, for the backward kernel:
+
+The backward kernel needs to compute d_input given d_output.
+
+The gradient for the input is the sum over all output regions that included the input position, of the output gradient divided by the kernel volume.
+
+Alternatively, for each output element (od, oh, ow), its gradient is spread over the kernel window in the input. So for each output's position, we compute the input window and add the gradient divided by kernel_vol to each element in that window.
+
+Thus, the backward kernel can be structured as follows:
+
+Each thread processes an output element (n, c, od, oh, ow). The output gradient is grad_out[n][c][od][oh][ow].
+
+The kernel_vol is the same as in the forward.
+
+The thread computes the input window's start and end indices (d_start, d_end, etc.), and then loops over the kernel's d, h, w in that window. For each input position (d, h, w) in that window, adds grad_out / kernel_vol to the input gradient at (d, h, w).
+
+The steps:
+
+1. Compute the linear index for the output element (similar to forward).
+2. Get the output gradient value: grad = grad_out[...] / kernel_vol.
+3. Compute the input window's start and end indices as before.
+4. Iterate over the kernel's d, h, w in the window.
+5. For each (d, h, w) in the window, compute the input offset and add grad to the input gradient at that position.
+
+This requires atomicAdd operations because multiple threads might be writing to the same input gradient positions. Wait, no—each output's window contributes to input elements, and overlapping regions (from different output elements) must accumulate their contributions. Since multiple threads could be writing to the same input position simultaneously, atomicAdd is necessary to prevent race conditions. However, atomic operations can be slow, so perhaps a better way is to use a grid that ensures no overlap, but that might be difficult.
+
+Alternatively, since the backward kernel is processing each output element independently, and their contributions to the input can overlap, atomicAdd is needed here. But in CUDA, atomicAdd for floats is available.
+
+Wait, but if two threads write to the same memory location, using atomicAdd ensures that the sum is correct. So in the backward kernel, for each input position (d, h, w) in the current window, we do:
+
+atomicAdd( &input_grad[offset], grad );
+
+Alternatively, if the input gradient is initialized to zero, and all contributions are added via atomic operations, this should work.
+
+But atomic operations can be a bottleneck. To minimize their impact, perhaps we can use shared memory to accumulate partial sums per thread block, then write back to global memory. However, this would require synchronization and may complicate the code.
+
+Alternatively, if the input gradient is initialized to zero, and the backward kernel is launched with sufficient threads, but the atomicAdd is the only way to handle concurrent writes.
+
+Hmm, perhaps the atomicAdd is the simplest way here, even if it's a bit slower. Let's proceed with that for now.
+
+So, in the backward kernel code:
+
+__global__ void avg_pool3d_backward(...) {
+
+   int idx = blockIdx.x * blockDim.x + threadIdx.x;
+   if (idx >= total_elements) return;
+
+   // compute n, c, od, oh, ow from idx.
+
+   // get the gradient from output
+   float grad = grad_out[...] / kernel_vol;
+
+   // compute the input window start and end as before.
+
+   // loop over the kernel window
+   for (int d = d_start; d < d_end; d++) {
+       for (int h = h_start; h < h_end; h++) {
+           for (int w = w_start; w < w_end; w++) {
+               // compute the input offset for (d, h, w)
+               int input_offset = ...;
+               // atomicAdd to input_grad
+               atomicAdd( &input_grad[input_offset], grad );
+           }
+       }
+   }
+
+}
+
+This should work. However, the atomicAdd may be slow for large batches or large kernels. Maybe using a tiled approach with shared memory could help, but for now, let's proceed with this.
+
+Now, the parameters passed to the backward kernel need to be the same as forward, plus the grad_output tensor and the input_grad tensor.
+
+Now, the CUDA code structure in Python.
+
+First, the forward function in Python will:
+
+- Compute the output shape using the input's dimensions and the parameters.
+
+- Then call the CUDA kernel, passing all necessary parameters.
+
+The backward function similarly.
+
+Now, implementing the CUDA code in Python using load_inline.
+
+The code outline would be:
+
+First, the forward kernel and backward kernel sources.
+
+The forward kernel:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pool3d_forward_kernel(
+    const float* input, float* output,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    // ... the code as above ...
+}
+
+Then, the backward kernel:
+
+__global__ void avg_pool3d_backward_kernel(
+    const float* grad_output, float* grad_input,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    // ... the code as above ...
+}
+
+The Python functions to launch these kernels would be:
+
+torch::Tensor avg_pool3d_forward(torch::Tensor input, int kernel_size, int stride, int padding) {
+    // Compute output dimensions
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+    int OD = (D + 2*padding - kernel_size) / stride + 1;
+    int OH = (H + 2*padding - kernel_size) / stride + 1;
+    int OW = (W + 2*padding - kernel_size) / stride + 1;
+
+    auto output = torch::zeros({N, C, OD, OH, OW}, input.options());
+
+    // ... compute grid and block sizes ...
+    int total_elements = N * C * OD * OH * OW;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    avg_pool3d_forward_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        kernel_size, stride, padding,
+        N, C, D, H, W,
+        OD, OH, OW
+    );
+
+    return output;
+}
+
+Similarly for the backward function.
+
+Wait, but in Python, the functions need to handle the parameters. For example, the stride can be None, so in the forward function, need to check if stride is provided. However, in the given problem, the model's __init__ has parameters kernel_size, stride (optional, default None), padding (default 0). But in the problem, the example uses stride=2, padding=1. So in the code, perhaps the kernel_size, stride, and padding are passed as arguments to the CUDA functions.
+
+Wait, in the Python code, the forward function in the model takes the input tensor and parameters (kernel_size, stride, padding). Wait, no: in the given code, the model's __init__ stores the parameters, so the forward function uses self.avg_pool, which has the parameters. So in our custom code, the forward and backward kernels must accept the parameters (kernel_size, stride, padding) as inputs.
+
+Wait, but when defining the CUDA functions in Python, how to pass these parameters? For example, in the example given, the elementwise_add_cuda function takes the tensors a and b as parameters, and the kernel uses their data.
+
+So in our case, the forward function in Python would be something like:
+
+def avg_pool3d_forward(input, kernel_size, stride, padding):
+    # compute output sizes
+    # ... 
+    # launch kernel
+    return output
+
+But in the CUDA kernel code, the parameters must be passed as arguments. So in the kernel call, we need to pass all necessary parameters.
+
+Now, the problem is that in the original Model class, the kernel_size, stride, and padding are attributes of the model. So in the ModelNew class, the model will have these parameters stored, and when forward is called, the kernel will use them.
+
+Therefore, the forward function in Python will need to take those parameters as inputs, so they can be passed to the CUDA kernel.
+
+Wait, but in the code provided, the get_init_inputs() returns [kernel_size, stride, padding], which are the parameters passed to the model's __init__.
+
+So in the ModelNew class, perhaps the parameters are stored as attributes, and when forward is called, they are passed to the CUDA function.
+
+Therefore, in the Python code for ModelNew:
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size, stride=None, padding=0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+
+    def forward(self, x):
+        return self.avg_pool3d_forward_cuda(x, self.kernel_size, self.stride, self.padding)
+
+Wait, but the CUDA functions must be loaded with the appropriate parameters.
+
+Therefore, the CUDA kernels need to be called with the parameters passed from the model's attributes.
+
+Now, putting it all together.
+
+First, the CUDA code for the forward and backward kernels.
+
+The forward kernel code:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pool3d_forward_kernel(
+    const float* input, float* output,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * OD * OH * OW) return;
+
+    // Compute the indices for N, C, OD, OH, OW
+    int ow = idx % OW;
+    int tmp = idx / OW;
+    int oh = tmp % OH;
+    tmp = tmp / OH;
+    int od = tmp % OD;
+    tmp = tmp / OD;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    // Compute input window start and end
+    int d_start = od * stride - padding;
+    int h_start = oh * stride - padding;
+    int w_start = ow * stride - padding;
+
+    int d_end = d_start + kernel_size;
+    int h_end = h_start + kernel_size;
+    int w_end = w_start + kernel_size;
+
+    // Clamp to valid ranges
+    d_start = max(d_start, 0);
+    h_start = max(h_start, 0);
+    w_start = max(w_start, 0);
+
+    d_end = min(d_end, D);
+    h_end = min(h_end, H);
+    w_end = min(w_end, W);
+
+    float sum = 0.0f;
+    for (int d = d_start; d < d_end; ++d) {
+        for (int h = h_start; h < h_end; ++h) {
+            for (int w = w_start; w < w_end; ++w) {
+                // Compute input index
+                int input_offset = 
+                    n * C * D * H * W +
+                    c * D * H * W +
+                    d * H * W +
+                    h * W +
+                    w;
+                sum += input[input_offset];
+            }
+        }
+    }
+
+    // Compute kernel volume
+    int kernel_vol = kernel_size * kernel_size * kernel_size;
+    float avg = sum / kernel_vol;
+
+    // Compute output index
+    int output_offset = 
+        n * C * OD * OH * OW +
+        c * OD * OH * OW +
+        od * OH * OW +
+        oh * OW +
+        ow;
+    output[output_offset] = avg;
+}
+
+The backward kernel:
+
+__global__ void avg_pool3d_backward_kernel(
+    const float* grad_output, float* grad_input,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * OD * OH * OW) return;
+
+    // Compute indices for output (n, c, od, oh, ow)
+    int ow = idx % OW;
+    int tmp = idx / OW;
+    int oh = tmp % OH;
+    tmp = tmp / OH;
+    int od = tmp % OD;
+    tmp = tmp / OD;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    // Get the gradient from output
+    float grad_out_val = grad_output[idx]; // since output is N,C,OD,OH,OW, so the offset is same as idx here.
+
+    float grad_per_element = grad_out_val / (kernel_size * kernel_size * kernel_size);
+
+    // Compute input window start and end
+    int d_start = od * stride - padding;
+    int h_start = oh * stride - padding;
+    int w_start = ow * stride - padding;
+
+    int d_end = d_start + kernel_size;
+    int h_end = h_start + kernel_size;
+    int w_end = w_start + kernel_size;
+
+    d_start = max(d_start, 0);
+    h_start = max(h_start, 0);
+    w_start = max(w_start, 0);
+
+    d_end = min(d_end, D);
+    h_end = min(h_end, H);
+    w_end = min(w_end, W);
+
+    for (int d = d_start; d < d_end; ++d) {
+        for (int h = h_start; h < h_end; ++h) {
+            for (int w = w_start; w < w_end; ++w) {
+                // Compute input offset
+                int input_offset = 
+                    n * C * D * H * W +
+                    c * D * H * W +
+                    d * H * W +
+                    h * W +
+                    w;
+                // Use atomicAdd to accumulate the gradient
+                atomicAdd(&grad_input[input_offset], grad_per_element);
+            }
+        }
+    }
+}
+
+Now, the Python wrapper functions:
+
+def avg_pool3d_forward_cuda(input, kernel_size, stride, padding):
+    N, C, D, H, W = input.shape
+    # Compute output dimensions
+    OD = (D + 2 * padding - kernel_size) // stride + 1
+    OH = (H + 2 * padding - kernel_size) // stride + 1
+    OW = (W + 2 * padding - kernel_size) // stride + 1
+
+    output = torch.zeros(N, C, OD, OH, OW, dtype=input.dtype, device=input.device)
+
+    block_size = 256
+    total_elements = N * C * OD * OH * OW
+    num_blocks = (total_elements + block_size - 1) // block_size
+
+    # Launch the forward kernel
+    avg_pool3d_forward_kernel[blocks, threads](
+        input.data_ptr(), output.data_ptr(),
+        kernel_size, stride, padding,
+        N, C, D, H, W,
+        OD, OH, OW
+    )
+
+    return output
+
+Wait, but in Python, the kernel launch uses the CUDA function. Wait, in the example, they used:
+
+elementwise_add_cuda(...) which was defined with the load_inline function. The actual CUDA functions are the ones in the cpp_sources.
+
+Wait, in the example, the forward function is elementwise_add_cuda which is defined in the CUDA code. So similarly, the avg_pool3d_forward function must be a Python function that calls the CUDA kernels.
+
+Wait, perhaps the functions in the CUDA code are defined as:
+
+torch::Tensor avg_pool3d_forward(torch::Tensor input, int kernel_size, int stride, int padding) {
+    ... 
+}
+
+But in the Python code, the function would be declared as:
+
+def avg_pool3d_forward_cuda(input, kernel_size, stride, padding):
+
+But the CUDA code must have the function definitions that match these.
+
+Wait, perhaps I should structure the code as follows:
+
+The CUDA source code (cpp_sources and cuda_sources) must define the Python-callable functions.
+
+So in the CUDA code:
+
+extern "C" {
+
+    torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding) {
+        // Implementation here, calling the kernel
+    }
+
+    torch::Tensor avg_pool3d_backward_cuda(
+        torch::Tensor grad_output, 
+        torch::Tensor input, 
+        int kernel_size, int stride, int padding
+    ) {
+        // Implementation here, calling the backward kernel
+    }
+
+}
+
+Wait, but the backward function needs the input's dimensions to compute the gradients. So the backward function may need the input tensor to get the original dimensions (D, H, W), or perhaps we can pass them as parameters.
+
+Alternatively, the backward function could compute the input dimensions from the input tensor's shape.
+
+Alternatively, the backward function must have access to the original input's shape, which can be passed as parameters.
+
+Hmm, perhaps the backward function needs to have the input tensor, but in the CUDA code, the input tensor's dimensions can be read.
+
+Wait, in the backward pass, the grad_input has the same shape as the input. So the backward function must output a tensor of the same shape as the input. To compute that, the backward function must know the input's dimensions (N, C, D, H, W). So the backward CUDA function would need the input tensor's shape, which can be obtained via input.size().
+
+Therefore, the backward function in CUDA would take the grad_output, the input tensor, and the parameters.
+
+Thus, in the CUDA code:
+
+The backward function would be:
+
+torch::Tensor avg_pool3d_backward_cuda(
+    torch::Tensor grad_output, 
+    torch::Tensor input, 
+    int kernel_size, 
+    int stride, 
+    int padding
+) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+
+    int OD = (D + 2 * padding - kernel_size) / stride + 1;
+    int OH = (H + 2 * padding - kernel_size) / stride + 1;
+    int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+    // Compute the output dimensions for grad_input is same as input's
+    auto grad_input = torch::zeros_like(input);
+
+    int total_elements = N * C * OD * OH * OW;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    avg_pool3d_backward_kernel<<<num_blocks, block_size>>>(
+        grad_output.data_ptr<float>(),
+        grad_input.data_ptr<float>(),
+        kernel_size, stride, padding,
+        N, C, D, H, W,
+        OD, OH, OW
+    );
+
+    return grad_input;
+}
+
+Now, putting all this into the Python code using load_inline.
+
+The CUDA source code for both forward and backward will be in the cuda_sources string.
+
+So the Python code would have:
+
+from torch.utils.cpp_extension import load_inline
+
+cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pool3d_forward_kernel(
+    const float* input, float* output,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    // ... kernel code as before ...
+}
+
+__global__ void avg_pool3d_backward_kernel(
+    const float* grad_output, float* grad_input,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    // ... backward kernel code ...
+}
+
+extern "C" {
+    torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding) {
+        int N = input.size(0);
+        int C = input.size(1);
+        int D = input.size(2);
+        int H = input.size(3);
+        int W = input.size(4);
+
+        int OD = (D + 2 * padding - kernel_size) / stride + 1;
+        int OH = (H + 2 * padding - kernel_size) / stride + 1;
+        int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+        auto output = torch::empty({N, C, OD, OH, OW}, input.options());
+
+        int total = N * C * OD * OH * OW;
+        int block_size = 256;
+        int num_blocks = (total + block_size - 1) / block_size;
+
+        avg_pool3d_forward_kernel<<<num_blocks, block_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            kernel_size, stride, padding,
+            N, C, D, H, W,
+            OD, OH, OW
+        );
+
+        return output;
+    }
+
+    torch::Tensor avg_pool3d_backward_cuda(
+        torch::Tensor grad_output, 
+        torch::Tensor input, 
+        int kernel_size, 
+        int stride, 
+        int padding
+    ) {
+        int N = input.size(0);
+        int C = input.size(1);
+        int D = input.size(2);
+        int H = input.size(3);
+        int W = input.size(4);
+
+        int OD = (D + 2 * padding - kernel_size) / stride + 1;
+        int OH = (H + 2 * padding - kernel_size) / stride + 1;
+        int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+        auto grad_input = torch::zeros_like(input);
+
+        int total = N * C * OD * OH * OW;
+        int block_size = 256;
+        int num_blocks = (total + block_size - 1) / block_size;
+
+        avg_pool3d_backward_kernel<<<num_blocks, block_size>>>(
+            grad_output.data_ptr<float>(),
+            grad_input.data_ptr<float>(),
+            kernel_size, stride, padding,
+            N, C, D, H, W,
+            OD, OH, OW
+        );
+
+        return grad_input;
+    }
+}
+"""
+
+cpp_source = """
+#include <vector>
+
+torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding);
+torch::Tensor avg_pool3d_backward_cuda(
+    torch::Tensor grad_output, 
+    torch::Tensor input, 
+    int kernel_size, 
+    int stride, 
+    int padding
+);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("avg_pool3d_forward", &avg_pool3d_forward_cuda, "3D average pool forward");
+    m.def("avg_pool3d_backward", &avg_pool3d_backward_cuda, "3D average pool backward");
+}
+"""
+
+Wait, but in the example given, the cpp_sources and cuda_sources are passed to load_inline. So in our case, the cpp_source is the header, and the cuda_source includes the kernels and the functions.
+
+Wait, in the example, the elementwise_add_cpp_source was a string containing the function declarations, and the cuda_source the definitions.
+
+Hmm, perhaps the code should be structured so that the cpp_sources is the header declarations, and the cuda_sources contains the kernel code and the function definitions.
+
+Wait, in the example:
+
+elementwise_add_cpp_source = "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+
+Then, the CUDA code defines the function.
+
+So for our case, the cpp_sources would be:
+
+cpp_sources = """
+#include <torch/extension.h>
+
+torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding);
+torch::Tensor avg_pool3d_backward_cuda(
+    torch::Tensor grad_output, 
+    torch::Tensor input, 
+    int kernel_size, int stride, int padding
+);
+"""
+
+And the cuda_sources is the code with the kernels and the functions.
+
+Putting this together:
+
+So the code would be:
+
+cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pool3d_forward_kernel(...); // as before
+
+__global__ void avg_pool3d_backward_kernel(...); // as before
+
+extern "C" {
+
+    torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding) {
+        // implementation
+    }
+
+    torch::Tensor avg_pool3d_backward_cuda(
+        torch::Tensor grad_output, 
+        torch::Tensor input, 
+        int kernel_size, 
+        int stride, 
+        int padding
+    ) {
+        // implementation
+    }
+
+}
+"""
+
+cpp_source = """
+#include <vector>
+#include <torch/extension.h>
+
+torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding);
+torch::Tensor avg_pool3d_backward_cuda(
+    torch::Tensor grad_output, 
+    torch::Tensor input, 
+    int kernel_size, 
+    int stride, 
+    int padding
+);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("avg_pool3d_forward", &avg_pool3d_forward_cuda, "3D average pool forward");
+    m.def("avg_pool3d_backward", &avg_pool3d_backward_cuda, "3D average pool backward");
+}
+"""
+
+Wait, but the cpp_sources and cuda_sources need to be passed to load_inline. So in code:
+
+module = load_inline(
+    name="avg_pool3d",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_source,
+    functions=["avg_pool3d_forward_cuda", "avg_pool3d_backward_cuda"],
+    verbose=True,
+)
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        # load the CUDA functions
+        # Assuming the module is imported and named 'avg_pool3d'
+        self.forward_func = avg_pool3d.avg_pool3d_forward
+        self.backward_func = avg_pool3d.avg_pool3d_backward
+
+    def forward(self, x):
+        return self.forward_func(x, self.kernel_size, self.stride, self.padding)
+
+    def backward(self, grad_output, x):
+        return self.backward_func(grad_output, x, self.kernel_size, self.stride, self.padding)
+
+Wait, but in PyTorch, the backward is handled via autograd. So to make this work with autograd, we need to create a custom autograd.Function.
+
+Ah, right! I forgot about the autograd part. The custom CUDA kernels need to be wrapped in an autograd.Function to handle the forward and backward passes.
+
+Therefore, the correct approach is to create a class that inherits from torch.autograd.Function, and implements the forward and backward methods, which call the CUDA functions.
+
+So in code:
+
+class AvgPool3dFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, kernel_size, stride, padding):
+        ctx.save_for_backward(input)
+        ctx.kernel_size = kernel_size
+        ctx.stride = stride
+        ctx.padding = padding
+
+        return avg_pool3d_forward_cuda(input, kernel_size, stride, padding)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+        kernel_size = ctx.kernel_size
+        stride = ctx.stride
+        padding = ctx.padding
+
+        grad_input = avg_pool3d_backward_cuda(grad_output, input, kernel_size, stride, padding)
+
+        return grad_input, None, None, None
+
+Then, the ModelNew class would use this function:
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+
+    def forward(self, x):
+        return AvgPool3dFunction.apply(x, self.kernel_size, self.stride, self.padding)
+
+Therefore, the complete code would involve:
+
+- Defining the CUDA kernels and functions as before.
+- Wrapping them in the autograd function.
+- The ModelNew class uses the autograd function.
+
+Now, putting it all together with proper code formatting.
+
+Wait, also, in the CUDA code, the backward kernel uses atomicAdd. The code must include the atomicAdd function.
+
+Also, in the backward kernel code, the input_offset is computed correctly.
+
+Additionally, the output dimensions are computed correctly.
+
+Now, let's write the full code.
+
+First, the CUDA code:
+
+The kernel functions:
+
+__global__ void avg_pool3d_forward_kernel(
+    const float* input, float* output,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * OD * OH * OW) return;
+
+    int ow = idx % OW;
+    int tmp = idx / OW;
+    int oh = tmp % OH;
+    tmp = tmp / OH;
+    int od = tmp % OD;
+    tmp = tmp / OD;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    int d_start = od * stride - padding;
+    int h_start = oh * stride - padding;
+    int w_start = ow * stride - padding;
+
+    int d_end = d_start + kernel_size;
+    int h_end = h_start + kernel_size;
+    int w_end = w_start + kernel_size;
+
+    d_start = max(d_start, 0);
+    h_start = max(h_start, 0);
+    w_start = max(w_start, 0);
+
+    d_end = min(d_end, D);
+    h_end = min(h_end, H);
+    w_end = min(w_end, W);
+
+    float sum = 0.0f;
+    for (int d = d_start; d < d_end; ++d) {
+        for (int h = h_start; h < h_end; ++h) {
+            for (int w = w_start; w < w_end; ++w) {
+                int input_offset = 
+                    n * C * D * H * W +
+                    c * D * H * W +
+                    d * H * W +
+                    h * W +
+                    w;
+                sum += input[input_offset];
+            }
+        }
+    }
+
+    int kernel_vol = kernel_size * kernel_size * kernel_size;
+    float avg = sum / kernel_vol;
+
+    int output_offset = 
+        n * C * OD * OH * OW +
+        c * OD * OH * OW +
+        od * OH * OW +
+        oh * OW +
+        ow;
+    output[output_offset] = avg;
+}
+
+Backward kernel:
+
+__global__ void avg_pool3d_backward_kernel(
+    const float* grad_output, float* grad_input,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * OD * OH * OW) return;
+
+    int ow = idx % OW;
+    int tmp = idx / OW;
+    int oh = tmp % OH;
+    tmp = tmp / OH;
+    int od = tmp % OD;
+    tmp = tmp / OD;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    float grad_out_val = grad_output[idx]; // grad_output is N,C,OD,OH,OW
+    float grad_per_element = grad_out_val / (kernel_size * kernel_size * kernel_size);
+
+    int d_start = od * stride - padding;
+    int h_start = oh * stride - padding;
+    int w_start = ow * stride - padding;
+
+    int d_end = d_start + kernel_size;
+    int h_end = h_start + kernel_size;
+    int w_end = w_start + kernel_size;
+
+    d_start = max(d_start, 0);
+    h_start = max(h_start, 0);
+    w_start = max(w_start, 0);
+
+    d_end = min(d_end, D);
+    h_end = min(h_end, H);
+    w_end = min(w_end, W);
+
+    for (int d = d_start; d < d_end; ++d) {
+        for (int h = h_start; h < h_end; ++h) {
+            for (int w = w_start; w < w_end; ++w) {
+                int input_offset = 
+                    n * C * D * H * W +
+                    c * D * H * W +
+                    d * H * W +
+                    h * W +
+                    w;
+                atomicAdd(&grad_input[input_offset], grad_per_element);
+            }
+        }
+    }
+}
+
+The forward and backward functions in the CUDA code:
+
+extern "C" {
+
+torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+
+    int OD = (D + 2 * padding - kernel_size) / stride + 1;
+    int OH = (H + 2 * padding - kernel_size) / stride + 1;
+    int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+    auto output = torch::empty({N, C, OD, OH, OW}, input.options());
+
+    int total_elements = N * C * OD * OH * OW;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    avg_pool3d_forward_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        kernel_size, stride, padding,
+        N, C, D, H, W,
+        OD, OH, OW
+    );
+
+    return output;
+}
+
+torch::Tensor avg_pool3d_backward_cuda(
+    torch::Tensor grad_output, 
+    torch::Tensor input, 
+    int kernel_size, 
+    int stride, 
+    int padding
+) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+
+    int OD = (D + 2 * padding - kernel_size) / stride + 1;
+    int OH = (H + 2 * padding - kernel_size) / stride + 1;
+    int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+    auto grad_input = torch::zeros_like(input);
+
+    int total_elements = N * C * OD * OH * OW;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    avg_pool3d_backward_kernel<<<num_blocks, block_size>>>(
+        grad_output.data_ptr<float>(),
+        grad_input.data_ptr<float>(),
+        kernel_size, stride, padding,
+        N, C, D, H, W,
+        OD, OH, OW
+    );
+
+    return grad_input;
+}
+
+}
+
+Now, the Python code:
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding);
+torch::Tensor avg_pool3d_backward_cuda(
+    torch::Tensor grad_output, 
+    torch::Tensor input, 
+    int kernel_size, 
+    int stride, 
+    int padding
+);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("avg_pool3d_forward", &avg_pool3d_forward_cuda, "3D average pool forward");
+    m.def("avg_pool3d_backward", &avg_pool3d_backward_cuda, "3D average pool backward");
+}
+"""
+
+cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pool3d_forward_kernel(
+    const float* input, float* output,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * OD * OH * OW) return;
+
+    int ow = idx % OW;
+    int tmp = idx / OW;
+    int oh = tmp % OH;
+    tmp = tmp / OH;
+    int od = tmp % OD;
+    tmp = tmp / OD;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    int d_start = od * stride - padding;
+    int h_start = oh * stride - padding;
+    int w_start = ow * stride - padding;
+
+    int d_end = d_start + kernel_size;
+    int h_end = h_start + kernel_size;
+    int w_end = w_start + kernel_size;
+
+    d_start = max(d_start, 0);
+    h_start = max(h_start, 0);
+    w_start = max(w_start, 0);
+
+    d_end = min(d_end, D);
+    h_end = min(h_end, H);
+    w_end = min(w_end, W);
+
+    float sum = 0.0f;
+    for (int d = d_start; d < d_end; ++d) {
+        for (int h = h_start; h < h_end; ++h) {
+            for (int w = w_start; w < w_end; ++w) {
+                int input_offset = 
+                    n * C * D * H * W +
+                    c * D * H * W +
+                    d * H * W +
+                    h * W +
+                    w;
+                sum += input[input_offset];
+            }
+        }
+    }
+
+    int kernel_vol = kernel_size * kernel_size * kernel_size;
+    float avg = sum / kernel_vol;
+
+    int output_offset = 
+        n * C * OD * OH * OW +
+        c * OD * OH * OW +
+        od * OH * OW +
+        oh * OW +
+        ow;
+    output[output_offset] = avg;
+}
+
+__global__ void avg_pool3d_backward_kernel(
+    const float* grad_output, float* grad_input,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * OD * OH * OW) return;
+
+    int ow = idx % OW;
+    int tmp = idx / OW;
+    int oh = tmp % OH;
+    tmp = tmp / OH;
+    int od = tmp % OD;
+    tmp = tmp / OD;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    float grad_out_val = grad_output[idx];
+    float grad_per_element = grad_out_val / (kernel_size * kernel_size * kernel_size);
+
+    int d_start = od * stride - padding;
+    int h_start = oh * stride - padding;
+    int w_start = ow * stride - padding;
+
+    int d_end = d_start + kernel_size;
+    int h_end = h_start + kernel_size;
+    int w_end = w_start + kernel_size;
+
+    d_start = max(d_start, 0);
+    h_start = max(h_start, 0);
+    w_start = max(w_start, 0);
+
+    d_end = min(d_end, D);
+    h_end = min(h_end, H);
+    w_end = min(w_end, W);
+
+    for (int d = d_start; d < d_end; ++d) {
+        for (int h = h_start; h < h_end; ++h) {
+            for (int w = w_start; w < w_end; ++w) {
+                int input_offset = 
+                    n * C * D * H * W +
+                    c * D * H * W +
+                    d * H * W +
+                    h * W +
+                    w;
+                atomicAdd(&grad_input[input_offset], grad_per_element);
+            }
+        }
+    }
+}
+
+extern "C" {
+
+torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+
+    int OD = (D + 2 * padding - kernel_size) / stride + 1;
+    int OH = (H + 2 * padding - kernel_size) / stride + 1;
+    int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+    auto output = torch::empty({N, C, OD, OH, OW}, input.options());
+
+    int total_elements = N * C * OD * OH * OW;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    avg_pool3d_forward_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        kernel_size, stride, padding,
+        N, C, D, H, W,
+        OD, OH, OW
+    );
+
+    return output;
+}
+
+torch::Tensor avg_pool3d_backward_cuda(
+    torch::Tensor grad_output, 
+    torch::Tensor input, 
+    int kernel_size, 
+    int stride, 
+    int padding
+) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+
+    int OD = (D + 2 * padding - kernel_size) / stride + 1;
+    int OH = (H + 2 * padding - kernel_size) / stride + 1;
+    int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+    auto grad_input = torch::zeros_like(input);
+
+    int total_elements = N * C * OD * OH * OW;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    avg_pool3d_backward_kernel<<<num_blocks, block_size>>>(
+        grad_output.data_ptr<float>(),
+        grad_input.data_ptr<float>(),
+        kernel_size, stride, padding,
+        N, C, D, H, W,
+        OD, OH, OW
+    );
+
+    return grad_input;
+}
+
+}
+"""
+
+# Compile the CUDA extension
+avg_pool3d = load_inline(
+    name="avg_pool3d",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["avg_pool3d_forward", "avg_pool3d_backward"],
+    verbose=True,
+)
+
+class AvgPool3dFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, kernel_size, stride, padding):
+        ctx.save_for_backward(input)
+        ctx.kernel_size = kernel_size
+        ctx.stride = stride
+        ctx.padding = padding
+
+        return avg_pool3d.avg_pool3d_forward(input, kernel_size, stride, padding)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+        kernel_size = ctx.kernel_size
+        stride = ctx.stride
+        padding = ctx.padding
+
+        grad_input = avg_pool3d.avg_pool3d_backward(grad_output, input, kernel_size, stride, padding)
+
+        return grad_input, None, None, None
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+
+    def forward(self, x):
+        return AvgPool3dFunction.apply(x, self.kernel_size, self.stride, self.padding)
+
+# The get_inputs and get_init_inputs functions remain as in the original problem.
+
+This should be the complete code. Let me check for any possible errors.
+
+Wait, in the CUDA code, the forward function's output tensor is initialized with torch::empty, which is okay. The backward's grad_input is initialized with zeros_like(input).
+
+Also, in the backward kernel, the atomicAdd is correctly applied.
+
+The strides and dimensions are computed correctly.
+
+Another possible issue: when the padding is such that the output dimensions are computed correctly.
+
+Another thing: in the CUDA code, the input and output are assumed to be contiguous. The code uses input.options() which should handle the device and dtype.
+
+The functions are correctly wrapped in the autograd function.
+
+The ModelNew class uses the custom AvgPool3dFunction to apply the forward and backward passes.
+
+I think this should work. Now, the final code in markdown format.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding);
+torch::Tensor avg_pool3d_backward_cuda(
+    torch::Tensor grad_output, 
+    torch::Tensor input, 
+    int kernel_size, 
+    int stride, 
+    int padding
+);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("avg_pool3d_forward", &avg_pool3d_forward_cuda, "3D average pool forward");
+    m.def("avg_pool3d_backward", &avg_pool3d_backward_cuda, "3D average pool backward");
+}
+"""
+
+cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pool3d_forward_kernel(
+    const float* input, float* output,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * OD * OH * OW) return;
+
+    int ow = idx % OW;
+    int tmp = idx / OW;
+    int oh = tmp % OH;
+    tmp = tmp / OH;
+    int od = tmp % OD;
+    tmp = tmp / OD;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    int d_start = od * stride - padding;
+    int h_start = oh * stride - padding;
+    int w_start = ow * stride - padding;
+
+    int d_end = d_start + kernel_size;
+    int h_end = h_start + kernel_size;
+    int w_end = w_start + kernel_size;
+
+    d_start = max(d_start, 0);
+    h_start = max(h_start, 0);
+    w_start = max(w_start, 0);
+
+    d_end = min(d_end, D);
+    h_end = min(h_end, H);
+    w_end = min(w_end, W);
+
+    float sum = 0.0f;
+    for (int d = d_start; d < d_end; ++d) {
+        for (int h = h_start; h < h_end; ++h) {
+            for (int w = w_start; w < w_end; ++w) {
+                int input_offset = 
+                    n * C * D * H * W +
+                    c * D * H * W +
+                    d * H * W +
+                    h * W +
+                    w;
+                sum += input[input_offset];
+            }
+        }
+    }
+
+    int kernel_vol = kernel_size * kernel_size * kernel_size;
+    float avg = sum / kernel_vol;
+
+    int output_offset = 
+        n * C * OD * OH * OW +
+        c * OD * OH * OW +
+        od * OH * OW +
+        oh * OW +
+        ow;
+    output[output_offset] = avg;
+}
+
+__global__ void avg_pool3d_backward_kernel(
+    const float* grad_output, float* grad_input,
+    int kernel_size, int stride, int padding,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * OD * OH * OW) return;
+
+    int ow = idx % OW;
+    int tmp = idx / OW;
+    int oh = tmp % OH;
+    tmp = tmp / OH;
+    int od = tmp % OD;
+    tmp = tmp / OD;
+    int c = tmp % C;
+    int n = tmp / C;
+
+    float grad_out_val = grad_output[idx];
+    float grad_per_element = grad_out_val / (kernel_size * kernel_size * kernel_size);
+
+    int d_start = od * stride - padding;
+    int h_start = oh * stride - padding;
+    int w_start = ow * stride - padding;
+
+    int d_end = d_start + kernel_size;
+    int h_end = h_start + kernel_size;
+    int w_end = w_start + kernel_size;
+
+    d_start = max(d_start, 0);
+    h_start = max(h_start, 0);
+    w_start = max(w_start, 0);
+
+    d_end = min(d_end, D);
+    h_end = min(h_end, H);
+    w_end = min(w_end, W);
+
+    for (int d = d_start; d < d_end; ++d) {
+        for (int h = h_start; h < h_end; ++h) {
+            for (int w = w_start; w < w_end; ++w) {
+                int input_offset = 
+                    n * C * D * H * W +
+                    c * D * H * W +
+                    d * H * W +
+                    h * W +
+                    w;
+                atomicAdd(&grad_input[input_offset], grad_per_element);
+            }
+        }
+    }
+}
+
+extern "C" {
+
+torch::Tensor avg_pool3d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+
+    int OD = (D + 2 * padding - kernel_size) / stride + 1;
+    int OH = (H + 2 * padding - kernel_size) / stride + 1;
+    int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+    auto output = torch::empty({N, C, OD, OH, OW}, input.options());
+
+    int total_elements = N * C * OD * OH * OW;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    avg_pool3d_forward_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        kernel_size, stride, padding,
+        N, C, D, H, W,
+        OD, OH, OW
+    );
+
+    return output;
+}
+
+torch::Tensor avg_pool3d_backward_cuda(
+    torch::Tensor grad_output, 
+    torch::Tensor input, 
+    int kernel_size, 
+    int stride, 
+    int padding
+) {
+    int N = input.size(0);
+    int C = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+
+    int OD = (D + 2 * padding - kernel_size) / stride + 1;
+    int OH = (H + 2 * padding - kernel_size) / stride + 1;
+    int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+    auto grad_input = torch::zeros_like(input);
+
+    int total_elements = N * C * OD * OH * OW;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    avg_pool3d_backward_kernel<<<num_blocks, block_size>>>(
+        grad_output.data_ptr<float>(),
+        grad_input.data_ptr<float>(),
+        kernel_size, stride, padding,
+        N, C, D, H, W,
+        OD, OH, OW
+    );
+
+    return grad_input;
+}
+
+}
+"""
+
+# Compile the CUDA extension
+avg_pool3d = load_inline(
+    name="avg_pool3d",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["avg_pool3d_forward", "avg_pool3d_backward"],
+    verbose=True,
+)
+
+class AvgPool3dFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, kernel_size, stride, padding):
+        ctx.save_for_backward(input)
+        ctx.kernel_size = kernel_size
+        ctx.stride = stride
+        ctx.padding = padding
+
+        return avg_pool3d.avg_pool3d_forward(input, kernel_size, stride, padding)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+        kernel_size = ctx.kernel_size
+        stride = ctx.stride
+        padding = ctx.padding
+
+        grad_input = avg_pool3d.avg_pool3d_backward(grad_output, input, kernel_size, stride, padding)
+
+        return grad_input, None, None, None
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+
+    def forward(self, x):
+        return AvgPool3dFunction.apply(x, self.kernel_size, self.stride, self.padding)
+
+# The given functions remain unchanged:
+batch_size = 16
+channels = 32
+depth = 128
+height = 128
+width = 256
+kernel_size = 3
+stride = 2
+padding = 1
+
+def get_inputs():
+    x = torch.rand(batch_size, channels, depth, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [kernel_size, stride, padding]
+```

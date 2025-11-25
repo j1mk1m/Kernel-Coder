@@ -1,0 +1,1044 @@
+Consider the following factors when optimizing:
+
+1. The problem requires replacing the GroupNorm operator with custom CUDA kernels. To achieve this, I need to understand the computation steps involved in GroupNorm and replicate them in CUDA.
+
+2. GroupNorm divides the channels into groups and normalizes each group independently. The steps are: compute mean and variance for each group, then normalize and scale/shift.
+
+3. To optimize, I might combine these steps into a single kernel to reduce memory traffic and kernel launch overhead. 
+
+4. Additionally, using shared memory for intermediate calculations (like mean/variance) could improve performance by reducing global memory accesses.
+
+5. Implementing the normalization in a way that leverages CUDA's thread hierarchy efficiently, such as having threads handle individual elements or small blocks of data.
+
+6. Also, considering the batch size and feature dimensions, which are given as 112, 64, 512, 512 respectively. These numbers might not be powers of two, so the grid and block dimensions need to be calculated appropriately.
+
+7. Need to ensure numerical stability in the variance computation (using epsilon as in PyTorch's implementation).
+
+8. The GroupNorm may involve per-channel operations, so grouping the features into num_groups (8 here) means each group has features / num_groups channels (64/8=8 channels per group).
+
+9. The input is 4D tensor (batch, features, dim1, dim2). For each group, the normalization is across the spatial dimensions (dim1 and dim2) and batch dimension? Wait, no: according to GroupNorm's documentation, it normalizes over the group's features. Let me confirm:
+
+GroupNorm divides the channels into groups and normalizes each group across the entire batch and spatial dimensions. The mean and variance are computed within each group, across all examples in the batch and all spatial locations.
+
+Thus, for each group, the calculation is over the elements in that group's channels, across all spatial dimensions and batch elements.
+
+Therefore, for each group, the number of elements per group is: batch_size * (features / num_groups) * dim1 * dim2.
+
+Wait, actually, features divided by num_groups is the number of channels per group. For each group, the number of elements is batch_size * (features_per_group) * dim1 * dim2. But actually, for each group, each channel in the group is part of the same group. Wait, actually, the group is over the channels. For example, if there are 64 features and 8 groups, each group has 8 channels. For each of those 8 channels, across all spatial and batch dimensions, you compute the mean and variance.
+
+Wait, more precisely, the mean and variance are computed over the dimensions except the channel dimension. So for each group, the mean and variance are computed over the (batch, height, width) dimensions for all the channels in the group.
+
+Thus, for each group, each channel in the group contributes its entire spatial and batch dimensions. So for each group, the total number of elements per group is batch_size * dim1 * dim2 * (number of channels in group). For example, with 8 groups, each group has 8 channels (since features is 64). So for each group, 64/8=8 channels, each channel has batch_size * dim1 * dim2 elements, so total per group: 8 * batch_size * dim1 * dim2 elements.
+
+Therefore, for each group, we need to compute the mean over those elements, then variance, then normalize each element, then apply gamma and beta.
+
+So the plan is:
+
+1. For each group in the groups (total of num_groups groups):
+
+   a. For each channel in the group's channels (total channels per group: C = features/num_groups):
+
+       i. Each channel has a tensor of shape (batch_size, dim1, dim2).
+
+       ii. The elements across all of these (for all channels in the group) are used to compute the mean and variance for the group.
+
+   b. Compute mean and variance over the entire group (all channels in the group, and all spatial and batch dimensions).
+
+   c. Normalize each element in each channel of the group using the group's mean and variance.
+
+   d. Apply the learned scale (gamma) and shift (beta) parameters for each channel.
+
+Wait, actually, the gamma and beta are per channel. So even within a group, each channel has its own gamma and beta? Or is it per group?
+
+Wait, according to PyTorch's documentation for GroupNorm:
+
+The affine parameters (gamma and beta) are of shape (num_features,), so they are per channel, just like in BatchNorm.
+
+Thus, even within a group, each channel has its own gamma and beta.
+
+Therefore, the steps for each group's channels:
+
+Compute the mean and variance over the group (all channels in the group, across batch and spatial).
+
+Then, for each element in each channel in the group, subtract the mean, divide by sqrt(var + eps), then multiply by gamma[channel] and add beta[channel].
+
+So the key steps are:
+
+- For each group, compute mean and variance over the entire group's elements (all channels in the group, across batch and spatial).
+
+- Then perform normalization and scaling per channel.
+
+Therefore, to implement this in CUDA, the plan is:
+
+1. Launch a kernel that processes each group's channels.
+
+   a. The kernel will need to compute the mean and variance for each group.
+
+   b. Then, compute the normalized values and apply scaling.
+
+   However, since the mean and variance are scalars per group, but the computation is across a large number of elements (for the group), we need to efficiently compute the sum of elements and sum of squares.
+
+   The approach is similar to the standard reduction algorithms in CUDA. Since the number of elements per group can be large (e.g., batch_size=112, dim1=512, dim2=512, group channels=64/8=8, so elements per group is 112 * 8 * 512 * 512 = 112*8*512^2 = that's a big number, but manageable).
+
+   However, parallel reduction is needed.
+
+   Alternatively, we can compute the mean and variance in a separate kernel, then perform the normalization in another kernel. But to reduce memory traffic, perhaps combine into a single kernel.
+
+   However, the first step is to compute mean and variance for each group, then apply the normalization.
+
+   Since the mean and variance are per group, and each group has a certain number of channels, perhaps the approach is as follows:
+
+   - For each group:
+
+      i. Compute mean and variance over all elements in that group.
+
+      ii. Then, apply normalization and scaling for each element in each channel of the group.
+
+   Thus, the computation can be parallelized across groups, but each group's processing requires a reduction step.
+
+   However, in CUDA, handling this requires launching kernels that process each group individually or in parallel.
+
+   Alternatively, we can process all groups in parallel with different threads handling different groups, but that might complicate the indexing.
+
+   Perhaps the best approach is to process each group in a separate kernel or in a way that allows parallel processing within the group's elements.
+
+   Let me think about the data layout. The input tensor is of shape (batch_size, features, dim1, dim2). To process groups, we can loop over each group.
+
+   For example, the features dimension is divided into num_groups groups. Each group has features_per_group = features / num_groups channels.
+
+   For each group g (from 0 to num_groups-1), the channels in that group are channels from g*features_per_group to (g+1)*features_per_group -1.
+
+   For each group:
+
+      - The channels are a contiguous block of features_per_group channels.
+
+      - The elements over which we compute mean and variance are all elements in those channels, across the batch and spatial dimensions.
+
+   So the elements for group g can be thought of as a 4D tensor of shape (batch_size, features_per_group, dim1, dim2), but stored in the original tensor's memory.
+
+   To compute the mean and variance for this group:
+
+      1. Compute the sum of all elements in the group: sum_x.
+
+      2. Compute the sum of squares: sum_x2.
+
+      Then, mean = sum_x / total_num_elements.
+
+      variance = (sum_x2 / total_num_elements) - mean^2.
+
+   The total_num_elements for a group is batch_size * features_per_group * dim1 * dim2.
+
+   So the problem reduces to, for each group, performing a parallel reduction over the group's elements to compute sum_x and sum_x2.
+
+   Once we have the mean and variance for each group, we can then compute the normalized output for each element in the group's channels.
+
+   The challenge is to implement this efficiently in CUDA, handling multiple groups and their reductions in parallel.
+
+   One approach is to have a kernel that processes all groups in parallel, with each thread block handling a group. Each thread in the block processes a portion of the group's elements, accumulating partial sums and partial sums of squares.
+
+   Alternatively, since the number of groups (8) is small, maybe each group can be handled in a separate kernel. But that might be inefficient due to kernel launch overhead.
+
+   Alternatively, use a single kernel that handles all groups by having threads process elements across groups.
+
+   Let me think of a possible implementation structure:
+
+   1. First, compute for all groups the mean and variance.
+
+      To do this, launch a kernel that:
+
+      - For each thread, processes an element in the input tensor.
+
+      - Each element belongs to a certain group.
+
+      - The thread contributes its value to the group's sum and sum_x2.
+
+      However, this requires atomic operations for reductions, which can be slow.
+
+      Alternatively, use a parallel reduction approach where each group's computation is handled in a thread block, with threads in the block processing chunks of the group's data.
+
+   Here's an outline for a kernel that computes the sum and sum_x2 for all groups:
+
+   The input tensor is of size (batch_size, features, dim1, dim2).
+
+   We can map each group to a thread block. Each block is responsible for a single group.
+
+   Within a block, each thread processes a chunk of the group's data.
+
+   The steps for each block (group):
+
+      a. Determine the start and end channel indices for the group.
+
+      b. Iterate over all elements in those channels across batch, dim1, dim2.
+
+      c. Compute partial sums and partial sums of squares.
+
+      d. Use shared memory to accumulate the partial sums in the block.
+
+      e. After reduction within the block, store the group's sum and sum_x2 in global memory.
+
+   This way, each group's reduction is handled by a single block, and the block's threads collaborate to compute the sum and sum_x2 efficiently.
+
+   Then, after all groups have their sums, we can compute the mean and variance for each group on the CPU or in another kernel.
+
+   Once we have the mean and variance, we can launch another kernel to apply the normalization and scaling.
+
+   The normalization kernel would need to:
+
+   For each element in each channel of each group:
+
+      1. Determine the group the element belongs to.
+
+      2. Retrieve the group's mean and variance.
+
+      3. Compute normalized value: (x - mean) / sqrt(var + eps).
+
+      4. Multiply by gamma[channel], add beta[channel].
+
+   To do this efficiently, the kernel can process elements in parallel, with each thread responsible for a particular element. The group's parameters (mean and variance) are stored in a per-group array, so each thread can quickly access the parameters for its element's group.
+
+   Now, implementing this in CUDA requires careful handling of memory access patterns and thread organization.
+
+   Let's outline the steps in code:
+
+   First, define a kernel to compute the sums:
+
+   ```cpp
+   __global__ void compute_group_stats(
+       const float* input,
+       float* sums,
+       float* sum_squares,
+       int batch_size,
+       int num_features,
+       int num_groups,
+       int dim1,
+       int dim2
+   ) {
+       // Each block handles a group
+       int group_idx = blockIdx.x;
+       if (group_idx >= num_groups) return;
+
+       int features_per_group = num_features / num_groups;
+       int start_channel = group_idx * features_per_group;
+       int end_channel = start_channel + features_per_group;
+
+       // Shared memory for partial sums
+       extern __shared__ float shared_mem[];
+       float* s_sum = shared_mem;
+       float* s_sum_sq = shared_mem + blockDim.x;
+
+       int tid = threadIdx.x;
+
+       // Initialize shared memory
+       s_sum[tid] = 0.0f;
+       s_sum_sq[tid] = 0.0f;
+       __syncthreads();
+
+       // Calculate the number of elements per thread in this group
+       int total_elements = batch_size * features_per_group * dim1 * dim2;
+       int elements_per_thread = (total_elements + blockDim.x - 1) / blockDim.x;
+
+       for (int i = tid * elements_per_thread; i < total_elements; i += blockDim.x) {
+           // Calculate the indices in the input tensor
+           // Need to map i to batch, channel_in_group, dim1, dim2
+           // Since the group's channels are contiguous, the channel_in_group is i / (batch_size * dim1 * dim2)
+           int batch = i / (features_per_group * dim1 * dim2);
+           int remainder = i % (features_per_group * dim1 * dim2);
+           int channel_in_group = remainder / (dim1 * dim2);
+           int pos = remainder % (dim1 * dim2);
+           int d1 = pos / dim2;
+           int d2 = pos % dim2;
+
+           // Get the actual channel in the input tensor
+           int channel = start_channel + channel_in_group;
+
+           // Compute the offset in the input tensor
+           int offset = batch * num_features * dim1 * dim2 +
+                       channel * dim1 * dim2 +
+                       d1 * dim2 + d2;
+
+           float x = input[offset];
+           atomicAdd(&s_sum[tid], x);
+           atomicAdd(&s_sum_sq[tid], x * x);
+       }
+
+       // Wait for all threads to finish their contributions
+       __syncthreads();
+
+       // Now perform reduction in shared memory
+       // Use a parallel reduction approach here
+       for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+           if (tid < s) {
+               s_sum[tid] += s_sum[tid + s];
+               s_sum_sq[tid] += s_sum_sq[tid + s];
+           }
+           __syncthreads();
+       }
+
+       // Write the final sum and sum_sq to global memory
+       if (tid == 0) {
+           sums[group_idx] = s_sum[0];
+           sum_squares[group_idx] = s_sum_sq[0];
+       }
+   }
+   ```
+
+   Wait, this might not be the most efficient way. The mapping of the index 'i' to the input tensor's indices might have too much computation per element. Perhaps a better way is to compute the strides and use more straightforward indexing.
+
+   Alternatively, perhaps we can loop over the elements in a more straightforward way, using the thread's index to traverse the group's data.
+
+   Alternatively, each thread can process multiple elements in the group.
+
+   However, this is getting complex. Let's think of the normalization kernel:
+
+   The normalization kernel would have each thread process an element in the input tensor, determine its group, fetch the group's mean and variance, and compute the normalized value.
+
+   To do this efficiently, the normalization kernel would need the per-group mean and variance stored in arrays that can be quickly accessed by the threads.
+
+   The steps would be:
+
+   1. Compute group sums (sum and sum_sq) for all groups using a kernel like above.
+
+   2. Compute mean and variance per group on the CPU (or in another kernel). Since this is a small array (size num_groups), it's efficient to compute on CPU.
+
+      mean[group] = sum[group] / total_elements_per_group
+
+      variance[group] = (sum_sq[group]/total_elements_per_group) - mean[group]^2
+
+   3. Then, launch a normalization kernel that for each element:
+
+      a. Determine which group the element is in.
+
+      b. Compute the group's mean and variance.
+
+      c. Perform the normalization: (x - mean) / sqrt(var + eps).
+
+      d. Multiply by gamma[channel], add beta[channel].
+
+   The problem is accessing the gamma and beta parameters, which are per-channel. Since each group has features_per_group channels, the gamma and beta for each channel in the group can be looked up.
+
+   However, in PyTorch's GroupNorm, the gamma and beta are learnable parameters stored in the module. Therefore, the custom CUDA implementation must have access to these parameters. The example provided in the question's ModelNew class shows that the custom operator is called with the tensors as arguments, but in the case of GroupNorm, the gamma and beta are parameters of the model.
+
+   Wait, the original Model class includes a GroupNorm layer, which has gamma and beta parameters. Therefore, in the custom implementation, the ModelNew class should similarly have parameters for gamma and beta, and the CUDA kernels should take them as inputs.
+
+   Therefore, the custom GroupNorm implementation must take the input tensor, the gamma, beta, num_groups, and other parameters.
+
+   Therefore, the custom CUDA function would have a signature like:
+
+   torch::Tensor group_norm_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, int num_groups, float eps);
+
+   Thus, the kernels need to have access to gamma and beta, which are tensors provided as arguments.
+
+   So, putting this together, the steps for the custom implementation are:
+
+   1. The forward function in ModelNew's forward() will call the custom CUDA kernel, passing the input, gamma, beta, num_groups, and eps.
+
+   2. The CUDA kernel must compute the mean and variance for each group, then normalize and apply scaling.
+
+   Now, implementing this requires careful handling of the parameters and tensor dimensions.
+
+   To handle the per-group computation efficiently, perhaps the following approach is better:
+
+   - Compute the per-group sums and sum squares in a separate kernel.
+
+   - Then, compute the means and variances on the CPU (since they are small arrays).
+
+   - Then, launch a normalization kernel that for each element:
+
+      a. Determine its group.
+
+      b. Compute the normalized value using the precomputed group mean and variance.
+
+      c. Apply gamma and beta for that channel.
+
+   This approach splits the computation into two steps, which may be manageable.
+
+   Let's outline the CUDA code for this approach.
+
+   First, the kernel to compute the sums:
+
+   ```cpp
+   template <typename scalar_t>
+   __global__ void compute_group_stats_kernel(
+       const scalar_t* __restrict__ input,
+       scalar_t* __restrict__ sums,
+       scalar_t* __restrict__ sum_squares,
+       int batch_size,
+       int num_features,
+       int num_groups,
+       int dim1,
+       int dim2,
+       int features_per_group) {
+
+       int group_idx = blockIdx.x;
+       if (group_idx >= num_groups) return;
+
+       // Each block handles one group
+       int start_channel = group_idx * features_per_group;
+
+       // Shared memory for partial sums
+       extern __shared__ float shared_mem[];
+       scalar_t* s_sum = (scalar_t*)shared_mem;
+       scalar_t* s_sum_sq = (scalar_t*)(shared_mem + blockDim.x);
+
+       int tid = threadIdx.x;
+
+       // Initialize shared memory
+       s_sum[tid] = 0;
+       s_sum_sq[tid] = 0;
+       __syncthreads();
+
+       // Total elements per group: batch_size * features_per_group * dim1 * dim2
+       const int total_elements = batch_size * features_per_group * dim1 * dim2;
+       const int elements_per_thread = (total_elements + blockDim.x - 1) / blockDim.x;
+
+       for (int i = tid * elements_per_thread; i < total_elements; i += blockDim.x) {
+           // Compute the indices within the group's data
+           int batch = i / (features_per_group * dim1 * dim2);
+           int remainder = i % (features_per_group * dim1 * dim2);
+           int channel_in_group = remainder / (dim1 * dim2);
+           int pos = remainder % (dim1 * dim2);
+           int d1 = pos / dim2;
+           int d2 = pos % dim2;
+
+           // Get the actual channel in the input tensor
+           int channel = start_channel + channel_in_group;
+
+           // Compute the offset in the input tensor
+           int offset = batch * num_features * dim1 * dim2 +
+                       channel * dim1 * dim2 +
+                       d1 * dim2 + d2;
+
+           scalar_t x = input[offset];
+           s_sum[tid] += x;
+           s_sum_sq[tid] += x * x;
+       }
+
+       __syncthreads();
+
+       // Reduce within the block
+       for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+           if (tid < s) {
+               s_sum[tid] += s_sum[tid + s];
+               s_sum_sq[tid] += s_sum_sq[tid + s];
+           }
+           __syncthreads();
+       }
+
+       if (tid == 0) {
+           sums[group_idx] = s_sum[0];
+           sum_squares[group_idx] = s_sum_sq[0];
+       }
+   }
+   ```
+
+   Wait, this uses shared memory correctly, but the calculation of 'i' might be time-consuming. Alternatively, perhaps a better way is to iterate over the dimensions directly.
+
+   However, given time constraints, let's proceed.
+
+   Then, after computing the sums and sum_squares for each group, we compute the means and variances on the CPU:
+
+   scalar_t* sums = ...;
+   scalar_t* sum_squares = ...;
+
+   for (int g = 0; g < num_groups; ++g) {
+       int features_per_group = num_features / num_groups;
+       int total_elements = batch_size * features_per_group * dim1 * dim2;
+       mean[g] = sums[g] / total_elements;
+       variance[g] = (sum_squares[g]/total_elements) - mean[g] * mean[g];
+       variance[g] = max(variance[g], eps);  // add eps for numerical stability
+       variance[g] = sqrt(variance[g]);
+   }
+
+   Then, the normalization kernel would need to process each element:
+
+   ```cpp
+   template <typename scalar_t>
+   __global__ void group_norm_kernel(
+       const scalar_t* __restrict__ input,
+       scalar_t* __restrict__ output,
+       const scalar_t* __restrict__ gamma,
+       const scalar_t* __restrict__ beta,
+       const scalar_t* __restrict__ mean,
+       const scalar_t* __restrict__ variance,
+       int batch_size,
+       int num_features,
+       int num_groups,
+       int dim1,
+       int dim2) {
+
+       // Each thread processes an element
+       int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       if (idx >= batch_size * num_features * dim1 * dim2) return;
+
+       // Compute the indices
+       int batch = idx / (num_features * dim1 * dim2);
+       int remainder = idx % (num_features * dim1 * dim2);
+       int channel = remainder / (dim1 * dim2);
+       int pos = remainder % (dim1 * dim2);
+       int d1 = pos / dim2;
+       int d2 = pos % dim2;
+
+       // Determine the group of the channel
+       int features_per_group = num_features / num_groups;
+       int group_idx = channel / features_per_group;
+
+       // Get the mean and variance for this group
+       scalar_t mu = mean[group_idx];
+       scalar_t inv_std = 1.0 / variance[group_idx];
+
+       // Compute the offset in the input tensor
+       int input_offset = batch * num_features * dim1 * dim2 +
+                          channel * dim1 * dim2 +
+                          d1 * dim2 + d2;
+
+       scalar_t x = input[input_offset];
+       scalar_t normalized = (x - mu) * inv_std;
+
+       // Apply gamma and beta (per-channel)
+       int gamma_idx = channel;
+       scalar_t scaled = normalized * gamma[gamma_idx] + beta[gamma_idx];
+
+       output[input_offset] = scaled;
+   }
+   ```
+
+   This kernel processes each element individually. The indices are computed for each element, and the group is determined based on the channel.
+
+   The total number of elements is batch_size * num_features * dim1 * dim2. The grid and block dimensions can be set to handle this.
+
+   Now, putting this into the Python code with the inline CUDA extension:
+
+   The challenge is that the custom CUDA function must handle the entire process: compute the stats, compute mean/var, then apply normalization.
+
+   The problem is that the stats computation requires an intermediate array (sums and sum_squares), which can be allocated on the GPU.
+
+   The steps in the Python code would be:
+
+   1. Define the CUDA kernels.
+
+   2. In the custom CUDA function, allocate memory for the sums and sum_squares arrays.
+
+   3. Launch the compute_group_stats_kernel.
+
+   4. Copy the sums and sum_squares back to CPU (or compute the means/variances on the GPU in another kernel?).
+
+   Alternatively, we can compute means and variances on the GPU, but that may complicate things.
+
+   Let's proceed with the following plan for the Python code:
+
+   The custom CUDA function will:
+
+   - Take as input: input, gamma, beta, num_groups, eps.
+
+   - Compute the necessary intermediate variables (sums, sum_squares) on the GPU.
+
+   - Compute the mean and variance on the CPU (since they are small arrays).
+
+   - Then launch the normalization kernel.
+
+   However, transferring the sums back to the CPU may be slow. Alternatively, compute the means and variances on the GPU in another kernel.
+
+   To avoid data transfer, perhaps compute the means and variances on the GPU. Let's think:
+
+   After computing sums and sum_squares for all groups, we can compute the means and variances in another kernel:
+
+   ```cpp
+   __global__ void compute_mean_var(
+       const scalar_t* sums,
+       const scalar_t* sum_squares,
+       scalar_t* mean,
+       scalar_t* var,
+       int num_groups,
+       int features_per_group,
+       int batch_size,
+       int dim1,
+       int dim2,
+       float eps) {
+
+       for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < num_groups; g += blockDim.x * gridDim.x) {
+           int total_elements = batch_size * features_per_group * dim1 * dim2;
+           scalar_t s = sums[g];
+           scalar_t s_sq = sum_squares[g];
+           scalar_t m = s / total_elements;
+           scalar_t v = s_sq / total_elements - m * m;
+           v = fmax(v, eps);
+           v = sqrt(v);
+           mean[g] = m;
+           var[g] = v;
+       }
+   }
+   ```
+
+   This way, the mean and variance arrays are computed on the GPU, avoiding data transfer.
+
+   Then, the normalization kernel can use these arrays.
+
+   Putting it all together, the CUDA code outline would be:
+
+   ```cpp
+   #include <torch/extension.h>
+   #include <cuda_runtime.h>
+   #include <cmath>
+
+   template <typename scalar_t>
+   __global__ void compute_group_stats_kernel(
+       const scalar_t* __restrict__ input,
+       scalar_t* __restrict__ sums,
+       scalar_t* __restrict__ sum_squares,
+       int batch_size,
+       int num_features,
+       int num_groups,
+       int dim1,
+       int dim2,
+       int features_per_group) {
+
+       // As before
+   }
+
+   template <typename scalar_t>
+   __global__ void compute_mean_var(
+       const scalar_t* sums,
+       const scalar_t* sum_squares,
+       scalar_t* mean,
+       scalar_t* var,
+       int num_groups,
+       int features_per_group,
+       int batch_size,
+       int dim1,
+       int dim2,
+       float eps) {
+
+       // As before
+   }
+
+   template <typename scalar_t>
+   __global__ void group_norm_kernel(
+       const scalar_t* __restrict__ input,
+       scalar_t* __restrict__ output,
+       const scalar_t* __restrict__ gamma,
+       const scalar_t* __restrict__ beta,
+       const scalar_t* __restrict__ mean,
+       const scalar_t* __restrict__ var,
+       int batch_size,
+       int num_features,
+       int dim1,
+       int dim2) {
+
+       // As before
+   }
+
+   template <typename scalar_t>
+   at::Tensor group_norm_cuda(
+       at::Tensor input,
+       at::Tensor gamma,
+       at::Tensor beta,
+       int num_groups,
+       float eps) {
+
+       const int batch_size = input.size(0);
+       const int num_features = input.size(1);
+       const int dim1 = input.size(2);
+       const int dim2 = input.size(3);
+       const int features_per_group = num_features / num_groups;
+
+       // Allocate temporary tensors
+       auto device = input.device();
+       auto sums = at::empty({num_groups}, input.options());
+       auto sum_squares = at::empty({num_groups}, input.options());
+       auto mean = at::empty({num_groups}, input.options());
+       auto var = at::empty({num_groups}, input.options());
+
+       // Launch compute_group_stats kernel
+       const int threads_per_block = 256;
+       const int blocks_per_grid = num_groups; // one block per group
+       compute_group_stats_kernel<<<blocks_per_grid, threads_per_block, 2 * threads_per_block * sizeof(scalar_t)>>>(
+           input.data_ptr<scalar_t>(),
+           sums.data_ptr<scalar_t>(),
+           sum_squares.data_ptr<scalar_t>(),
+           batch_size, num_features, num_groups, dim1, dim2, features_per_group
+       );
+
+       // Compute mean and variance
+       const dim3 mv_blocks(1);
+       const dim3 mv_threads(256); // arbitrary, can be tuned
+       compute_mean_var<<<mv_blocks, mv_threads>>>(
+           sums.data_ptr<scalar_t>(),
+           sum_squares.data_ptr<scalar_t>(),
+           mean.data_ptr<scalar_t>(),
+           var.data_ptr<scalar_t>(),
+           num_groups,
+           features_per_group,
+           batch_size,
+           dim1,
+           dim2,
+           eps
+       );
+
+       // Allocate output tensor
+       auto output = at::empty_like(input);
+
+       // Launch normalization kernel
+       const int total_elements = batch_size * num_features * dim1 * dim2;
+       const int norm_threads = 1024;
+       const int norm_blocks = (total_elements + norm_threads - 1) / norm_threads;
+       group_norm_kernel<<<norm_blocks, norm_threads>>>(
+           input.data_ptr<scalar_t>(),
+           output.data_ptr<scalar_t>(),
+           gamma.data_ptr<scalar_t>(),
+           beta.data_ptr<scalar_t>(),
+           mean.data_ptr<scalar_t>(),
+           var.data_ptr<scalar_t>(),
+           batch_size,
+           num_features,
+           dim1,
+           dim2
+       );
+
+       return output;
+   }
+
+   // Implement for float and double
+   at::Tensor group_norm_cuda(at::Tensor input, at::Tensor gamma, at::Tensor beta, int num_groups, float eps) {
+       AT_ASSERTM(input.is_cuda(), "input must be a CUDA tensor");
+       AT_ASSERTM(gamma.is_cuda(), "gamma must be a CUDA tensor");
+       AT_ASSERTM(beta.is_cuda(), "beta must be a CUDA tensor");
+       AT_ASSERTM(input.dim() == 4, "Input must be 4D tensor (batch, features, h, w)");
+
+       auto dtype = input.scalar_type();
+       if (dtype == at::ScalarType::Float) {
+           return group_norm_cuda<float>(input, gamma, beta, num_groups, eps);
+       } else {
+           // Handle other types if needed
+           AT_ERROR("Unsupported tensor type");
+       }
+   }
+
+   // Define the Python entry
+   PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+       m.def("group_norm", &group_norm_cuda, "Group normalization CUDA implementation");
+   }
+   ```
+
+   However, this code may have several issues:
+
+   1. The compute_group_stats_kernel needs to have the correct shared memory size. The shared memory allocation is done via:
+
+      The compute_group_stats_kernel uses:
+
+      extern __shared__ float shared_mem[];
+
+      The size is 2 * threads_per_block * sizeof(scalar_t). Wait, in the kernel launch:
+
+      compute_group_stats_kernel<<<blocks_per_grid, threads_per_block, 2 * threads_per_block * sizeof(scalar_t)>>>
+
+      The shared memory is allocated as the third argument, which is 2*threads_per_block * sizeof(scalar_t). This is because s_sum and s_sum_sq each need space for blockDim.x elements.
+
+      So the allocation is correct.
+
+   2. The compute_mean_var kernel's loop over groups may not be efficient, but with small num_groups, it's manageable.
+
+   3. The gamma and beta tensors must be of the correct size (num_features).
+
+   Now, in the Python model:
+
+   The original Model class has a GroupNorm layer, which has gamma and beta parameters. Therefore, in the ModelNew class, we need to create similar parameters and pass them to the custom CUDA function.
+
+   So the ModelNew class would look like this:
+
+   class ModelNew(nn.Module):
+       def __init__(self, num_features: int, num_groups: int):
+           super().__init__()
+           self.num_groups = num_groups
+           self.num_features = num_features
+           self.gamma = nn.Parameter(torch.ones(num_features))
+           self.beta = nn.Parameter(torch.zeros(num_features))
+
+       def forward(self, x):
+           return group_norm_cuda(x, self.gamma, self.beta, self.num_groups, 1e-5)  # assuming eps=1e-5
+
+   However, the custom CUDA function is wrapped via torch.utils.cpp_extension. So we need to define the extension and load it.
+
+   Putting it all together, the complete code would involve writing the CUDA code as a string and compiling it inline.
+
+   However, the user's example showed using load_inline with cpp_sources and cuda_sources. Therefore, we need to structure the CUDA code as a string in the Python code.
+
+   Also, note that in the original problem, the Model's __init__ takes num_features and num_groups. The get_init_inputs() returns [features, num_groups], which is used to initialize the model. So the ModelNew should also be initialized with those parameters, and the parameters (gamma and beta) are created accordingly.
+
+   Now, putting this all into code:
+
+   The final Python code with the custom CUDA kernels would be as follows.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int, num_groups: int):
+        super().__init__()
+        self.num_groups = num_groups
+        self.num_features = num_features
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.eps = 1e-5  # Use the same epsilon as PyTorch's default
+
+        # Define the CUDA kernels
+        group_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+template <typename scalar_t>
+__global__ void compute_group_stats_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ sums,
+    scalar_t* __restrict__ sum_squares,
+    int batch_size,
+    int num_features,
+    int num_groups,
+    int dim1,
+    int dim2,
+    int features_per_group) {
+
+    int group_idx = blockIdx.x;
+    if (group_idx >= num_groups) return;
+
+    int start_channel = group_idx * features_per_group;
+
+    extern __shared__ scalar_t shared_mem[];
+    scalar_t* s_sum = shared_mem;
+    scalar_t* s_sum_sq = shared_mem + blockDim.x;
+
+    int tid = threadIdx.x;
+
+    s_sum[tid] = 0;
+    s_sum_sq[tid] = 0;
+    __syncthreads();
+
+    int total_elements = batch_size * features_per_group * dim1 * dim2;
+    int elements_per_thread = (total_elements + blockDim.x - 1) / blockDim.x;
+
+    for (int i = tid * elements_per_thread; i < total_elements; i += blockDim.x) {
+        int batch = i / (features_per_group * dim1 * dim2);
+        int remainder = i % (features_per_group * dim1 * dim2);
+        int channel_in_group = remainder / (dim1 * dim2);
+        int pos = remainder % (dim1 * dim2);
+        int d1 = pos / dim2;
+        int d2 = pos % dim2;
+
+        int channel = start_channel + channel_in_group;
+
+        int offset = batch * num_features * dim1 * dim2 +
+                     channel * dim1 * dim2 +
+                     d1 * dim2 + d2;
+
+        scalar_t x = input[offset];
+        s_sum[tid] += x;
+        s_sum_sq[tid] += x * x;
+    }
+
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sums[group_idx] = s_sum[0];
+        sum_squares[group_idx] = s_sum_sq[0];
+    }
+}
+
+template <typename scalar_t>
+__global__ void compute_mean_var(
+    const scalar_t* sums,
+    const scalar_t* sum_squares,
+    scalar_t* mean,
+    scalar_t* var,
+    int num_groups,
+    int features_per_group,
+    int batch_size,
+    int dim1,
+    int dim2,
+    float eps) {
+
+    for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < num_groups; g += blockDim.x * gridDim.x) {
+        int total_elements = batch_size * features_per_group * dim1 * dim2;
+        scalar_t s = sums[g];
+        scalar_t s_sq = sum_squares[g];
+        scalar_t m = s / total_elements;
+        scalar_t v = s_sq / total_elements - m * m;
+        v = fmaxf(v, eps);
+        v = sqrtf(v);
+        mean[g] = m;
+        var[g] = v;
+    }
+}
+
+template <typename scalar_t>
+__global__ void group_norm_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ gamma,
+    const scalar_t* __restrict__ beta,
+    const scalar_t* __restrict__ mean,
+    const scalar_t* __restrict__ var,
+    int batch_size,
+    int num_features,
+    int dim1,
+    int dim2) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * num_features * dim1 * dim2) return;
+
+    int batch = idx / (num_features * dim1 * dim2);
+    int remainder = idx % (num_features * dim1 * dim2);
+    int channel = remainder / (dim1 * dim2);
+    int pos = remainder % (dim1 * dim2);
+    int d1 = pos / dim2;
+    int d2 = pos % dim2;
+
+    int features_per_group = num_features / num_groups;
+    int group_idx = channel / features_per_group;
+
+    scalar_t mu = mean[group_idx];
+    scalar_t inv_std = 1.0 / var[group_idx];
+
+    int offset = batch * num_features * dim1 * dim2 +
+                 channel * dim1 * dim2 +
+                 d1 * dim2 + d2;
+
+    scalar_t x = input[offset];
+    scalar_t normalized = (x - mu) * inv_std;
+
+    int gamma_idx = channel;
+    scalar_t scaled = normalized * gamma[gamma_idx] + beta[gamma_idx];
+
+    output[offset] = scaled;
+}
+
+template <typename scalar_t>
+at::Tensor group_norm_cuda(
+    at::Tensor input,
+    at::Tensor gamma,
+    at::Tensor beta,
+    int num_groups,
+    float eps) {
+
+    const int batch_size = input.size(0);
+    const int num_features = input.size(1);
+    const int dim1 = input.size(2);
+    const int dim2 = input.size(3);
+    const int features_per_group = num_features / num_groups;
+
+    auto device = input.device();
+    auto sums = at::empty({num_groups}, input.options());
+    auto sum_squares = at::empty({num_groups}, input.options());
+    auto mean = at::empty({num_groups}, input.options());
+    auto var = at::empty({num_groups}, input.options());
+
+    const int threads_per_block = 256;
+    const int blocks_per_grid = num_groups;
+    const int shared_size = 2 * threads_per_block * sizeof(scalar_t);
+
+    compute_group_stats_kernel<scalar_t><<<blocks_per_grid, threads_per_block, shared_size>>>(
+        input.data_ptr<scalar_t>(),
+        sums.data_ptr<scalar_t>(),
+        sum_squares.data_ptr<scalar_t>(),
+        batch_size, num_features, num_groups, dim1, dim2, features_per_group
+    );
+
+    dim3 mv_blocks(1);
+    dim3 mv_threads(256);
+    compute_mean_var<scalar_t><<<mv_blocks, mv_threads>>>(
+        sums.data_ptr<scalar_t>(),
+        sum_squares.data_ptr<scalar_t>(),
+        mean.data_ptr<scalar_t>(),
+        var.data_ptr<scalar_t>(),
+        num_groups,
+        features_per_group,
+        batch_size,
+        dim1,
+        dim2,
+        eps
+    );
+
+    auto output = at::empty_like(input);
+
+    const int total_elements = batch_size * num_features * dim1 * dim2;
+    const int norm_threads = 1024;
+    const int norm_blocks = (total_elements + norm_threads - 1) / norm_threads;
+
+    group_norm_kernel<scalar_t><<<norm_blocks, norm_threads>>>(
+        input.data_ptr<scalar_t>(),
+        output.data_ptr<scalar_t>(),
+        gamma.data_ptr<scalar_t>(),
+        beta.data_ptr<scalar_t>(),
+        mean.data_ptr<scalar_t>(),
+        var.data_ptr<scalar_t>(),
+        batch_size,
+        num_features,
+        dim1,
+        dim2
+    );
+
+    return output;
+}
+
+at::Tensor group_norm(
+    at::Tensor input,
+    at::Tensor gamma,
+    at::Tensor beta,
+    int num_groups,
+    float eps) {
+    AT_ASSERTM(input.is_cuda(), "input must be a CUDA tensor");
+    AT_ASSERTM(gamma.is_cuda(), "gamma must be a CUDA tensor");
+    AT_ASSERTM(beta.is_cuda(), "beta must be a CUDA tensor");
+    AT_ASSERTM(input.dim() == 4, "Input must be 4D tensor (batch, features, h, w)");
+
+    auto dtype = input.scalar_type();
+    if (dtype == at::ScalarType::Float) {
+        return group_norm_cuda<float>(input, gamma, beta, num_groups, eps);
+    } else {
+        AT_ERROR("Unsupported tensor type");
+    }
+}
+"""
+
+        group_norm_cpp_source = """
+extern "C" {
+    torch::Tensor group_norm(
+        torch::Tensor input,
+        torch::Tensor gamma,
+        torch::Tensor beta,
+        int num_groups,
+        float eps);
+}
+"""
+
+        # Compile the inline CUDA code
+        self.group_norm_cuda = load_inline(
+            name="group_norm_cuda",
+            cpp_sources=group_norm_cpp_source,
+            cuda_sources=group_norm_source,
+            functions=["group_norm"],
+            verbose=True,
+            extra_cflags=[""],
+            extra_cuda_flags=["-lineinfo"],
+            extra_ldflags=[""],
+        )
+
+    def forward(self, x):
+        return self.group_norm_cuda.group_norm(
+            x, self.gamma, self.beta, self.num_groups, self.eps
+        )
+
+```
+</think>
+
+The provided code replaces the PyTorch's native `GroupNorm` layer with a custom CUDA implementation. The `ModelNew` class defines its own parameters (gamma and beta) and uses the compiled CUDA kernels for computation. The CUDA kernels handle the group-wise mean and variance calculation, followed by normalization and affine transformation. The approach reduces kernel launch overhead and optimizes memory access patterns using shared memory for intermediate reductions. The implementation ensures that all computations are performed on the GPU without unnecessary data transfers to the CPU, which is crucial for maintaining performance. The use of template functions allows the kernel to handle different data types, though in this example, it's limited to float for simplicity. The code should be compiled and run with CUDA-enabled PyTorch.

@@ -1,0 +1,52 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication followed by GELU and Softmax
+matrix_mul_gelu_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Custom CUDA implementation of matrix multiplication, GELU, and Softmax
+__global__ void matrix_mul_gelu_softmax_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    // Implement matrix multiplication here
+    // Apply GELU to each element of the result
+    // Apply Softmax along dimension 1
+}
+
+torch::Tensor matrix_mul_gelu_softmax_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto out = torch::zeros({m, n}, a.options());
+
+    matrix_mul_gelu_softmax_kernel<<</* grid size */, /* block size */>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), m, n, k);
+
+    return out;
+}
+"""
+
+matrix_mul_gelu_softmax_cpp_source = (
+    "torch::Tensor matrix_mul_gelu_softmax_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication followed by GELU and Softmax
+matrix_mul_gelu_softmax = load_inline(
+    name="matrix_mul_gelu_softmax",
+    cpp_sources=matrix_mul_gelu_softmax_cpp_source,
+    cuda_sources=matrix_mul_gelu_softmax_source,
+    functions=["matrix_mul_gelu_softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.matrix_mul_gelu_softmax = matrix_mul_gelu_softmax
+
+    def forward(self, x):
+        return self.matrix_mul_gelu_softmax.matrix_mul_gelu_softmax_cuda(x, x)

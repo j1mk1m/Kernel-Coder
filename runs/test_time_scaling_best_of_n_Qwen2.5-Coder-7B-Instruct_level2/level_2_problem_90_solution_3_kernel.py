@@ -1,0 +1,66 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel definitions go here
+custom_kernel_source = """
+// Include necessary headers
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Define your custom CUDA kernel here
+__global__ void my_custom_kernel(...) {
+    // Kernel implementation goes here
+}
+
+// Function to call the custom CUDA kernel from PyTorch
+torch::Tensor my_custom_function(torch::Tensor input) {
+    // Implementation goes here
+    return result;
+}
+"""
+
+custom_kernel_cpp_source = (
+    "torch::Tensor my_custom_function(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code
+my_custom_operator = load_inline(
+    name="my_custom_operator",
+    cpp_sources=custom_kernel_cpp_source,
+    cuda_sources=custom_kernel_source,
+    functions=["my_custom_function"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, sum_tensor_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape))
+        # Add any additional attributes or methods here
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = my_custom_operator.my_custom_function(x)  # Apply custom CUDA kernel
+        x = torch.clamp(x, min=-1.0, max=1.0)
+        x = torch.nn.functional.gelu(x)
+        return x
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 128
+    in_channels = 8
+    out_channels = 64
+    depth, height, width = 16, 64, 64
+    kernel_size = 3
+    sum_tensor_shape = (out_channels, 1, 1, 1)
+
+    model = ModelNew(in_channels, out_channels, kernel_size, sum_tensor_shape)
+    inputs = get_inputs()
+    outputs = model(inputs[0])
+    print(outputs.shape)

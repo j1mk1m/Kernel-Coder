@@ -1,0 +1,152 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement convolution kernel here...
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
+    // Kernel implementation...
+}
+"""
+
+# Define the custom CUDA kernel for group normalization
+group_normalization_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement group normalization kernel here...
+
+torch::Tensor group_normalization_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int num_groups) {
+    // Kernel implementation...
+}
+"""
+
+# Define the custom CUDA kernel for scaling
+scaling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement scaling kernel here...
+
+torch::Tensor scaling_cuda(torch::Tensor input, torch::Tensor scale) {
+    // Kernel implementation...
+}
+"""
+
+# Define the custom CUDA kernel for max pooling
+max_pooling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement max pooling kernel here...
+
+torch::Tensor max_pooling_cuda(torch::Tensor input, int kernel_size) {
+    // Kernel implementation...
+}
+"""
+
+# Define the custom CUDA kernel for clamping
+clamping_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement clamping kernel here...
+
+torch::Tensor clamping_cuda(torch::Tensor input, double min_val, double max_val) {
+    // Kernel implementation...
+}
+"""
+
+# Compile the inline CUDA code for each operation
+convolution = load_inline(
+    name="convolution",
+    cpp_sources="torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);",
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+group_normalization = load_inline(
+    name="group_normalization",
+    cpp_sources="torch::Tensor group_normalization_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int num_groups);",
+    cuda_sources=group_normalization_source,
+    functions=["group_normalization_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+scaling = load_inline(
+    name="scaling",
+    cpp_sources="torch::Tensor scaling_cuda(torch::Tensor input, torch::Tensor scale);",
+    cuda_sources=scaling_source,
+    functions=["scaling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+max_pooling = load_inline(
+    name="max_pooling",
+    cpp_sources="torch::Tensor max_pooling_cuda(torch::Tensor input, int kernel_size);",
+    cuda_sources=max_pooling_source,
+    functions=["max_pooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+clamping = load_inline(
+    name="clamping",
+    cpp_sources="torch::Tensor clamping_cuda(torch::Tensor input, double min_val, double max_val);",
+    cuda_sources=clamping_source,
+    functions=["clamping_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.group_norm = group_normalization
+        self.scale = scaling
+        self.maxpool = max_pooling
+        self.clamp = clamping
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+
+    def forward(self, x):
+        x = self.conv.convolution_cuda(x, self.weight, self.bias)
+        x = self.group_norm.group_normalization_cuda(x, self.weight, self.bias, num_groups)
+        x = self.scale.scaling_cuda(x, self.scale)
+        x = self.maxpool.max_pooling_cuda(x, maxpool_kernel_size)
+        x = self.clamp.clamping_cuda(x, self.clamp_min, self.clamp_max)
+        return x
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 128
+    in_channels = 8
+    out_channels = 64
+    height, width = 128, 128
+    kernel_size = 3
+    num_groups = 16
+    scale_shape = (out_channels, 1, 1)
+    maxpool_kernel_size = 4
+    clamp_min = 0.0
+    clamp_max = 1.0
+
+    model_new = ModelNew(in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max)
+    inputs = get_inputs()
+    outputs = model_new(inputs[0])
+    print(outputs.shape)

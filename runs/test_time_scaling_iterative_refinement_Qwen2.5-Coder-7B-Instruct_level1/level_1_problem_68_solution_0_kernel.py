@@ -1,0 +1,99 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed 3D convolution
+transposed_3d_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void transposed_3d_conv_kernel(const float* x, const float* weight, float* out, int batch_size, int in_channels, int out_channels, int kernel_depth, int kernel_width, int kernel_height, int stride_depth, int stride_width, int stride_height, int padding_depth, int padding_width, int padding_height, int output_padding_depth, int output_padding_width, int output_padding_height, int groups) {
+    int b = blockIdx.z * blockDim.z + threadIdx.z;
+    int d = blockIdx.y * blockDim.y + threadIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b >= batch_size || d >= out_channels || h >= out.size(4)) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int c = 0; c < in_channels; ++c) {
+        for (int kd = 0; kd < kernel_depth; ++kd) {
+            for (int kw = 0; kw < kernel_width; ++kw) {
+                for (int kh = 0; kh < kernel_height; ++kh) {
+                    int x_d = d * stride_depth - padding_depth + kd;
+                    int x_h = h * stride_height - padding_height + kh;
+                    int x_w = (h - kh) * stride_width - padding_width + kw;
+                    if (x_d >= 0 && x_d < x.size(2) && x_h >= 0 && x_h < x.size(3) && x_w >= 0 && x_w < x.size(4)) {
+                        sum += x[b][c][x_d][x_h][x_w] * weight[d][c * groups + (h - kh)][kd][kw][kh];
+                    }
+                }
+            }
+        }
+    }
+
+    if (bias.has_value()) {
+        sum += bias.value()[d];
+    }
+
+    out[b][d][h] = sum;
+}
+
+torch::Tensor transposed_3d_conv_cuda(torch::Tensor x, torch::Tensor weight, torch::optional<torch::Tensor> bias, torch::IntArrayRef stride, torch::IntArrayRef padding, torch::IntArrayRef output_padding, int groups) {
+    auto batch_size = x.size(0);
+    auto in_channels = x.size(1);
+    auto out_channels = weight.size(0);
+    auto kernel_depth = weight.size(2);
+    auto kernel_width = weight.size(3);
+    auto kernel_height = weight.size(4);
+    auto stride_depth = stride[0];
+    auto stride_width = stride[1];
+    auto stride_height = stride[2];
+    auto padding_depth = padding[0];
+    auto padding_width = padding[1];
+    auto padding_height = padding[2];
+    auto output_padding_depth = output_padding[0];
+    auto output_padding_width = output_padding[1];
+    auto output_padding_height = output_padding[2];
+
+    auto out = torch::zeros({batch_size, out_channels, x.size(2) * stride_depth + kernel_depth - 1 - 2 * padding_depth + output_padding_depth, x.size(3) * stride_width + kernel_width - 1 - 2 * padding_width + output_padding_width, x.size(4) * stride_height + kernel_height - 1 - 2 * padding_height + output_padding_height}, device=x.device, dtype=torch.float32);
+
+    const int block_size = 256;
+    const int num_blocks_x = (out.size(4) + block_size - 1) / block_size;
+    const int num_blocks_y = (out.size(3) + block_size - 1) / block_size;
+    const int num_blocks_z = (out.size(2) + block_size - 1) / block_size;
+
+    dim3 grid(num_blocks_x, num_blocks_y, num_blocks_z);
+    dim3 block(block_size, 1, 1);
+
+    transposed_3d_conv_kernel<<<grid, block>>>(x.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(), batch_size, in_channels, out_channels, kernel_depth, kernel_width, kernel_height, stride_depth, stride_width, stride_height, padding_depth, padding_width, padding_height, output_padding_depth, output_padding_width, output_padding_height, groups);
+
+    return out;
+}
+"""
+
+transposed_3d_conv_cpp_source = (
+    "torch::Tensor transposed_3d_conv_cuda(torch::Tensor x, torch::Tensor weight, torch::optional<torch::Tensor> bias, torch::IntArrayRef stride, torch::IntArrayRef padding, torch::IntArrayRef output_padding, int groups);"
+)
+
+# Compile the inline CUDA code for transposed 3D convolution
+transposed_3d_conv = load_inline(
+    name="transposed_3d_conv",
+    cpp_sources=transposed_3d_conv_cpp_source,
+    cuda_sources=transposed_3d_conv_source,
+    functions=["transposed_3d_conv_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1, 1), padding: tuple = (0, 0, 0), output_padding: tuple = (0, 0, 0), groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.transposed_3d_conv = transposed_3d_conv
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = torch.randn(out_channels, in_channels // groups, kernel_size[0], kernel_size[1], kernel_size[2]).cuda()  # Replace with actual weight initialization
+        bias = torch.randn(out_channels).cuda() if bias else None  # Replace with actual bias initialization
+        return self.transposed_3d_conv.transposed_3d_conv_cuda(x, weight, bias, stride, padding, output_padding, groups)

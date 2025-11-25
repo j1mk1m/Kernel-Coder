@@ -1,0 +1,88 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+transposed_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void transposed_conv_kernel(const float* input, const float* weight, float* output, int input_height, int input_width, int output_height, int output_width, int channels_in, int channels_out, int kernel_size, int stride, int padding, int dilation) {
+    int batch_id = blockIdx.z;
+    int out_channel_id = blockIdx.y;
+    int out_row_id = blockIdx.x / output_width;
+    int out_col_id = blockIdx.x % output_width;
+
+    int in_row_start = out_row_id * stride - padding;
+    int in_col_start = out_col_id * stride - padding;
+    int in_row_end = in_row_start + kernel_size * dilation;
+    int in_col_end = in_col_start + kernel_size * dilation;
+
+    float sum = 0.0f;
+    for (int c_in = 0; c_in < channels_in; ++c_in) {
+        for (int k_row = 0; k_row < kernel_size; ++k_row) {
+            for (int k_col = 0; k_col < kernel_size; ++k_col) {
+                int in_row_idx = in_row_start + k_row * dilation;
+                int in_col_idx = in_col_start + k_col * dilation;
+                if (in_row_idx >= 0 && in_row_idx < input_height && in_col_idx >= 0 && in_col_idx < input_width) {
+                    int in_idx = ((batch_id * channels_in + c_in) * input_height + in_row_idx) * input_width + in_col_idx;
+                    int w_idx = ((out_channel_id * channels_in + c_in) * kernel_size + k_row) * kernel_size + k_col;
+                    sum += input[in_idx] * weight[w_idx];
+                }
+            }
+        }
+    }
+
+    int out_idx = ((batch_id * channels_out + out_channel_id) * output_height + out_row_id) * output_width + out_col_id;
+    output[out_idx] = sum;
+}
+
+torch::Tensor transposed_conv_cuda(torch::Tensor input, torch::Tensor weight, int stride, int padding, int dilation) {
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int input_height = input.size(2);
+    int input_width = input.size(3);
+    int out_channels = weight.size(0);
+    int kernel_size = weight.size(2);
+    int output_height = (input_height - 1) * stride + kernel_size - 2 * padding;
+    int output_width = (input_width - 1) * stride + kernel_size - 2 * padding;
+
+    auto output = torch::zeros({batch_size, out_channels, output_height, output_width}, input.options());
+
+    dim3 block_size(output_width);
+    dim3 grid_size(output_height, out_channels, batch_size);
+
+    transposed_conv_kernel<<<grid_size, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), input_height, input_width, output_height, output_width, in_channels, out_channels, kernel_size, stride, padding, dilation);
+
+    return output;
+}
+"""
+
+transposed_conv_cpp_source = (
+    "torch::Tensor transposed_conv_cuda(torch::Tensor input, torch::Tensor weight, int stride, int padding, int dilation);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+transposed_conv = load_inline(
+    name="transposed_conv",
+    cpp_sources=transposed_conv_cpp_source,
+    cuda_sources=transposed_conv_source,
+    functions=["transposed_conv_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = transposed_conv
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv_transpose.transposed_conv_cuda(x, self.weight, stride=self.stride, padding=self.padding, dilation=self.dilation)
+        x = x - self.bias
+        x = torch.tanh(x)
+        return x

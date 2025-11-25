@@ -1,0 +1,76 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+min_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void min_reduction_kernel(const float* input, float* output, int numel, int dim) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load data into shared memory
+    if (i < numel) {
+        sdata[tid] = input[i];
+    } else {
+        sdata[tid] = std::numeric_limits<float>::max();
+    }
+
+    __syncthreads();
+
+    // Perform reduction within each block
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = std::fmin(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // Write result back to global memory
+    if (tid == 0) {
+        output[blockIdx.x] = sdata[0];
+    }
+}
+
+torch::Tensor min_reduction_cuda(torch::Tensor input, int dim) {
+    int numel = input.numel();
+    int output_size = input.size(dim);
+    auto output = torch::zeros(output_size, torch::kFloat32).to(input.device());
+
+    const int block_size = 256;
+    const int num_blocks = (output_size + block_size - 1) / block_size;
+
+    min_reduction_kernel<<<num_blocks, block_size, block_size * sizeof(float)>>>(
+        input.data_ptr<float>(), output.data_ptr<float>(), numel, dim
+    );
+
+    return output;
+}
+"""
+
+min_reduction_cpp_source = (
+    "torch::Tensor min_reduction_cuda(torch::Tensor input, int dim);"
+)
+
+min_reduction = load_inline(
+    name="min_reduction",
+    cpp_sources=min_reduction_cpp_source,
+    cuda_sources=min_reduction_source,
+    functions=["min_reduction_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.min_reduction = min_reduction
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.min_reduction.min_reduction_cuda(x, self.dim)

@@ -1,0 +1,1 @@
+name 'get_inputs' is not defined

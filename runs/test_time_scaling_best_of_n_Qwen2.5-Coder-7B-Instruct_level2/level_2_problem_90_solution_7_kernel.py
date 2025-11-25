@@ -1,0 +1,171 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int depth, int height, int width, int kernel_size) {
+    // Implement the convolution logic here
+}
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, int kernel_size) {
+    // Implement the convolution wrapper function here
+}
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, int kernel_size);"
+)
+
+# Compile the inline CUDA code for 3D convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for LeakyReLU
+leaky_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void leaky_relu_kernel(const float* input, float* output, int size, float negative_slope) {
+    // Implement the LeakyReLU logic here
+}
+
+torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope) {
+    // Implement the LeakyReLU wrapper function here
+}
+"""
+
+leaky_relu_cpp_source = (
+    "torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope);"
+)
+
+# Compile the inline CUDA code for LeakyReLU
+leaky_relu = load_inline(
+    name="leaky_relu",
+    cpp_sources=leaky_relu_cpp_source,
+    cuda_sources=leaky_relu_source,
+    functions=["leaky_relu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for sum operation
+sum_operation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void sum_operation_kernel(const float* input, const float* sum_tensor, float* output, int batch_size, int channels, int depth, int height, int width) {
+    // Implement the sum operation logic here
+}
+
+torch::Tensor sum_operation_cuda(torch::Tensor input, torch::Tensor sum_tensor) {
+    // Implement the sum operation wrapper function here
+}
+"""
+
+sum_operation_cpp_source = (
+    "torch::Tensor sum_operation_cuda(torch::Tensor input, torch::Tensor sum_tensor);"
+)
+
+# Compile the inline CUDA code for sum operation
+sum_operation = load_inline(
+    name="sum_operation",
+    cpp_sources=sum_operation_cpp_source,
+    cuda_sources=sum_operation_source,
+    functions=["sum_operation_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for clamp operation
+clamp_operation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void clamp_operation_kernel(const float* input, float* output, int size, float min_val, float max_val) {
+    // Implement the clamp operation logic here
+}
+
+torch::Tensor clamp_operation_cuda(torch::Tensor input, float min_val, float max_val) {
+    // Implement the clamp operation wrapper function here
+}
+"""
+
+clamp_operation_cpp_source = (
+    "torch::Tensor clamp_operation_cuda(torch::Tensor input, float min_val, float max_val);"
+)
+
+# Compile the inline CUDA code for clamp operation
+clamp_operation = load_inline(
+    name="clamp_operation",
+    cpp_sources=clamp_operation_cpp_source,
+    cuda_sources=clamp_operation_source,
+    functions=["clamp_operation_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for GELU activation
+gelu_activation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_activation_kernel(const float* input, float* output, int size) {
+    // Implement the GELU activation logic here
+}
+
+torch::Tensor gelu_activation_cuda(torch::Tensor input) {
+    // Implement the GELU activation wrapper function here
+}
+"""
+
+gelu_activation_cpp_source = (
+    "torch::Tensor gelu_activation_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for GELU activation
+gelu_activation = load_inline(
+    name="gelu_activation",
+    cpp_sources=gelu_activation_cpp_source,
+    cuda_sources=gelu_activation_source,
+    functions=["gelu_activation_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, sum_tensor_shape):
+        super(ModelNew, self).__init__()
+        self.convolution = convolution
+        self.leaky_relu = leaky_relu
+        self.sum_operation = sum_operation
+        self.clamp_operation = clamp_operation
+        self.gelu_activation = gelu_activation
+        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape))
+
+    def forward(self, x):
+        x = self.convolution.convolution_cuda(x, self.weight, kernel_size)
+        x = self.leaky_relu.leaky_relu_cuda(x, negative_slope=0.2)
+        x = self.sum_operation.sum_operation_cuda(x, self.sum_tensor)
+        x = self.clamp_operation.clamp_operation_cuda(x, min_val=-1.0, max_val=1.0)
+        x = self.gelu_activation.gelu_activation_cuda(x)
+        return x

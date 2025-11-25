@@ -1,0 +1,2 @@
+# Example comments:
+# I replaced the matrix multiplication and Softmax operations with custom CUDA kernels because these operations can be highly parallelized and benefit significantly from GPU acceleration. By fusing these operations into a single kernel,

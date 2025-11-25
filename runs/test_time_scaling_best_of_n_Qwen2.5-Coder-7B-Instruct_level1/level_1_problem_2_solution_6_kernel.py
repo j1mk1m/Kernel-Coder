@@ -1,0 +1,99 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define BLOCK_SIZE 16
+
+__global__ void matmul_kernel(const float* A, const float* B, float* C, int M, int K, int N) {
+    __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
+
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float sum = 0.0f;
+
+    for (int k = 0; k < (K + BLOCK_SIZE - 1) / BLOCK_SIZE; ++k) {
+        if (row < M && k * BLOCK_SIZE + threadIdx.x < K) {
+            As[threadIdx.y][threadIdx.x] = A[row * K + k * BLOCK_SIZE + threadIdx.x];
+        } else {
+            As[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        if (col < N && k * BLOCK_SIZE + threadIdx.y < K) {
+            Bs[threadIdx.x][threadIdx.y] = B[(k * BLOCK_SIZE + threadIdx.y) * N + col];
+        } else {
+            Bs[threadIdx.x][threadIdx.y] = 0.0f;
+        }
+
+        __syncthreads();
+
+        for (int m = 0; m < BLOCK_SIZE; ++m) {
+            sum += As[threadIdx.y][m] * Bs[m][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(1);
+
+    auto C = torch::zeros({M, N}, A.options());
+
+    dim3 grid((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE, 1);
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE, 1);
+
+    matmul_kernel<<<grid, block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, K, N);
+
+    return C;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matmul = matmul
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matmul.matmul_cuda(A, B)
+
+# Example usage
+if __name__ == "__main__":
+    M = 1024 * 2
+    K = 4096 * 2
+    N = 2048 * 2
+
+    A = torch.rand(M, K)
+    B = torch.rand(K, N)
+
+    model = ModelNew().cuda()
+    C = model(A.cuda(), B.cuda())
+
+    print(C.shape)

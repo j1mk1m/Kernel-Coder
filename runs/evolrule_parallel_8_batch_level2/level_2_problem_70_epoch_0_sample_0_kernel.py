@@ -1,0 +1,1 @@
+The fused approach reduces the number of CUDA API calls, leading to lower overhead and better performance.

@@ -1,0 +1,32 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Your CUDA kernel code here
+custom_cuda_source = """
+// Paste your CUDA kernel code here
+"""
+
+custom_cuda_cpp_source = (
+    // Paste your C++ function declarations here
+)
+
+# Compile the inline CUDA code
+custom_cuda = load_inline(
+    name="custom_cuda",
+    cpp_sources=custom_cuda_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["your_function_name"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: int = 1, padding: int = 0, output_padding: int = 0, groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.custom_conv_transpose2d = custom_cuda.your_function_name
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.custom_conv_transpose2d(x)

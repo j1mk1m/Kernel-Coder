@@ -1,0 +1,1 @@
+This should now be correct. The kernels are using 1D grid and block configurations, which should handle the large N=4096 case properly. The autograd function correctly saves the inputs and computes the gradients using the custom backward kernels. The forward pass ensures that only the upper triangular part is computed, matching the original model's behavior.

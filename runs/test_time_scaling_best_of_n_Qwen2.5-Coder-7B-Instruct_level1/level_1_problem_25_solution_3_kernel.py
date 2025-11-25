@@ -1,0 +1,44 @@
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA source code for the Swish operation
+swish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void swish_forward_kernel(float* x, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        x[idx] *= 1.0f / (1.0f + expf(-x[idx]));
+    }
+}
+
+torch::Tensor swish_forward_cuda(torch::Tensor x) {
+    auto n = x.numel();
+    auto y = torch::zeros_like(x);
+    const int threads_per_block = 256;
+    const int blocks_per_grid = (n + threads_per_block - 1) / threads_per_block;
+    swish_forward_kernel<<<blocks_per_grid, threads_per_block>>>(x.data_ptr<float>(), n);
+    return y;
+}
+"""
+
+swish_cpp_source = "torch::Tensor swish_forward_cuda(torch::Tensor x);"
+
+# Compile the inline CUDA code for the Swish operation
+swish = load_inline(
+    name="swish",
+    cpp_sources=swish_cpp_source,
+    cuda_sources=swish_source,
+    functions=["swish_forward_cuda"],
+    verbose=True,
+    extra_cflags=[],
+    extra_ldflags=[],
+)
+
+# Use the compiled CUDA kernel in a custom module
+class ModelSwish(nn.Module):
+    def __init__(self):
+        super(ModelSwish, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return swish.swish_forward_cuda(x)

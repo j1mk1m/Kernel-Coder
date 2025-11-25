@@ -1,0 +1,9 @@
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        # Replace with custom CUDA operators here
+        pass
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Implement forward pass using custom CUDA operators here
+        pass

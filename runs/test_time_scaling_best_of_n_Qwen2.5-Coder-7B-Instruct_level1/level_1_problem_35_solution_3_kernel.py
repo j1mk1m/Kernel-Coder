@@ -1,0 +1,58 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Group Normalization
+group_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void group_norm_forward_kernel(const float* x, float* mean, float* var, float* gamma, float* beta, float* out, int batch_size, int num_features, int dim1, int dim2, int num_groups) {
+    // Implement Group Normalization forward pass here
+    // ...
+}
+
+torch::Tensor group_norm_forward_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta) {
+    auto batch_size = x.size(0);
+    auto num_features = x.size(1);
+    auto dim1 = x.size(2);
+    auto dim2 = x.size(3);
+    auto num_groups = gamma.size(0);
+
+    auto mean = torch::empty({batch_size, num_groups}, x.options());
+    auto var = torch::empty({batch_size, num_groups}, x.options());
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * num_groups + block_size - 1) / block_size;
+
+    group_norm_forward_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(), out.data_ptr<float>(), batch_size, num_features, dim1, dim2, num_groups);
+
+    return out;
+}
+"""
+
+group_norm_cpp_source = (
+    "torch::Tensor group_norm_forward_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta);"
+)
+
+# Compile the inline CUDA code for Group Normalization
+group_norm = load_inline(
+    name="group_norm",
+    cpp_sources=group_norm_cpp_source,
+    cuda_sources=group_norm_source,
+    functions=["group_norm_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int, num_groups: int):
+        super(ModelNew, self).__init__()
+        self.group_norm = group_norm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.group_norm.group_norm_forward_cuda(x, self.gamma, self.beta)

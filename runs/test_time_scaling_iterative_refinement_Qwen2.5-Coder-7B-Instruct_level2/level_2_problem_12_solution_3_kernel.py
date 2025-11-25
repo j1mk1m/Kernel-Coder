@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for GEMM
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 16;
+    dim3 grid((n + block_size - 1) / block_size, (m + block_size - 1) / block_size);
+    dim3 block(block_size, block_size);
+
+    gemm_kernel<<<grid, block>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for GEMM
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for LeakyReLU
+leaky_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void leaky_relu_kernel(const float* input, float* output, int size, float negative_slope) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = input[idx] > 0 ? input[idx] : negative_slope * input[idx];
+    }
+}
+
+torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope) {
+    auto size = input.numel();
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    leaky_relu_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size, negative_slope);
+
+    return output;
+}
+"""
+
+leaky_relu_cpp_source = (
+    "torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope);"
+)
+
+# Compile the inline CUDA code for LeakyReLU
+leaky_relu = load_inline(
+    name="leaky_relu",
+    cpp_sources=leaky_relu_cpp_source,
+    cuda_sources=leaky_relu_source,
+    functions=["leaky_relu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        self.gemm = gemm
+        self.multiplier = multiplier
+        self.leaky_relu = leaky_relu
+
+    def forward(self, x):
+        x = self.gemm.gemm_cuda(x, x.new_zeros(out_features, in_features))
+        x = x * self.multiplier
+        x = self.leaky_relu.leaky_relu_cuda(x, self.negative_slope)
+        return x
+
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 1024
+    in_features = 8192
+    out_features = 8192
+    multiplier = 2.0
+    negative_slope = 0.1
+
+    model = ModelNew(in_features, out_features, multiplier, negative_slope)
+    inputs = get_inputs()
+    outputs = model(inputs[0])
+    print(outputs.shape)

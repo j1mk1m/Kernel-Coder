@@ -1,0 +1,303 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 32;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    matmul_kernel<<<num_blocks_y, num_blocks_x>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for summation
+summation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void summation_kernel(const float* a, float* out, int size) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        sdata[tid] = a[idx];
+        __syncthreads();
+
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            atomicAdd(out, sdata[0]);
+        }
+    }
+}
+
+torch::Tensor summation_cuda(torch::Tensor a) {
+    auto size = a.numel();
+    auto out = torch::zeros({1}, a.options()).fill_(0.0f);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    summation_kernel<<<num_blocks, block_size, block_size * sizeof(float)>>>(a.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+summation_cpp_source = (
+    "torch::Tensor summation_cuda(torch::Tensor a);"
+)
+
+# Compile the inline CUDA code for summation
+summation = load_inline(
+    name="summation",
+    cpp_sources=summation_cpp_source,
+    cuda_sources=summation_source,
+    functions=["summation_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for max operation
+max_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void max_kernel(const float* a, float* out, int size) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        sdata[tid] = a[idx];
+        __syncthreads();
+
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] = fmax(sdata[tid], sdata[tid + s]);
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            atomicMax(out, sdata[0]);
+        }
+    }
+}
+
+torch::Tensor max_cuda(torch::Tensor a) {
+    auto size = a.numel();
+    auto out = torch::zeros({1}, a.options()).fill_(-std::numeric_limits<float>::infinity());
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    max_kernel<<<num_blocks, block_size, block_size * sizeof(float)>>>(a.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+max_cpp_source = (
+    "torch::Tensor max_cuda(torch::Tensor a);"
+)
+
+# Compile the inline CUDA code for max operation
+max_op = load_inline(
+    name="max_op",
+    cpp_sources=max_cpp_source,
+    cuda_sources=max_source,
+    functions=["max_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for average pooling
+avg_pooling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pooling_kernel(const float* a, float* out, int m, int n, int pool_size) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < pool_size; ++i) {
+            for (int j = 0; j < pool_size; ++j) {
+                int r = row * pool_size + i;
+                int c = col * pool_size + j;
+                if (r < m && c < n) {
+                    sum += a[r * n + c];
+                }
+            }
+        }
+        out[row * n + col] = sum / (pool_size * pool_size);
+    }
+}
+
+torch::Tensor avg_pooling_cuda(torch::Tensor a, int pool_size) {
+    auto m = a.size(0);
+    auto n = a.size(1);
+    auto out = torch::zeros({m // pool_size, n // pool_size}, a.options());
+
+    const int block_size = 32;
+    const int num_blocks_x = (n // pool_size + block_size - 1) / block_size;
+    const int num_blocks_y = (m // pool_size + block_size - 1) / block_size;
+
+    avg_pooling_kernel<<<num_blocks_y, num_blocks_x>>>(a.data_ptr<float>(), out.data_ptr<float>(), m, n, pool_size);
+
+    return out;
+}
+"""
+
+avg_pooling_cpp_source = (
+    "torch::Tensor avg_pooling_cuda(torch::Tensor a, int pool_size);"
+)
+
+# Compile the inline CUDA code for average pooling
+avg_pooling = load_inline(
+    name="avg_pooling",
+    cpp_sources=avg_pooling_cpp_source,
+    cuda_sources=avg_pooling_source,
+    functions=["avg_pooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for logsumexp
+logsumexp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void logsumexp_kernel(const float* a, float* out, int size) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        sdata[tid] = a[idx];
+        __syncthreads();
+
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] = fmax(sdata[tid], sdata[tid + s]);
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            float max_val = sdata[0];
+            sdata[tid] = exp(a[idx] - max_val);
+            __syncthreads();
+
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    sdata[tid] += sdata[tid + s];
+                }
+                __syncthreads();
+            }
+
+            if (tid == 0) {
+                atomicAdd(out, max_val + log(sdata[0]));
+            }
+        }
+    }
+}
+
+torch::Tensor logsumexp_cuda(torch::Tensor a) {
+    auto size = a.numel();
+    auto out = torch::zeros({1}, a.options()).fill_(0.0f);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    logsumexp_kernel<<<num_blocks, block_size, block_size * sizeof(float)>>>(a.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+logsumexp_cpp_source = (
+    "torch::Tensor logsumexp_cuda(torch::Tensor a);"
+)
+
+# Compile the inline CUDA code for logsumexp
+logsumexp = load_inline(
+    name="logsumexp",
+    cpp_sources=logsumexp_cpp_source,
+    cuda_sources=logsumexp_source,
+    functions=["logsumexp_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        x = self.linear(x)  # (batch_size, out_features)
+        x = matmul.matmul_cuda(x, torch.ones((out_features, 1)).to(x.device))  # (batch_size, 1)
+        x = max_op.max_cuda(x.view(-1))  # (1,)
+        x = avg_pooling.avg_pooling_cuda(x.view(1, 1), 1)  # (1, 1)
+        x = logsumexp.logsumexp_cuda(x.view(-1))  # (1,)
+        x = logsumexp.logsumexp_cuda(x.view(-1))  # (1,)
+        return x

@@ -1,0 +1,1 @@
+The kernel function now correctly implements the LogSoftmax operation, and the output of the `ModelNew` matches the output of the original `Model`.

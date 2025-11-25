@@ -1,0 +1,160 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+conv_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define CUDA_KERNEL_LOOP(i, n) \
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); i += blockDim.x * gridDim.x)
+
+__global__ void conv_transpose_kernel(const float* input, const float* weight, float* output, int input_height, int input_width, int output_height, int output_width, int channels, int groups, int kernel_size, int stride, int padding) {
+    int ochannel = blockIdx.y;
+    int orow = blockIdx.z * stride + threadIdx.y;
+    int ocol = blockIdx.w * stride + threadIdx.x;
+
+    if (orow >= output_height || ocol >= output_width) return;
+
+    float sum = 0.0f;
+    for (int ic = 0; ic < channels; ic++) {
+        int ichannel = ic / groups;
+        int irow = orow - padding + kernel_size - 1 - (threadIdx.y % kernel_size);
+        int icol = ocol - padding + kernel_size - 1 - (threadIdx.x % kernel_size);
+
+        if (irow >= 0 && irow < input_height && icol >= 0 && icol < input_width) {
+            int in_idx = (occhannel * input_height * input_width) + (ichannel * input_height * input_width) + (irow * input_width) + icol;
+            int wei_idx = ((ic % groups) * groups + ochannel) * (kernel_size * kernel_size * channels) + (ic * kernel_size * kernel_size) + (threadIdx.y * kernel_size + threadIdx.x);
+            sum += input[in_idx] * weight[wei_idx];
+        }
+    }
+
+    int out_idx = (occhannel * output_height * output_width) + (ochannel * output_height * output_width / groups) + (orow * output_width) + ocol;
+    output[out_idx] = sum;
+}
+
+torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, int output_height, int output_width, int groups, int kernel_size, int stride, int padding) {
+    auto channels = input.size(1);
+    auto in_height = input.size(2);
+    auto in_width = input.size(3);
+
+    auto output = torch::zeros({input.size(0), channels // groups, output_height, output_width}, input.options());
+
+    const int block_size = 16;
+    const int num_blocks_x = (output_width + block_size - 1) / block_size;
+    const int num_blocks_y = (output_height + block_size - 1) / block_size;
+    const int num_blocks_z = groups;
+    const int num_blocks_w = (channels / groups + block_size - 1) / block_size;
+
+    conv_transpose_kernel<<<dim3(num_blocks_x, num_blocks_y, num_blocks_z, num_blocks_w), dim3(block_size, block_size)>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), in_height, in_width, output_height, output_width, channels, groups, kernel_size, stride, padding);
+
+    return output;
+}
+"""
+
+conv_transpose_cpp_source = (
+    "torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, int output_height, int output_width, int groups, int kernel_size, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+conv_transpose = load_inline(
+    name="conv_transpose",
+    cpp_sources=conv_transpose_cpp_source,
+    cuda_sources=conv_transpose_source,
+    functions=["conv_transpose_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define CUDA_KERNEL_LOOP(i, n) \
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); i += blockDim.x * gridDim.x)
+
+__global__ void softmax_kernel(const float* input, float* output, int batch_size, int channels, int height, int width) {
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+    int h = blockIdx.z;
+    int w = blockIdx.w;
+
+    float max_val = -FLT_MAX;
+    for (int ci = 0; ci < channels; ci++) {
+        int idx = (b * channels * height * width) + (ci * height * width) + (h * width) + w;
+        max_val = fmax(max_val, input[idx]);
+    }
+
+    float sum_exp = 0.0f;
+    for (int ci = 0; ci < channels; ci++) {
+        int idx = (b * channels * height * width) + (ci * height * width) + (h * width) + w;
+        float exp_val = exp(input[idx] - max_val);
+        sum_exp += exp_val;
+    }
+
+    int idx = (b * channels * height * width) + (c * height * width) + (h * width) + w;
+    output[idx] = exp(input[idx] - max_val) / sum_exp;
+}
+
+torch::Tensor softmax_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 16;
+    const int num_blocks_x = (width + block_size - 1) / block_size;
+    const int num_blocks_y = (height + block_size - 1) / block_size;
+    const int num_blocks_z = channels;
+    const int num_blocks_w = batch_size;
+
+    softmax_kernel<<<dim3(num_blocks_w, num_blocks_z, num_blocks_y, num_blocks_x), dim3(block_size, block_size)>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels, height, width);
+
+    return output;
+}
+"""
+
+softmax_cpp_source = (
+    "torch::Tensor softmax_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for softmax
+softmax = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = conv_transpose
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose.conv_transpose_cuda(x, self.weight, x.size(2), x.size(3), self.groups, kernel_size, stride, padding)
+        x = softmax.softmax_cuda(x)
+        x = x + self.bias
+        x = x * self.scaling_factor
+        x = torch.sigmoid(x)
+        return x
+
+    def init_weights(self, weight):
+        self.weight = weight
+
+# Example usage
+model_new = ModelNew(in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor)
+inputs = get_inputs()
+outputs = model_new(inputs[0])
+print(outputs.shape)

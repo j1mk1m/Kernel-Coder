@@ -1,0 +1,668 @@
+The L2 norm computation has two parts: the norm computation and the division. The norm computation is along dimension 1. Let's first think about the norm computation. The norm is a vector that has the same first dimension as the input. The division is an element-wise operation between the input tensor and the norm vector. Since the norm vector is much smaller than the input, we might want to compute the norm and division in a single kernel to avoid the overhead of storing and accessing the norm tensor separately. This is operator fusion. So we can fuse the norm computation and division into one kernel. Let me try to think about how to implement this.
+
+First, the L2 norm along dimension 1 for each row. For a tensor of shape (batch_size, dim), the norm is computed as sqrt(sum(x_i^2)) for each row. Then, divide each element by its row's norm.
+
+To fuse the norm and division into a single kernel, we can compute the norm for each row on the fly and then perform the division without storing the intermediate norm tensor. However, this would require each thread to compute the row's norm and then perform the division, but this could be inefficient because each element in the row would need to access the norm value, which might require atomic operations or synchronization, leading to higher complexity. Alternatively, we can compute the norm for each row first in one kernel, store it in shared memory, and then perform the division in the same kernel. Wait, but the norm computation is a reduction along the dimension, so perhaps a better approach is to first compute the norm for each row in a kernel, store it in a separate tensor, and then do the division in another kernel. However, this would involve two separate kernels, but maybe the overhead of two kernels is less than the overhead of having to store and load the norm tensor. Alternatively, perhaps fusing them into a single kernel can save memory traffic and reduce kernel launch overhead.
+
+Wait, but if the norm is a reduction, then it requires summing over the dimension. To compute the norm for each row, each row can be handled by a block. Each thread in the block processes an element of the row, computes the square, and then perform a block-wide reduction to get the sum. Then take the square root to get the norm. Then, each element in the row can be divided by the norm. This way, all this can be done in a single kernel.
+
+This approach would involve:
+
+1. For each row (each block handles a row), the threads in the block compute the squares of their respective elements, sum them into a shared memory, then compute the norm.
+
+2. Once the norm is computed, each thread divides its element by the norm.
+
+This way, the norm is stored in shared memory, and the division is done immediately after, avoiding the need to store the norm tensor in global memory. This could be more efficient in terms of memory bandwidth and reduce kernel launch overhead.
+
+So, let's outline the steps for the fused kernel:
+
+- The grid is set such that each block corresponds to a row (since dim is the second dimension). The number of blocks is equal to the batch_size.
+
+- Each block has as many threads as needed to cover the elements in the row. Since the dimension is 65535, which is large, maybe each block uses a number of threads equal to the block size (e.g., 256), and then use multiple threads per row. Wait, but 65535 elements per row would require multiple threads per row. Alternatively, use a block size of 256, and each block processes a row by having each thread process multiple elements. Wait, but for reduction, it's better to have enough threads per row to cover the elements, but with the dimension being 65535, which is a large number. Let me think.
+
+Wait, let's think of the problem:
+
+The input tensor is of shape (batch_size, dim). Let's say the batch_size is 32768, dim=65535.
+
+Each row (along dimension 1) has 65535 elements. For each row, compute the sum of squares, take sqrt, then divide each element by that norm.
+
+So for each row, the norm computation is a reduction over 65535 elements. To compute this efficiently, a block per row would be necessary. Each block would need to process all 65535 elements. However, 65535 elements is a large number, so each thread in the block can process a subset of the elements.
+
+The typical approach for a reduction is to have each thread compute a partial sum, then perform a reduction within the block. The steps are:
+
+1. Each thread in the block reads a portion of the input row, computes the squares, and accumulates into a private register.
+
+2. Then, perform a block-wide reduction to sum all the partial sums, resulting in the total sum for the row.
+
+3. Compute the norm as sqrt(sum).
+
+4. Then, each thread divides their respective elements by the norm and writes the result.
+
+The problem is that the block size has to be chosen such that enough threads can process the 65535 elements. Let's see:
+
+Suppose we have a block size of 256 threads. Then each thread can process 65535 / 256 ≈ 256 elements (since 256*256=65536). Since 65535 is just one less, it's manageable. Each thread would process approximately 256 elements, compute the sum of their squares, then contribute to the block's reduction.
+
+So, the plan is:
+
+- The grid is set to have batch_size blocks (each block corresponds to a row).
+
+- Each block has 256 threads.
+
+- Each thread processes (dim + block_size -1)/block_size elements per row. Wait, for dim=65535 and block_size=256, each thread would process ceil(65535 / 256) = 257 elements (since 256*257=65792 which is more than 65535).
+
+But that might be okay. The code can have each thread process a loop over their assigned elements.
+
+First, the norm computation:
+
+Each thread in the block (for a row) would process their assigned elements:
+
+sum += x[i]^2 for all i in their assigned indices.
+
+Once all threads have computed their partial sums, perform a block-wide reduction to get the total sum.
+
+Then compute the norm as sqrt(sum).
+
+Then, each thread would again loop over their assigned elements and divide each by the norm.
+
+This way, the entire operation is done in a single kernel launch.
+
+Now, considering the memory access pattern:
+
+The input tensor is stored in row-major order. Each row is contiguous in memory. Since each block processes a row, the threads in a block can coalesced load the elements of the row.
+
+However, in the first pass (computing the squares and accumulating), each thread processes a contiguous block of elements. For example, thread 0 processes elements 0-256, thread1 256-512, etc. Wait, no, actually, each thread would process a set of elements spaced by the block size. For example, if the block has 256 threads, each thread i processes elements i, i+256, i+512, etc. This is the standard approach for parallel reductions.
+
+Alternatively, to maximize coalescing, it's better to have each thread process a contiguous chunk. For example, if the row is stored as a linear array, then thread 0 processes elements 0-255, thread1 256-511, etc. But with 256 threads, each thread can handle 257 elements (since 256*257=65792 which is more than 65535).
+
+Wait, actually, the exact number of elements per thread would be (dim + block_size -1) // block_size. For 65535 elements and 256 threads, it's (65535 +256 -1)/256 = 65791 /256 ≈ 256.99, so 257 elements per thread.
+
+Therefore, the first loop would be over the elements assigned to each thread.
+
+Now, for the reduction within the block, after each thread has computed their partial sum, they can perform a reduction using shared memory. The standard approach for block reduction would be to use shared memory to store the partial sums, then perform a binary reduction.
+
+Once the total sum is computed, the norm is sqrt(sum). This can be computed by one thread in the block, then broadcast to all threads in the block.
+
+Then, in the second pass, each thread processes their assigned elements again, divides by the norm, and writes to the output tensor.
+
+Now, the code outline for the kernel would be:
+
+__global__ void l2_norm_fusion_kernel(
+    const float* __restrict__ input,
+    float* output,
+    int batch_size,
+    int dim
+) {
+    // Each block handles a row (a single batch element)
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    // Shared memory for partial sums and norm
+    __shared__ float s_partials[256]; // assuming block size 256
+    __shared__ float norm;
+
+    // Compute partial sum for this thread's elements
+    float sum = 0.0f;
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = input[row * dim + i];
+        sum += val * val;
+    }
+
+    // Store partial sum to shared memory
+    s_partials[tid] = sum;
+    __syncthreads();
+
+    // Block reduction to compute total sum
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (tid < s) {
+            s_partials[tid] += s_partials[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Only thread 0 computes the norm and writes it to shared memory
+    if (tid == 0) {
+        float total_sum = s_partials[0];
+        norm = rsqrt(total_sum); // rsqrt for efficiency, but need to sqrt then inverse?
+        // Wait, actually, the norm is sqrt(total_sum), so 1/norm is 1/sqrt(total_sum) = rsqrt(total_sum)
+        // So, instead of sqrt and then divide, can use rsqrt directly to get the reciprocal
+        // This might be faster. Alternatively, compute norm as sqrt(total_sum), then reciprocal.
+        // Let me think: the division is input[i]/norm, so equivalent to input[i] * (1/norm)
+        // To compute 1/norm, we can use rsqrt(total_sum). So yes, this is better.
+        norm = rsqrt(total_sum);
+        s_partials[0] = norm; // store reciprocal of norm in s_partials[0]?
+        // Wait, actually, if norm is 1/sqrt(total_sum), then we can multiply by norm directly.
+        // So, yes, better to precompute reciprocal.
+    }
+    __syncthreads();
+
+    // Now each thread can read the norm from shared memory
+    float inv_norm = s_partials[0]; // Assuming stored there
+
+    // Now, process the elements again for the division
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = input[row * dim + i];
+        output[row * dim + i] = val * inv_norm;
+    }
+}
+
+Wait, but in the code above:
+
+- The block reduction part computes the total_sum as the sum of squares, then thread 0 computes inv_norm = rsqrt(total_sum). Then stores inv_norm into s_partials[0]. Then, all threads can read inv_norm from there.
+
+But in the code above, after the reduction, when tid ==0, the code computes norm = rsqrt(total_sum), then stores s_partials[0] = norm. Then, after syncthreads, all threads can read inv_norm from s_partials[0].
+
+This should work.
+
+But let me check:
+
+Wait, in the first part, after the first loop, each thread's s_partials[tid] is their partial sum. Then, the block reduction reduces all s_partials into s_partials[0], which is the total sum. Then thread 0 computes inv_norm as rsqrt(s_partials[0]). Then stores it into s_partials[0], so that all threads can read it.
+
+Yes, that's correct.
+
+But in the code above, after the first reduction loop, the total sum is stored in s_partials[0] (since the loop reduces down to s_partials[0] holding the total). Then, thread 0 can read that, compute inv_norm, and write to s_partials[0], which is then read by all threads.
+
+This should work.
+
+Now, the problem is that rsqrt may have some precision issues, but in CUDA, rsqrt is a fast approximation. If higher precision is needed, we can use sqrt(total_sum), then compute inv_norm = 1.0f / sqrt(total_sum). But for the sake of performance, using rsqrt might be better. However, in some cases, the input might have zero norm, but the problem statement says it's L2 normalization, which assumes the norm is non-zero. So we can proceed.
+
+Now, the kernel would need to be launched with a grid of batch_size blocks, each of block_size threads (e.g., 256). The block size can be set as 256.
+
+Now, in the Python code, the input tensor is passed to the kernel, along with output tensor. The batch_size and dim are parameters.
+
+The Python code would then need to:
+
+- Create an output tensor of the same shape as input.
+
+- Launch the kernel with the appropriate grid and block dimensions.
+
+Now, let's write the CUDA code.
+
+First, the CUDA kernel code:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <int block_size>
+__global__ void l2_norm_fusion_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int dim
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float s_partials[block_size];
+    __shared__ float inv_norm;
+
+    // Compute partial sum for this thread's elements
+    float sum = 0.0f;
+    for (int i = tid; i < dim; i += block_size) {
+        float val = input[row * dim + i];
+        sum += val * val;
+    }
+
+    s_partials[tid] = sum;
+    __syncthreads();
+
+    // Block reduction
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_partials[tid] += s_partials[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum = s_partials[0];
+        // Compute reciprocal of sqrt(total_sum) (rsqrt is faster)
+        inv_norm = rsqrtf(total_sum);
+        s_partials[0] = inv_norm;
+    }
+    __syncthreads();
+
+    // Apply the normalization
+    inv_norm = s_partials[0];
+    for (int i = tid; i < dim; i += block_size) {
+        float val = input[row * dim + i];
+        output[row * dim + i] = val * inv_norm;
+    }
+}
+
+// Define the function that wraps the kernel
+torch::Tensor l2_norm_fusion_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    const int dim = input.size(1);
+
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    // Launch the kernel with template parameter block_size set to 256
+    l2_norm_fusion_kernel<block_size><<<grid, block>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    return output;
+}
+
+Wait, but the template parameter for the kernel must be known at compile time. Since we are using block_size as 256, which is a constant, the template is okay.
+
+However, in the code above, the kernel is templated on block_size, which is set to 256 here. The kernel function is thus l2_norm_fusion_kernel<256>, which is correct.
+
+Now, in the Python code, we can compile this CUDA code. Let's write the Python code.
+
+The Python code would need to:
+
+- Load the CUDA code inline, using load_inline from torch.utils.cpp_extension.
+
+- The code must be written as strings for the CUDA and C++ sources.
+
+The C++ header includes torch/extension.h, etc.
+
+Putting this into the Python code:
+
+First, the CUDA source code as a string:
+
+l2_norm_fusion_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <int block_size>
+__global__ void l2_norm_fusion_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int dim
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float s_partials[block_size];
+    __shared__ float inv_norm;
+
+    float sum = 0.0f;
+    for (int i = tid; i < dim; i += block_size) {
+        float val = input[row * dim + i];
+        sum += val * val;
+    }
+
+    s_partials[tid] = sum;
+    __syncthreads();
+
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_partials[tid] += s_partials[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum = s_partials[0];
+        inv_norm = rsqrtf(total_sum);
+        s_partials[0] = inv_norm;
+    }
+    __syncthreads();
+
+    inv_norm = s_partials[0];
+    for (int i = tid; i < dim; i += block_size) {
+        float val = input[row * dim + i];
+        output[row * dim + i] = val * inv_norm;
+    }
+}
+
+torch::Tensor l2_norm_fusion_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    const int dim = input.size(1);
+
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    l2_norm_fusion_kernel<block_size><<<grid, block>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    return output;
+}
+"""
+
+Wait, but in the kernel function, the __shared__ variables are declared inside the kernel. The code seems okay.
+
+The C++ header for the function:
+
+l2_norm_fusion_cpp_source = """
+torch::Tensor l2_norm_fusion_cuda(torch::Tensor input);
+"""
+
+Then, in Python:
+
+from torch.utils.cpp_extension import load_inline
+
+l2_norm_fusion = load_inline(
+    name="l2_norm_fusion",
+    cpp_sources=l2_norm_fusion_cpp_source,
+    cuda_sources=l2_norm_fusion_source,
+    functions=["l2_norm_fusion_cuda"],
+    verbose=True,
+)
+
+Then, the new model would use this function.
+
+So the ModelNew class would be:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l2_norm_fusion = l2_norm_fusion  # Assuming the module is stored here
+
+    def forward(self, x):
+        return self.l2_norm_fusion.l2_norm_fusion_cuda(x)
+
+Wait, but in the previous example, they used self.elementwise_add.elementwise_add_cuda(...). In this case, the loaded module's function is l2_norm_fusion_cuda, so the forward would be:
+
+return self.l2_norm_fusion.l2_norm_fusion_cuda(x)
+
+Alternatively, perhaps the loaded module is a module that has the function as a method. Let me check the example given.
+
+In the example, they had:
+
+elementwise_add = load_inline(...)
+
+then in forward, called self.elementwise_add.elementwise_add_cuda(a, b)
+
+So similarly, here, after:
+
+l2_norm_fusion = load_inline(...)
+
+then in the ModelNew's forward, it's:
+
+return l2_norm_fusion.l2_norm_fusion_cuda(x)
+
+Wait, but in the example, the model had self.elementwise_add, but perhaps it's not necessary. The example could have just called the function directly. Maybe in the example, the load_inline returns a module that can be called with the functions. So in the new model:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Maybe no need to store, just call the function directly
+
+    def forward(self, x):
+        return l2_norm_fusion.l2_norm_fusion_cuda(x)
+
+But in the example, they stored the module in self, perhaps for clarity. So in the code, the user may need to store the module as an attribute.
+
+Alternatively, since the function is part of the module, but in the code above, the function is defined as part of the load_inline's functions.
+
+Alternatively, the function is part of the module, so:
+
+After loading the module into l2_norm_fusion, then in forward, you can do l2_norm_fusion.l2_norm_fusion_cuda(x).
+
+But in the example, they had:
+
+elementwise_add = load_inline(...)
+class ModelNew:
+    def __init__(self):
+        self.elementwise_add = elementwise_add
+    def forward(...):
+        self.elementwise_add.elementwise_add_cuda(...)
+
+So following that pattern, the new code should have:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l2_fusion = l2_norm_fusion
+
+    def forward(self, x):
+        return self.l2_fusion.l2_norm_fusion_cuda(x)
+
+Yes, this way, the module is stored as an attribute, and the method is accessed properly.
+
+Now, check the code for possible errors.
+
+First, in the CUDA kernel:
+
+- The input is of type float, so input.data_ptr<float>() is okay.
+
+- The template parameter block_size is 256, which is the same as the block's thread count. So the __shared__ s_partials is declared as block_size, which is okay.
+
+- The kernel is launched with block_size threads per block.
+
+Potential issues:
+
+1. Handling of the case when dim is not divisible by block_size. Since in the for loop, the step is block_size, and the loop runs for i < dim, that should be okay. Each thread processes all their assigned elements even if it's less than a full block.
+
+2. The use of rsqrtf: if the total_sum is zero, this would be a problem. However, the problem states it's L2 normalization, so the input should have non-zero norms. So it's assumed that the input is valid.
+
+3. The output tensor is created with empty_like, which is correct.
+
+Now, compiling this code. The CUDA code is inline, so it should compile.
+
+Another possible optimization: using shared memory for the input data to reduce global memory accesses, but given that the input is large, it may not fit into shared memory. Alternatively, the current approach is okay.
+
+Another point: in the reduction step, after the first loop, each thread has a partial sum. Then, they write to s_partials[tid], and then syncthreads. Then the reduction proceeds. That is correct.
+
+Now, putting all together, the Python code would be:
+
+The final code would be:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+l2_norm_fusion_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <int block_size>
+__global__ void l2_norm_fusion_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int dim
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float s_partials[block_size];
+    __shared__ float inv_norm;
+
+    float sum = 0.0f;
+    for (int i = tid; i < dim; i += block_size) {
+        float val = input[row * dim + i];
+        sum += val * val;
+    }
+
+    s_partials[tid] = sum;
+    __syncthreads();
+
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_partials[tid] += s_partials[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum = s_partials[0];
+        inv_norm = rsqrtf(total_sum);
+        s_partials[0] = inv_norm;
+    }
+    __syncthreads();
+
+    inv_norm = s_partials[0];
+    for (int i = tid; i < dim; i += block_size) {
+        float val = input[row * dim + i];
+        output[row * dim + i] = val * inv_norm;
+    }
+}
+
+torch::Tensor l2_norm_fusion_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    const int dim = input.size(1);
+
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    l2_norm_fusion_kernel<block_size><<<grid, block>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    return output;
+}
+"""
+
+l2_norm_fusion_cpp_source = """
+torch::Tensor l2_norm_fusion_cuda(torch::Tensor input);
+"""
+
+l2_norm_fusion = load_inline(
+    name="l2_norm_fusion",
+    cpp_sources=l2_norm_fusion_cpp_source,
+    cuda_sources=l2_norm_fusion_source,
+    functions=["l2_norm_fusion_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l2_fusion = l2_norm_fusion
+
+    def forward(self, x):
+        return self.l2_fusion.l2_norm_fusion_cuda(x)
+```
+
+Wait, but in the CUDA kernel, the input is accessed as input[row * dim + i], which assumes that the input is a contiguous 1D tensor. However, the input tensor in PyTorch is a 2D tensor (batch_size x dim). So the stride for the rows may not be 1, but in the code above, we assume that the row is contiguous. To ensure this, the input tensor must be contiguous in memory. Since the user's get_inputs() creates a tensor with torch.rand(batch_size, dim), which is a contiguous tensor, so that should be okay. But in the code, perhaps it's better to ensure that the input is contiguous, or maybe not needed.
+
+Alternatively, in the CUDA kernel, the input is a 2D tensor, so the correct way to index it is:
+
+input[row][i] corresponds to input[row * dim + i].
+
+Yes, that is correct for a contiguous 2D tensor.
+
+Another point: The output tensor is created as torch::empty_like(input), which should have the same strides, so the output will also be contiguous.
+
+Another thing: The kernel is launched with grid size batch_size, which can be up to 32768. CUDA allows up to 65535 blocks in a dimension, but the total grid size can be larger. For example, the maximum grid size in CUDA is 2^31-1 per dimension, so 32768 is okay.
+
+Now, testing if the code compiles. The kernel function has a template parameter block_size, which is 256. The shared memory size for s_partials is 256 floats, which is 1KB. The shared memory for inv_norm is another float. The total shared memory usage is acceptable.
+
+Another possible issue: if dim is smaller than block_size, then each thread would process more than one element, but the code handles that with the loop.
+
+Overall, this should work.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+l2_norm_fusion_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template <int block_size>
+__global__ void l2_norm_fusion_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int dim
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float s_partials[block_size];
+    __shared__ float inv_norm;
+
+    float sum = 0.0f;
+    for (int i = tid; i < dim; i += block_size) {
+        float val = input[row * dim + i];
+        sum += val * val;
+    }
+
+    s_partials[tid] = sum;
+    __syncthreads();
+
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_partials[tid] += s_partials[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum = s_partials[0];
+        inv_norm = rsqrtf(total_sum);
+        s_partials[0] = inv_norm;
+    }
+    __syncthreads();
+
+    inv_norm = s_partials[0];
+    for (int i = tid; i < dim; i += block_size) {
+        float val = input[row * dim + i];
+        output[row * dim + i] = val * inv_norm;
+    }
+}
+
+torch::Tensor l2_norm_fusion_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    const int dim = input.size(1);
+
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    l2_norm_fusion_kernel<block_size><<<grid, block>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    return output;
+}
+"""
+
+l2_norm_fusion_cpp_source = """
+torch::Tensor l2_norm_fusion_cuda(torch::Tensor input);
+"""
+
+l2_norm_fusion = load_inline(
+    name="l2_norm_fusion",
+    cpp_sources=l2_norm_fusion_cpp_source,
+    cuda_sources=l2_norm_fusion_source,
+    functions=["l2_norm_fusion_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l2_fusion = l2_norm_fusion
+
+    def forward(self, x):
+        return self.l2_fusion.l2_norm_fusion_cuda(x)
+```

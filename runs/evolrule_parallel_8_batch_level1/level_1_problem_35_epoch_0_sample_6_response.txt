@@ -1,0 +1,1082 @@
+To create a custom CUDA operator, you can use the following template:
+
+```python
+from torch.utils.cpp_extension import load_inline
+cuda_source = """
+// put your cuda code here
+"""
+cpu_source = """
+// put your cpu code here (if needed)
+"""
+module = load_inline(
+    name="operator_name",
+    cpp_sources=cpu_source,
+    cuda_sources=cuda_source,
+    functions=["function_name"],
+    verbose=True
+)
+```
+        
+You can then call the custom operator via module.function_name(...).
+
+The goal is to replace the GroupNorm operator with a custom CUDA implementation. You can either rewrite the entire operator from scratch, or find opportunities to fuse operations in the existing operator. You can also use PyTorch's native extensions or ATen to build the custom operator. Make sure that your code is correct and efficient. 
+
+I will compile and run your code. If it does not work, I will let you know and you have to fix it. 
+
+Now, let us start the optimization. 
+
+First, I need to optimize the GroupNorm operator in the given Model. To do that, I can implement a custom CUDA kernel for GroupNorm. Let me recall how GroupNorm works.
+
+Group Normalization divides the channels into groups and computes the mean and variance within each group. Then, it normalizes the input using these statistics and applies an affine transformation with learnable parameters.
+
+The steps for GroupNorm are roughly:
+1. Reshape the input tensor into (N, G, C/G, ...)
+2. Compute mean and variance along the channels and spatial dimensions (i.e., for each group).
+3. Normalize the input using the computed mean and variance.
+4. Apply the affine transformation (gamma and beta) if provided.
+
+The existing implementation uses PyTorch's nn.GroupNorm, which is a standard operator. To replace this with a custom CUDA kernel, I need to implement all these steps efficiently in CUDA.
+
+First, let me outline the CUDA kernel structure. Since GroupNorm involves reduction operations (computing mean and variance), these can be implemented using parallel reduction techniques on the GPU.
+
+Let me think about how to structure the kernel. The key steps are:
+
+1. **Reshaping**: Since the input is of shape (N, C, H, W), and we split C into G groups, each of size C/G. The reshaping is logical, so perhaps we can work with the original memory layout by adjusting indices.
+
+2. **Mean and Variance Calculation**: For each group, we need to compute the mean and variance across all elements in that group (all spatial dimensions and all samples in the batch). Since each group has (C/G) * H * W elements per sample, but across all samples, perhaps we can process this in parallel.
+
+Wait, actually, for GroupNorm, the mean and variance are computed over the dimensions (C/G, H, W), for each group and each sample. Wait, no, the mean and variance are computed over the channels and spatial dimensions, but across all samples? Wait, no, actually, for each sample, the mean and variance are computed per group. So for each group, and each sample, compute the mean and variance over the channels in that group and the spatial dimensions. Wait, actually, the group is divided across the channels. Let me confirm the definition.
+
+From the PyTorch documentation: GroupNorm divides the channels into groups and computes within each group the mean and variance for normalization. The mean and variance are computed over the "C / G * H * W" values. So for each group and each sample, compute the mean and variance over the group's channels and spatial dimensions.
+
+Therefore, for each sample and each group, we have to compute the mean and variance across the spatial dimensions and the group's channels. Then, normalize each element in that group with the mean and variance of that group and sample.
+
+Therefore, the computation can be structured as follows:
+
+For each group in 0..G-1:
+    For each sample in 0..N-1:
+        Compute mean and variance over the group's channels (each group has C/G channels) and spatial dimensions (H and W)
+        Then, normalize each element in that group and sample.
+
+This suggests that the computation can be parallelized over the groups and samples. Let me think of how to structure this in CUDA.
+
+First, the input is of shape (N, C, H, W). Let me denote G as the number of groups.
+
+First, for each group g (0..G-1), and each sample n (0..N-1), we need to compute the mean and variance over the channels in the group (C/G channels) and spatial dimensions.
+
+Let me think of the data layout. Let's assume that the input is stored in a contiguous tensor. The group's data for sample n would be a block of (C/G)*H*W elements. So, for a given group and sample, we can process these elements.
+
+The mean and variance computation can be done as follows:
+
+- For each group and sample, compute sum of all elements in that group's data (sum_x).
+- Then compute sum of squares (sum_x2).
+- The mean is sum_x / count (count is (C/G)*H*W)
+- The variance is (sum_x2 / count) - mean^2
+- Then, for each element, subtract the mean and divide by sqrt(variance + eps), then multiply by gamma and add beta.
+
+The challenge is to compute this efficiently in parallel.
+
+The steps for the kernel:
+
+1. **Compute mean and variance for each group and sample**:
+   - For each group g and sample n, compute sum_x and sum_x2 over the group's elements for that sample.
+   - This can be done via parallel reduction. Each thread block can handle a group and sample, and the threads within the block can process elements in parallel.
+
+2. **Normalize the data**:
+   - Once the mean and variance are computed, each element can be normalized using these values, and then scaled by gamma and beta.
+
+Now, the question is how to structure the CUDA kernel.
+
+First, the input tensor is of shape (N, C, H, W). Let's say the number of groups is G.
+
+First, for each group g, the channels in that group are from (g * C/G) to ( (g+1)*C/G - 1 ). Since C must be divisible by G, we can assume that.
+
+The first thing is to compute for each group g and sample n:
+
+- The number of elements per group per sample is (C//G) * H * W = (C/(G)) * H * W. Let me denote this as "count".
+
+Now, for each group g and sample n, we need to compute sum_x and sum_x2 over the elements in that group for the sample.
+
+An approach to parallelize this:
+
+The computation of sum_x and sum_x2 can be done per group and sample. For each group and sample, we can launch a thread block. Each thread in the block processes a chunk of the elements, accumulating partial sums. Then, we can use a reduction kernel within the block to compute the total sum and sum of squares.
+
+Once we have the mean and variance for each group and sample, we can store them in an array, say, means and variances.
+
+Then, the normalization step can be done by each thread processing an element, computing its group and sample, retrieving the mean and variance, and applying the normalization.
+
+Now, to implement this in CUDA:
+
+First, let me think of the data access patterns.
+
+The input is stored in a 4D tensor (N, C, H, W). The CUDA kernel will need to access elements in this tensor.
+
+To compute the group and sample indices, given a thread's index, perhaps it's better to structure the threads so that each thread block is responsible for a particular group and sample.
+
+Let me outline the steps:
+
+1. **Compute mean and variance for each group and sample**:
+
+   - Launch a grid of blocks where each block corresponds to a (group, sample) pair.
+   - For each block (g, n):
+       - Compute the total number of elements: count = (C // G) * H * W
+       - Use threads in the block to process elements and compute sum_x and sum_x2.
+       - Use a reduction within the block to get the total sum and sum of squares.
+       - Compute mean = sum_x / count
+       - Compute variance = (sum_x2 / count) - mean^2
+       - Store mean and variance in a per-sample, per-group storage.
+
+2. **Normalization**:
+
+   - Launch another kernel where each thread processes an element (n, c, h, w).
+   - For each element, compute its group g = c // (C//G)
+   - Retrieve the mean and variance for group g and sample n.
+   - Compute normalized value: (x - mean) / sqrt(var + eps)
+   - Multiply by gamma[g] and add beta[g], assuming gamma and beta are per group.
+
+Wait, actually, the gamma and beta parameters in GroupNorm are of shape (C,), same as the number of channels. Wait, actually according to PyTorch's GroupNorm documentation, the affine parameters gamma and beta are of shape (C,), where C is the number of channels, same as the input's channel dimension. Wait, that's an important point.
+
+Wait, let me check PyTorch's GroupNorm documentation: 
+
+From PyTorch's documentation for GroupNorm:
+
+"Group Normalization divides the channels into groups and computes within each group the mean and variance for normalization. gamma and beta are learnable per-channel affine parameters computed by the scale and shift arguments."
+
+Wait, actually, the scale and shift parameters (gamma and beta) are per-channel, not per-group. So each channel has its own gamma and beta. Wait, but this might complicate things, as each channel in a group would have different gamma and beta. However, this complicates the normalization step since each element in a group needs to be scaled by its own gamma and beta. But the mean and variance are computed per group and per sample. So the normalization is done per group, but the scaling is per channel.
+
+Hmm, so the normalization is applied per group, but the affine parameters are per channel. So for each channel in a group, the gamma and beta are different, but the mean and variance are shared across all channels in the group.
+
+Therefore, the computation steps are:
+
+1. For each group g and sample n:
+   - Compute mean_gn and var_gn (variance)
+   - For each element in the group's channels and spatial dimensions for sample n:
+       normalized_val = (x - mean_gn) / sqrt(var_gn + eps)
+       then apply gamma_c * normalized_val + beta_c for each channel c in the group.
+
+Therefore, the gamma and beta are applied per channel, but the normalization is per group.
+
+This complicates the kernel because, for each element, after computing the normalized value, we need to multiply by gamma_c and add beta_c, where c is the channel index.
+
+This means that the gamma and beta parameters are per channel, so for each group, the group has (C/G) channels, each with their own gamma and beta.
+
+Therefore, the gamma and beta are of size C.
+
+Therefore, the normalization step requires:
+
+normalized_element = (x - mean_gn) / sqrt(var_gn + eps) * gamma[c] + beta[c]
+
+So, in the normalization kernel, for each element (n, c, h, w), the channel c determines the group (g = c // (C//G)), then we can compute the mean and variance for group g and sample n, then multiply by gamma[c] and add beta[c].
+
+This suggests that in the normalization kernel, each thread needs to compute the group from the channel, look up the mean and variance for that group and sample, then apply the per-channel gamma and beta.
+
+Now, for the CUDA implementation:
+
+First, the kernel for computing the mean and variance.
+
+The parameters required are the input tensor, the gamma and beta parameters (but wait, do they need to be passed here? No, the mean and variance computation doesn't involve gamma and beta. Those are used in the normalization step.)
+
+Wait, actually, the mean and variance computation is independent of gamma and beta. So in the first kernel, we can compute the mean and var for each group and sample, then store them in a tensor.
+
+The mean and variance storage can be a tensor of shape (N, G), but actually, for each group and sample, we need two values (mean and variance). So perhaps a tensor of shape (2, N, G) where the first dimension is 0 for mean and 1 for variance.
+
+Alternatively, two tensors of shape (N, G).
+
+Let me think of the first kernel:
+
+First, the input is a tensor of shape (N, C, H, W). The number of groups is G.
+
+The output of the first kernel is two tensors: means (shape N x G) and vars (shape N x G).
+
+Then, the normalization kernel takes the input, the means, vars, gamma, beta, and produces the output.
+
+But in PyTorch's nn.GroupNorm, the gamma and beta are stored as parameters of the layer. Therefore, in the custom implementation, the ModelNew will have parameters gamma and beta, similar to the original.
+
+Therefore, in the custom implementation:
+
+The custom GroupNorm operator will need to take the input tensor, the gamma, beta, and the number of groups.
+
+Alternatively, the parameters can be passed as part of the function call.
+
+Wait, but when using a custom CUDA operator, the parameters (gamma and beta) must be provided as inputs to the kernel. Therefore, the custom GroupNorm function must accept the input tensor, gamma, beta, num_groups, and possibly other parameters like eps (epsilon for numerical stability).
+
+In the original PyTorch implementation, the eps is a parameter of the GroupNorm layer, so in the custom implementation, we need to include it as well.
+
+Therefore, the custom kernel function will need to take:
+
+- Input tensor
+- Gamma tensor (shape C,)
+- Beta tensor (shape C,)
+- Number of groups (G)
+- Epsilon (eps)
+
+Now, let's structure the code.
+
+First, in the Python code, the ModelNew will replace the GroupNorm layer with parameters gamma and beta, and implement the forward pass using the custom CUDA kernel.
+
+Wait, actually, in PyTorch's GroupNorm, the parameters are part of the module (gamma and beta are learnable parameters stored in the module). Therefore, in the custom implementation, the ModelNew should also have these parameters.
+
+Therefore, the ModelNew class will have a gamma and beta parameter, similar to the original.
+
+Wait, but the original code's Model uses nn.GroupNorm, which already contains the parameters. Therefore, in the ModelNew, to replicate the behavior, we can either:
+
+1. Keep the parameters as part of the model (so the custom kernel uses the model's parameters), or
+
+2. Have the custom kernel take the parameters as input tensors.
+
+Option 1 would require the kernel to access the parameters from the model, but since in the kernel, parameters are passed as tensors, perhaps it's better to pass them as inputs.
+
+Therefore, the custom kernel function will need to accept the input, gamma, beta, num_groups, and eps as inputs.
+
+Therefore, the custom CUDA function signature would be something like:
+
+def groupnorm_cuda(input, gamma, beta, num_groups, eps):
+
+Now, in the CUDA kernel code:
+
+First, let's think about the mean and variance computation kernel.
+
+Let me outline the CUDA kernel steps in code.
+
+First, for the mean and variance computation:
+
+Each block handles a group and a sample. Let's say:
+
+Block dimensions: for each block, blockIdx.x corresponds to group, blockIdx.y corresponds to sample. So the total number of blocks is G * N.
+
+Wait, but the maximum number of blocks in each dimension is limited (e.g., 65535 in CUDA). For G=8 and N=112, total blocks would be 896, which is okay.
+
+Each block (g, n) is responsible for computing the mean and variance for group g and sample n.
+
+Inside the block, the threads can process elements in parallel. For example, each thread in the block can process a chunk of elements in the group's data for that sample.
+
+The group's data for sample n has (C/G)*H*W elements. Let me denote this as count = (C // G) * H * W.
+
+The threads can each process a subset of these elements.
+
+The algorithm for the block:
+
+1. Each thread loads a portion of the elements, computes partial sums for x and x^2.
+
+2. Perform a parallel reduction within the block to accumulate the sums.
+
+3. Compute mean and variance.
+
+4. Write the mean and variance to the output arrays.
+
+The reduction can be done using a standard block-wise reduction method.
+
+For the normalization kernel:
+
+Each element (n, c, h, w) needs to be processed.
+
+The thread can be mapped to the element indices. For example:
+
+Total elements: N * C * H * W.
+
+Each thread can process one element. The thread index can be calculated as:
+
+idx = blockIdx.x * blockDim.x + threadIdx.x
+
+But for higher dimensions, it's better to use a 3D grid or compute indices via thread indices.
+
+Alternatively, we can compute the indices as:
+
+n = idx / (C * H * W)
+
+remainder = idx % (C * H * W)
+
+c = remainder / (H * W)
+
+remainder2 = remainder % (H * W)
+
+h = remainder2 / W
+
+w = remainder2 % W
+
+But this might be inefficient. Alternatively, using 3D thread blocks might be better.
+
+Alternatively, use a 2D grid where blockIdx.x corresponds to N and blockIdx.y corresponds to C*H*W / blockDim.x.
+
+But perhaps it's easier to flatten everything.
+
+Alternatively, use a 1D grid where each thread corresponds to an element.
+
+But given that the input is 4D, the index calculation is manageable.
+
+For each thread processing element (n, c, h, w):
+
+Compute the group g = c // (C_per_group), where C_per_group = C // G.
+
+Then, retrieve the mean and variance for group g and sample n.
+
+Then compute the normalized value, apply gamma[c] and beta[c].
+
+Now, for the implementation steps.
+
+First, the code for the custom CUDA kernels.
+
+First, the CUDA source code.
+
+Let me outline the steps.
+
+First, the CUDA kernel for computing mean and variance.
+
+First, define a kernel that computes mean and variance for each group and sample.
+
+The kernel will take as input:
+
+- input: the input tensor (N, C, H, W)
+- means: output tensor (N, G)
+- vars: output tensor (N, G)
+- num_groups: G
+- C: number of channels
+- H: height
+- W: width
+- eps: epsilon value (for numerical stability)
+
+Wait, but the kernel needs to know the dimensions. Therefore, perhaps the parameters should include the dimensions of the input tensor.
+
+Alternatively, the kernel can compute the strides from the tensor, but that might be more complex. To simplify, perhaps pass the dimensions as arguments.
+
+Alternatively, in the kernel function, we can use input.stride(0), etc., but that requires using ATen in the kernel.
+
+Alternatively, in the Python code, when calling the CUDA function, we can pass the necessary dimensions as arguments.
+
+So, the Python function would be:
+
+def groupnorm_cuda(input, gamma, beta, num_groups, eps):
+
+Inside the CUDA kernel, we need to have access to the dimensions N, C, H, W.
+
+Therefore, perhaps the kernel function should also take these as arguments.
+
+Wait, but in the kernel, we can get the tensor dimensions via the input tensor's size.
+
+Alternatively, pass them as arguments.
+
+To make it manageable, perhaps in the Python code, the function groupnorm_cuda will extract the dimensions and pass them to the CUDA kernel.
+
+Now, let's start writing the CUDA code.
+
+First, the CUDA code for the mean and variance computation kernel.
+
+Kernel 1: compute_mean_var_kernel
+
+Parameters:
+
+- input: const float*
+- means: float*
+- vars: float*
+- N, C, H, W: integers
+- num_groups: G
+- eps: float (but eps is only used in the variance computation?)
+
+Wait, actually, the variance is (E[x^2] - (E[x])^2). The eps is added in the denominator when computing the inverse sqrt. So the variance doesn't need eps here, but when computing the denominator, the variance is used with eps added.
+
+Wait, in the computation of the variance, we can compute variance = (sum_x2/count) - (mean)^2, then when computing the inverse sqrt, we do sqrt(variance + eps).
+
+Therefore, the variance can be stored as variance without adding eps.
+
+Therefore, in the kernel, the variance is stored as variance, and eps is handled in the normalization step.
+
+Thus, the mean and variance kernel doesn't need to know eps.
+
+Now, the kernel code:
+
+First, the block is for group and sample.
+
+Each block corresponds to a group g and sample n.
+
+The blockIdx is arranged such that:
+
+blockIdx.x = group index (0 to G-1)
+
+blockIdx.y = sample index (0 to N-1)
+
+Therefore, the total number of blocks is G*N.
+
+Each block has a number of threads. Let's choose a block size of 256 threads, for example.
+
+In each block, the threads will process the elements of the group's data for that sample.
+
+The number of elements per group per sample is count = (C/G) * H * W.
+
+Let me denote C_per_group = C // G.
+
+Each thread in the block can process a chunk of elements.
+
+The steps:
+
+1. Calculate group g = blockIdx.x
+
+2. Calculate sample n = blockIdx.y
+
+3. Compute the starting channel of the group: c_start = g * C_per_group
+
+4. The elements for this group and sample are located in:
+
+input[n][c][h][w], for c in [c_start, c_start + C_per_group -1], h in [0, H-1], w in [0, W-1]
+
+The total elements are count = C_per_group * H * W.
+
+5. Each thread in the block processes a portion of these elements.
+
+Each thread's index is threadIdx.x, and the number of threads per block is blockDim.x (say 256).
+
+Each thread can process one element, but with count possibly larger than the number of threads, we can have each thread process multiple elements.
+
+Alternatively, use a grid-stride loop.
+
+Alternatively, use a parallel reduction approach.
+
+The standard way to compute sum over elements in a block is to have each thread load a value, accumulate partial sums, then perform a reduction.
+
+First, each thread loads its assigned elements and computes partial sums.
+
+Wait, here's an approach:
+
+First, compute the total count for this group and sample. count = C_per_group * H * W.
+
+Each thread in the block will process a number of elements. Let's say each thread handles (count / blockDim.x) elements, with some remainder.
+
+But since count may be less than blockDim.x, we can use a loop where each thread processes elements in steps.
+
+Alternatively, use the following method:
+
+Initialize shared memory for partial sums.
+
+Each thread reads a chunk of elements, accumulating local sums.
+
+Then perform a block reduction.
+
+This is more efficient for small counts, but for large counts, it might be better to have each thread process multiple elements.
+
+Alternatively, here's a plan:
+
+Each block (g, n) will:
+
+- Compute the total sum_x and sum_x2 for the group and sample.
+
+The steps:
+
+1. Each thread reads a portion of the elements, accumulating into local variables (sum_x and sum_x2).
+
+2. Use a parallel reduction within the block to sum all the partial sums.
+
+3. Write the final mean and variance to the means and vars arrays.
+
+Now, the code.
+
+First, the kernel:
+
+__global__ void compute_mean_var_kernel(
+    const float* input,
+    float* means,
+    float* vars,
+    int N, int C, int H, int W,
+    int num_groups
+) {
+    int g = blockIdx.x;
+    int n = blockIdx.y;
+    int G = num_groups;
+    int C_per_group = C / G;
+    
+    int count = C_per_group * H * W;
+    int c_start = g * C_per_group;
+    
+    // Each thread processes some elements
+    float sum_x = 0.0f;
+    float sum_x2 = 0.0f;
+    
+    for (int idx = threadIdx.x; idx < count; idx += blockDim.x) {
+        // Compute the indices within the group's data
+        // The data is stored as (n, c, h, w)
+        // For the group's data, c ranges from c_start to c_start + C_per_group - 1
+        // The total elements are C_per_group * H * W
+        // The idx is flattened over all elements in this group and sample.
+        // So, we can compute c, h, w from idx:
+        int c_offset = idx / (H * W);
+        int hw_idx = idx % (H * W);
+        int h = hw_idx / W;
+        int w = hw_idx % W;
+        
+        int c = c_start + c_offset;
+        
+        // Get the value from input[n][c][h][w]
+        // Assuming input is stored in (N, C, H, W) order, contiguous
+        int input_offset = n * C * H * W + c * H * W + h * W + w;
+        float x = input[input_offset];
+        
+        sum_x += x;
+        sum_x2 += x * x;
+    }
+    
+    // Now perform block reduction
+    __shared__ float shared_sum_x[256];  // Assuming blockDim.x <= 256
+    __shared__ float shared_sum_x2[256];
+    
+    int tid = threadIdx.x;
+    shared_sum_x[tid] = sum_x;
+    shared_sum_x2[tid] = sum_x2;
+    __syncthreads();
+    
+    // Reduce using binary reduction
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        if (tid < s) {
+            shared_sum_x[tid] += shared_sum_x[tid + s];
+            shared_sum_x2[tid] += shared_sum_x2[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        float mean = shared_sum_x[0] / count;
+        float var = (shared_sum_x2[0] / count) - (mean * mean);
+        // Store to means and vars arrays
+        // The means array is stored as [N][G], so for n and g:
+        int mean_offset = n * G + g;
+        means[mean_offset] = mean;
+        vars[mean_offset] = var;
+    }
+}
+
+Wait, but the storage order of means and vars arrays? Let's say means is a 1D array of size N * G, where for group g and sample n, the index is n*G + g.
+
+Yes.
+
+Now, this kernel requires that the blockDim.x is a power of two? Not necessarily, but the reduction loop should handle any blockDim.x.
+
+Wait, the reduction loop uses s = blockDim.x / 2, then halves each time. This works as long as the blockDim.x is a power of two. If not, the last steps may process some threads, but it's better to use a blockDim that is a power of two.
+
+Therefore, when launching the kernel, we should choose a block size that is a power of two, say 256.
+
+Now, the normalization kernel.
+
+Kernel 2: normalize_kernel
+
+This kernel will process each element, applying the normalization based on the computed means and variances, and the gamma and beta parameters.
+
+Parameters:
+
+- input: const float*
+- output: float*
+- means: const float* (size N*G)
+- vars: const float* (size N*G)
+- gamma: const float* (size C)
+- beta: const float* (size C)
+- N, C, H, W, num_groups, eps
+
+The kernel needs to process each element (n, c, h, w):
+
+Compute:
+
+g = c / (C_per_group)
+
+Then, the mean and var are at means[n * G + g], vars[n * G + g]
+
+Compute the normalized value:
+
+normalized = (x - mean) / sqrt(var + eps)
+
+Then, apply gamma[c] * normalized + beta[c]
+
+The output is stored in output array.
+
+The kernel can be structured as:
+
+__global__ void normalize_kernel(
+    const float* input,
+    float* output,
+    const float* means,
+    const float* vars,
+    const float* gamma,
+    const float* beta,
+    int N, int C, int H, int W,
+    int num_groups,
+    float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Assuming the total elements is N * C * H * W
+    if (idx >= N * C * H * W) return;
+    
+    // Compute indices n, c, h, w
+    int n = idx / (C * H * W);
+    int remainder = idx % (C * H * W);
+    int c = remainder / (H * W);
+    int hw_idx = remainder % (H * W);
+    int h = hw_idx / W;
+    int w = hw_idx % W;
+    
+    int G = num_groups;
+    int C_per_group = C / G;
+    
+    int g = c / C_per_group;
+    
+    // Get mean and var for group g and sample n
+    int mean_var_idx = n * G + g;
+    float mean = means[mean_var_idx];
+    float var = vars[mean_var_idx];
+    float denom = rsqrt(var + eps);
+    
+    // Get the input value
+    int input_offset = n * C * H * W + c * H * W + h * W + w;
+    float x = input[input_offset];
+    
+    float normalized = (x - mean) * denom;
+    float out_val = gamma[c] * normalized + beta[c];
+    
+    output[input_offset] = out_val;
+}
+
+Now, the host function that calls these two kernels.
+
+The host function will need to:
+
+1. Compute the dimensions of the input tensor (N, C, H, W).
+
+2. Allocate temporary storage for means and vars (each of size N * G).
+
+3. Launch the compute_mean_var_kernel.
+
+4. Launch the normalize_kernel.
+
+5. Free the temporary storage.
+
+Now, the host function in CUDA:
+
+extern "C" {
+
+torch::Tensor groupnorm_cuda(
+    torch::Tensor input,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int num_groups,
+    float eps
+) {
+    // Check dimensions
+    TORCH_CHECK(input.dim() == 4, "Input must be 4D");
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+    int G = num_groups;
+    
+    // Check that C is divisible by G
+    TORCH_CHECK(C % G == 0, "Number of channels must be divisible by num_groups");
+    
+    // Allocate output tensor
+    auto output = at::empty_like(input);
+    
+    // Allocate temporary storage for means and vars (each of size N * G)
+    auto means = at::empty({N * G}, input.options());
+    auto vars = at::empty({N * G}, input.options());
+    
+    // Launch compute_mean_var_kernel
+    dim3 block(256);
+    dim3 grid(G, N);  // blockIdx.x = group, blockIdx.y = sample
+    
+    compute_mean_var_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        means.data_ptr<float>(),
+        vars.data_ptr<float>(),
+        N, C, H, W,
+        G
+    );
+    
+    // Launch normalize kernel
+    int total_elements = N * C * H * W;
+    dim3 block_norm(256);
+    dim3 grid_norm( (total_elements + block_norm.x - 1) / block_norm.x, 1 );
+    
+    normalize_kernel<<<grid_norm, block_norm>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        means.data_ptr<float>(),
+        vars.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        N, C, H, W,
+        G,
+        eps
+    );
+    
+    // Check for errors
+    cudaDeviceSynchronize();
+    // Handle errors here, but maybe just let PyTorch handle it
+    
+    return output;
+}
+
+}
+
+Now, in the Python code, we need to load this CUDA code.
+
+The CPU code (if needed) can be a dummy, since we assume CUDA is used.
+
+Therefore, the Python code:
+
+First, define the CUDA source as a string.
+
+Then, load the inline CUDA code.
+
+The code structure would be:
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA source code
+groupnorm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void compute_mean_var_kernel(
+    const float* input,
+    float* means,
+    float* vars,
+    int N, int C, int H, int W,
+    int num_groups
+) {
+    // ... (kernel code from above)
+}
+
+__global__ void normalize_kernel(
+    const float* input,
+    float* output,
+    const float* means,
+    const float* vars,
+    const float* gamma,
+    const float* beta,
+    int N, int C, int H, int W,
+    int num_groups,
+    float eps
+) {
+    // ... (kernel code from above)
+}
+
+extern "C" {
+    torch::Tensor groupnorm_cuda(
+        torch::Tensor input,
+        torch::Tensor gamma,
+        torch::Tensor beta,
+        int num_groups,
+        float eps
+    ) {
+        // ... (host function code from above)
+    }
+}
+"""
+
+# Define CPU source (if needed, but since it's CUDA, maybe not)
+groupnorm_cpu_source = """
+// Dummy CPU implementation (not used here)
+"""
+
+# Load the CUDA code
+groupnorm_module = load_inline(
+    name="groupnorm_cuda",
+    cpp_sources="",
+    cuda_sources=groupnorm_cuda_source,
+    functions=["groupnorm_cuda"],
+    verbose=True
+)
+
+Then, the ModelNew class would be:
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int, num_groups: int):
+        super(ModelNew, self).__init__()
+        self.num_groups = num_groups
+        self.eps = 1e-5  # Assuming default epsilon value, similar to PyTorch
+        self.gamma = nn.Parameter(torch.empty(num_features))
+        self.beta = nn.Parameter(torch.empty(num_features))
+        # Initialize gamma and beta like PyTorch's GroupNorm
+        nn.init.ones_(self.gamma)
+        nn.init.zeros_(self.beta)
+    
+    def forward(self, x):
+        return groupnorm_module.groupnorm_cuda(x, self.gamma, self.beta, self.num_groups, self.eps)
+
+Wait, but the original Model uses nn.GroupNorm, which also has learnable parameters gamma and beta. So in the ModelNew, we need to replicate this by having gamma and beta as parameters.
+
+Therefore, in the __init__ of ModelNew, we create parameters gamma and beta of size num_features (same as the input channels).
+
+The forward function then calls the custom CUDA function, passing gamma, beta, num_groups, and eps.
+
+Wait, but the original Model's get_init_inputs function returns [features, num_groups]. The features is the num_features (number of channels). So when creating the model, it would be initialized with those parameters.
+
+Now, the problem is that the custom kernel requires the gamma and beta tensors to be passed as inputs. Hence, in the ModelNew, they are stored as parameters, so in the forward, they can be accessed via self.gamma and self.beta.
+
+Therefore, the code for ModelNew is as above.
+
+Now, check for possible errors.
+
+First, in the compute_mean_var_kernel, the shared memory arrays:
+
+In the compute_mean_var_kernel, the shared memory is declared as:
+
+__shared__ float shared_sum_x[256];
+
+This assumes that the block size is 256. The block is set to 256 threads. If in the future we change the block size, we need to adjust this. But for now, it's okay.
+
+Another point: in the compute_mean_var_kernel, when calculating c:
+
+int c = c_start + c_offset;
+
+c_offset is the channel offset within the group. Since c_start is the starting channel of the group, and c_offset ranges from 0 to C_per_group - 1, this is correct.
+
+Also, in the input_offset calculation:
+
+input is a 4D tensor (N, C, H, W), so the offset is computed as:
+
+n * C*H*W + c * H*W + h*W + w
+
+This is correct for a contiguous tensor.
+
+In the normalize kernel, the indices are calculated correctly.
+
+Now, the host function:
+
+The host function launches the compute_mean_var_kernel with grid dimensions (G, N). Since blockIdx.x is group and blockIdx.y is sample.
+
+Each block corresponds to a (g, n) pair, so G * N blocks.
+
+The block size is 256 threads per block.
+
+The normalize kernel is launched with a 1D grid, as the elements are processed in a linearized fashion.
+
+The number of blocks is ceil(total_elements / block_size). The block size is 256.
+
+Now, in the host function, after launching the kernels, we call cudaDeviceSynchronize() to ensure completion.
+
+Now, in the Python code, the groupnorm_cuda function is exposed, and the parameters are passed correctly.
+
+Now, check for the following issues:
+
+1. The parameters gamma and beta must be of the same device as the input tensor. Since in PyTorch, the model's parameters are on the same device as the model. So when the model is moved to CUDA, the parameters are also on CUDA.
+
+Therefore, in the forward function, when x is on CUDA (as per the get_inputs() function which returns tensors on CUDA?), the parameters should also be on CUDA.
+
+Wait, in the original get_inputs() function provided, the inputs are generated on the CPU (since get_inputs() uses torch.randn, but in the problem description's example, the inputs are on CUDA. Wait, looking back:
+
+In the problem's given architecture:
+
+The get_inputs() function is:
+
+def get_inputs():
+    x = torch.rand(batch_size, features, dim1, dim2)
+    return [x]
+
+Wait, but the original example had inputs on CUDA. However, in the problem's given code, the inputs are on CPU unless specified. But in the problem's context, since it's a neural network model, the tensors would be moved to CUDA when training on GPU. Therefore, the custom kernel must handle tensors on CUDA.
+
+Therefore, in the ModelNew, the parameters gamma and beta must be on the same device as the input x.
+
+Therefore, in the __init__ of ModelNew, we should initialize them on the appropriate device, but since PyTorch modules automatically handle device placement, perhaps it's okay. Alternatively, when the model is moved to CUDA, the parameters are moved as well.
+
+Therefore, the code should be okay.
+
+Now, another point: the original Model uses nn.GroupNorm, which has an eps parameter. In the custom implementation, the eps is set to 1e-5 by default, same as PyTorch's default. However, the user might have a different eps. To make it compatible, perhaps the ModelNew should accept the eps as a parameter. However, in the problem's given code, the original Model's __init__ does not include eps, so perhaps it's okay to hardcode the default value.
+
+Alternatively, the ModelNew could take an eps parameter. Since the problem's original Model doesn't have it, but to be compatible, perhaps it's better to set it as a class variable.
+
+In the given problem, the original code's Model uses the default GroupNorm parameters (eps=1e-5), so setting it to that is correct.
+
+Now, compiling and running this code should work.
+
+Potential issues to check:
+
+- The dimensions in the compute_mean_var_kernel and normalize_kernel are correctly calculated.
+
+- The shared memory in compute_mean_var_kernel is sufficient (256 elements for 256 threads).
+
+- The block and grid dimensions are correctly set.
+
+- The parameters gamma and beta are correctly passed as tensors in the forward function.
+
+Now, putting all together, the complete code would be as follows:
+
+First, the CUDA kernel code in the Python string, then the ModelNew class.
+
+Now, let's write this in code blocks as per the user's instruction.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# CUDA kernel implementation for GroupNorm
+groupnorm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void compute_mean_var_kernel(
+    const float* input,
+    float* means,
+    float* vars,
+    int N, int C, int H, int W,
+    int num_groups
+) {
+    int g = blockIdx.x;
+    int n = blockIdx.y;
+    int G = num_groups;
+    int C_per_group = C / G;
+    int count = C_per_group * H * W;
+    int c_start = g * C_per_group;
+
+    float sum_x = 0.0f;
+    float sum_x2 = 0.0f;
+
+    for (int idx = threadIdx.x; idx < count; idx += blockDim.x) {
+        int c_offset = idx / (H * W);
+        int hw_idx = idx % (H * W);
+        int h = hw_idx / W;
+        int w = hw_idx % W;
+        int c = c_start + c_offset;
+
+        int input_offset = n * C * H * W + c * H * W + h * W + w;
+        float x = input[input_offset];
+        sum_x += x;
+        sum_x2 += x * x;
+    }
+
+    __shared__ float shared_sum_x[256];
+    __shared__ float shared_sum_x2[256];
+    int tid = threadIdx.x;
+    shared_sum_x[tid] = sum_x;
+    shared_sum_x2[tid] = sum_x2;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum_x[tid] += shared_sum_x[tid + s];
+            shared_sum_x2[tid] += shared_sum_x2[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float mean = shared_sum_x[0] / count;
+        float var = (shared_sum_x2[0] / count) - (mean * mean);
+        int mean_var_idx = n * G + g;
+        means[mean_var_idx] = mean;
+        vars[mean_var_idx] = var;
+    }
+}
+
+__global__ void normalize_kernel(
+    const float* input,
+    float* output,
+    const float* means,
+    const float* vars,
+    const float* gamma,
+    const float* beta,
+    int N, int C, int H, int W,
+    int num_groups,
+    float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * H * W) return;
+
+    int n = idx / (C * H * W);
+    int remainder = idx % (C * H * W);
+    int c = remainder / (H * W);
+    int hw_idx = remainder % (H * W);
+    int h = hw_idx / W;
+    int w = hw_idx % W;
+
+    int G = num_groups;
+    int C_per_group = C / G;
+    int g = c / C_per_group;
+    int mean_var_idx = n * G + g;
+
+    float mean = means[mean_var_idx];
+    float var = vars[mean_var_idx];
+    float denom = rsqrt(var + eps);
+
+    int input_offset = n * C * H * W + c * H * W + h * W + w;
+    float x = input[input_offset];
+    float normalized = (x - mean) * denom;
+    float out_val = gamma[c] * normalized + beta[c];
+    output[input_offset] = out_val;
+}
+
+extern "C" {
+    torch::Tensor groupnorm_cuda(
+        torch::Tensor input,
+        torch::Tensor gamma,
+        torch::Tensor beta,
+        int num_groups,
+        float eps
+    ) {
+        TORCH_CHECK(input.dim() == 4, "Input must be 4D");
+        int N = input.size(0);
+        int C = input.size(1);
+        int H = input.size(2);
+        int W = input.size(3);
+        int G = num_groups;
+        TORCH_CHECK(C % G == 0, "Number of channels must be divisible by num_groups");
+
+        auto output = at::empty_like(input);
+        auto means = at::empty({N * G}, input.options());
+        auto vars = at::empty({N * G}, input.options());
+
+        dim3 block(256);
+        dim3 grid(G, N);
+        compute_mean_var_kernel<<<grid, block>>>(
+            input.data_ptr<float>(),
+            means.data_ptr<float>(),
+            vars.data_ptr<float>(),
+            N, C, H, W,
+            G
+        );
+
+        int total_elements = N * C * H * W;
+        dim3 block_norm(256);
+        dim3 grid_norm((total_elements + block_norm.x - 1) / block_norm.x, 1);
+        normalize_kernel<<<grid_norm, block_norm>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            means.data_ptr<float>(),
+            vars.data_ptr<float>(),
+            gamma.data_ptr<float>(),
+            beta.data_ptr<float>(),
+            N, C, H, W,
+            G,
+            eps
+        );
+
+        cudaDeviceSynchronize();
+        return output;
+    }
+}
+"""
+
+# Load the CUDA code
+groupnorm_module = load_inline(
+    name="groupnorm_cuda",
+    cuda_sources=groupnorm_cuda_source,
+    functions=["groupnorm_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int, num_groups: int):
+        super(ModelNew, self).__init__()
+        self.num_groups = num_groups
+        self.eps = 1e-5  # Default epsilon value
+        self.gamma = nn.Parameter(torch.empty(num_features))
+        self.beta = nn.Parameter(torch.empty(num_features))
+        # Initialize gamma and beta similar to PyTorch's GroupNorm
+        nn.init.ones_(self.gamma)
+        nn.init.zeros_(self.beta)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return groupnorm_module.groupnorm_cuda(x, self.gamma, self.beta, self.num_groups, self.eps)
+```
+
+This code defines a custom CUDA implementation of the GroupNorm layer. The `ModelNew` class uses this implementation, replacing PyTorch's native `nn.GroupNorm` with the optimized kernels. The CUDA kernels handle the mean/variance computation and normalization efficiently using parallel reduction and element-wise operations.

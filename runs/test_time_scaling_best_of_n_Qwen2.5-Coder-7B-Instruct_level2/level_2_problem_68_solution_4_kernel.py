@@ -1,0 +1,81 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_min_subtract_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_min_subtract_kernel(const float* a, const float* b, float* c, float* min_val, float* result, int m, int n, int k, float constant) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+
+        float val = fminf(sum, constant);
+        result[row * n + col] = val - constant;
+        min_val[row * n + col] = val;
+    }
+}
+
+torch::Tensor matmul_min_subtract_cuda(torch::Tensor a, torch::Tensor b, float constant) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+
+    auto c = torch::zeros({m, n}, a.options());
+    auto min_val = torch::zeros({m, n}, a.options());
+
+    const int block_size = 256;
+    const int num_cols_per_block = block_size / sizeof(float);
+    const int num_rows_per_block = block_size / sizeof(float);
+
+    dim3 grid((n + num_cols_per_block - 1) / num_cols_per_block, (m + num_rows_per_block - 1) / num_rows_per_block);
+    dim3 block(num_cols_per_block, num_rows_per_block);
+
+    matmul_min_subtract_kernel<<<grid, block>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), min_val.data_ptr<float>(), c.data_ptr<float>(), m, n, k, constant);
+
+    return c;
+}
+"""
+
+matmul_min_subtract_cpp_source = (
+    "torch::Tensor matmul_min_subtract_cuda(torch::Tensor a, torch::Tensor b, float constant);"
+)
+
+# Compile the inline CUDA code for matrix multiplication, minimum, and subtraction
+matmul_min_subtract = load_inline(
+    name="matmul_min_subtract",
+    cpp_sources=matmul_min_subtract_cpp_source,
+    cuda_sources=matmul_min_subtract_source,
+    functions=["matmul_min_subtract_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, constant):
+        super(ModelNew, self).__init__()
+        self.matmul_min_subtract = matmul_min_subtract
+
+    def forward(self, x):
+        return self.matmul_min_subtract.matmul_min_subtract_cuda(x, x.new_zeros(out_features, in_features), constant)
+
+if __name__ == "__main__":
+    batch_size = 128
+    in_features = 16384
+    out_features = 16384
+    constant = 2.0
+
+    model = ModelNew(in_features, out_features, constant)
+    inputs = get_inputs()
+    outputs = model(inputs[0])
+    print(outputs.shape)

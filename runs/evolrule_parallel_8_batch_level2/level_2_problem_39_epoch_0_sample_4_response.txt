@@ -1,0 +1,637 @@
+You may also replace some of the PyTorch modules (like nn.Linear) with custom CUDA kernels if you can get a better performance. 
+
+You can assume that the input tensors are contiguous in the format PyTorch expects, so you don't have to handle strides or non-contiguous memory. 
+
+Make sure that the optimized code has the same inputs and outputs as the original. 
+
+The batch normalization operator is a prime target for optimization. It's known that the batch normalization can be fused with the previous matrix multiplication and scaling operations. Let me think about how to approach this optimization.
+
+First, I need to understand the original model's operations step by step:
+
+1. The model performs a matrix multiplication (gemm) using nn.Linear.
+2. Scales the result by multiplying with a learnable parameter (scale).
+3. Applies batch normalization (nn.BatchNorm1d).
+
+The goal is to combine these operations into a single kernel to reduce memory bandwidth and kernel launch overhead.
+
+BatchNorm formula: 
+
+y = (x - mean) / sqrt(var + eps) * gamma + beta
+
+Where x is the input to the batch norm, and gamma and beta are learnable parameters of batch norm. The mean and variance are computed over the batch.
+
+But in our case, the input to batch norm is already scaled by the 'scale' parameter. Let me see if I can fuse the scaling and batch norm steps.
+
+Wait, actually, the sequence is:
+
+Original steps:
+
+x = gemm(x) → this is a linear layer, which is a matrix multiply followed by a bias add. Wait, no: nn.Linear includes a bias by default. Wait in the original code, the Model's __init__ has self.gemm = nn.Linear(in_features, out_features). So the gemm includes a weight matrix W and a bias term b. So the gemm computes x * W^T + b.
+
+Then the next step is x = x * self.scale. The scale is a parameter of shape (out_features,). Since the batch dimension is first (batch_size, in_features), after the linear layer, the output is (batch_size, out_features). So multiplying by self.scale (shape (out_features,)) would be a per-element multiplication with broadcasting.
+
+Then batch norm is applied over the features (since it's 1d, the batch norm is over the batch dimension for each feature). 
+
+The idea is to fuse the gemm (matrix multiply and bias), the scaling, and the batch norm into a single kernel. That way, we can compute all these steps in a single pass over the data, reducing memory traffic and kernel launch overhead.
+
+Alternatively, perhaps even fuse the batch norm into the matrix multiplication step, since batch norm can be expressed in terms of the mean and variance, which are computed across the batch. 
+
+Let me think step by step:
+
+First, let's note that the batch norm computation requires computing the mean and variance of each feature across the batch. Since the batch norm is part of the forward pass, we need to compute these statistics on the fly during the forward pass. So, the batch norm step inherently requires some reduction operations (summing over the batch dimension to compute mean and variance).
+
+Fusing the gemm, scaling, and batch norm into a single kernel would involve:
+
+1. Performing the matrix multiply (x @ W^T) + b (the linear layer).
+2. Multiply by the scale parameter (element-wise).
+3. Compute the mean and variance over the batch for each feature.
+4. Apply the batch normalization formula using those computed mean and variance, along with the gamma and beta parameters of the batch norm layer.
+
+However, steps 3 requires reductions, which are challenging to do efficiently in a fused kernel. However, perhaps we can compute the intermediate steps in a way that can be efficiently fused.
+
+Alternatively, maybe we can compute all the necessary terms in a way that allows us to combine the operations.
+
+Wait, perhaps it's possible to combine the scaling and batch norm steps first before the matrix multiply? Probably not, since the scaling is applied after the matrix multiply. Hmm.
+
+Alternatively, perhaps we can precompute some terms.
+
+Wait, let's write out the equations step by step.
+
+Let me denote:
+
+Let x_in be the input to the model.
+
+First step: gemm (linear layer):
+
+h = x_in * W^T + b (where * is matrix multiplication). Wait, in PyTorch, the linear layer is x_in @ W.t() + b, where W is stored as (out_features, in_features).
+
+Then scaling:
+
+scaled_h = h * scale (element-wise multiplication with scale of shape (out_features,))
+
+Then batch norm:
+
+y = batch_norm(scaled_h)
+
+The batch norm formula is:
+
+y = (scaled_h - mean) / sqrt(var + eps) * gamma + beta
+
+where mean and var are computed per feature over the batch.
+
+So the entire computation is:
+
+y = [ ( (x_in @ W^T + b) * scale - mean ) / sqrt(var + eps) ) ] * gamma + beta
+
+But the mean and var are computed from scaled_h, which is (h * scale).
+
+Hmm. To fuse these steps into a single kernel, perhaps we can compute all the intermediate terms in a way that allows us to avoid storing intermediate tensors.
+
+But the challenge is that the mean and variance depend on the scaled_h tensor. To compute the mean and variance, we have to first compute the scaled_h tensor, then compute the mean and variance across the batch dimension.
+
+However, if we can compute the scaled_h's mean and variance while performing the matrix multiplication and scaling, that could be possible.
+
+Alternatively, perhaps we can compute the mean and variance of h * scale, but given that h = x_in @ W^T + b, and the scale is applied element-wise, then scaled_h = (x_in @ W^T + b) .* scale.
+
+Wait, the scale is a vector of shape (out_features,), so each element of h (which has shape (batch_size, out_features)) is scaled by the corresponding element in scale. So scaled_h[:, j] = h[:,j] * scale[j].
+
+Therefore, the mean of scaled_h over the batch dimension is:
+
+mean_scaled_h[j] = (sum_{i=1 to batch_size} scaled_h[i,j}) / batch_size
+
+Similarly, the variance is the average of (scaled_h[i,j] - mean_scaled_h[j])^2 over i.
+
+The problem is that these reductions (summing over the batch) are necessary for the batch norm, and they can't be avoided.
+
+Therefore, to fuse the entire computation into a single kernel, we need to:
+
+1. Compute h = x_in @ W^T + b
+2. Multiply by scale to get scaled_h
+3. Compute the mean and variance of scaled_h over the batch dimension
+4. Normalize scaled_h using mean and variance
+5. Multiply by gamma and add beta
+
+But steps 3 requires a reduction over the batch, which is a collective operation. These reductions can be done in parallel for each feature, but they are separate from the main computation.
+
+To handle this in a fused kernel, perhaps the approach is:
+
+- First, compute the matrix multiply and add bias, then multiply by scale. But during this process, we also accumulate the necessary sums (sum of scaled_h and sum of scaled_h squared) for each feature, to compute mean and variance.
+
+Once those sums are done, compute mean and variance, then apply the normalization and scaling by gamma and beta.
+
+This way, all steps except the final normalization (which requires mean and variance) can be done in a single kernel pass, and then the normalization is done in another kernel pass. Alternatively, perhaps we can compute the mean and variance in a separate kernel first, then do the rest in another kernel.
+
+Wait, but the batch norm requires the mean and variance before applying the normalization. So the computation must be:
+
+Compute scaled_h (step 2) first, then compute mean and variance (step 3), then compute step 4 and 5.
+
+Thus, the minimal approach would be to perform the matrix multiply and scaling in one kernel, then compute the reductions for mean and variance in another kernel, then apply normalization in a third kernel. However, this might not save much compared to the original code which does the operations in sequence, but perhaps combining some steps can reduce overhead.
+
+Alternatively, maybe we can compute the matrix multiply, scaling, and accumulate the sums in a single kernel, then compute the mean and variance, then apply the normalization and scaling by gamma and beta in another kernel.
+
+This way, instead of having multiple intermediate tensors (h, scaled_h), we can compute the necessary sums on the fly.
+
+Let me outline the plan:
+
+First kernel:
+
+For each element (i, j) in the output tensor:
+
+Compute h_ij = x_in[i] @ W^T[j] + b[j]
+
+Then scaled_h_ij = h_ij * scale[j]
+
+During this computation, accumulate:
+
+sum_scaled_h_j += scaled_h_ij (for each j)
+
+sum_scaled_h_squared_j += scaled_h_ij^2 (for each j)
+
+These accumulations can be done using atomic operations or using a reduction method in CUDA.
+
+Once this first kernel is done, we can compute the mean and variance for each feature j:
+
+mean_j = sum_scaled_h_j / batch_size
+
+var_j = (sum_scaled_h_squared_j / batch_size) - mean_j^2
+
+Then, the normalization:
+
+normalized_j = (scaled_h_ij - mean_j) / sqrt(var_j + eps)
+
+Then, the final output is normalized_j * gamma[j] + beta[j]
+
+So the second kernel would handle the normalization and scaling by gamma and beta.
+
+This approach reduces the number of intermediate tensors (since scaled_h isn't stored, only its sum and sum of squares are needed), but requires careful implementation of the first kernel to handle the accumulation.
+
+Wait, but scaled_h is needed to compute the output, so we can't avoid storing scaled_h. Wait no, actually:
+
+Wait the scaled_h is needed for computing the normalization. Because the normalized value is (scaled_h_ij - mean_j)/sqrt(var + eps). Therefore, we need scaled_h_ij for each element, so scaled_h must be stored as an intermediate tensor. So actually, the first kernel would compute h and scaled_h, and accumulate the sums. So we still need to store scaled_h.
+
+Alternatively, can we compute the normalized value without storing scaled_h?
+
+Wait let's see:
+
+Let me write the final output step by step:
+
+y_ij = [ (scaled_h_ij - mean_j) / sqrt(var_j + eps) ] * gamma_j + beta_j
+
+But scaled_h_ij = (h_ij) * scale_j = (x_in[i] @ W^T[j] + b_j) * scale_j
+
+So substituting:
+
+y_ij = [ ( (x_in[i] @ W^T[j] + b_j) * scale_j - mean_j ) / sqrt(var_j + eps) ) ] * gamma_j + beta_j
+
+Hmm. So if we can compute this expression without storing scaled_h, but compute scaled_h_ij on the fly during the normalization step, then we can avoid storing scaled_h. But that would require recomputing h_ij, which is the result of the matrix multiply and bias. However, that computation could be expensive, as it requires re-doing the matrix multiply for each element, which is O(in_features) operations per element. Since in_features is 4096, and the output is 4096 features, this would be 4096*4096 = ~16 million operations per batch element, which is way too expensive. So that's not feasible.
+
+Therefore, we must store scaled_h_ij. So we need to have an intermediate tensor for scaled_h.
+
+Therefore, the first kernel must compute h and scaled_h, and accumulate the sums needed for the mean and variance.
+
+Therefore, the first kernel would do the matrix multiply with bias, multiply by scale, store the scaled_h tensor, and accumulate the sums for mean and variance.
+
+The second kernel would compute the mean and variance (using the accumulated sums), then compute the normalization and apply gamma and beta.
+
+This would reduce the number of memory writes and reads, but how much? Let's see:
+
+Original steps:
+
+1. gemm: compute h = x_in @ W^T + b → stored in h
+2. scaled_h = h * scale → stored in scaled_h
+3. compute mean and var over batch → need scaled_h
+4. batch norm step → compute normalized, then apply gamma and beta → stored as output.
+
+In the fused approach:
+
+1. Compute h and scaled_h in a single kernel (since scaled_h is h * scale, it's just an element-wise multiplication, which can be done in the same loop as the matrix multiply and bias addition. Wait, actually, the matrix multiply and bias addition gives h, then multiplying by scale is an element-wise operation. So if we compute h first, then the scaling is straightforward. But the scaling can be done immediately after computing h_ij. Since h is computed element-wise (for each output element), we can immediately apply the scale and store scaled_h_ij.
+
+Wait, the matrix multiply for h is:
+
+h_ij = sum_{k} x_in[i, k] * W[j, k] + b[j]
+
+Once that is computed, scaled_h_ij = h_ij * scale[j]
+
+Therefore, the scaling can be done right after computing h_ij, so in the same kernel that computes h.
+
+Therefore, the first kernel can compute h_ij, then scaled_h_ij, store scaled_h_ij in the output tensor (which can be the final tensor, but we need the intermediate scaled_h for computing the mean and var), but actually, to compute the mean and var, we need the scaled_h tensor. So the scaled_h must be stored.
+
+Therefore, the first kernel does:
+
+Compute scaled_h tensor, and accumulate the sums for mean and variance.
+
+Wait but how to accumulate the sums. For each thread, they can process a block of elements and accumulate partial sums, then those partial sums are reduced to a per-feature total.
+
+This requires a reduction over the batch dimension for each feature.
+
+In CUDA, this can be done with shared memory or using atomicAdd for the sums. Let's think about how to structure this.
+
+Alternatively, perhaps the first kernel can compute scaled_h and also compute the per-feature sums in a separate buffer.
+
+Wait, here's a possible approach:
+
+First, we can launch a kernel to compute the matrix multiply and scale, and also accumulate the sum and sum_squared for each feature.
+
+The kernel would process each element (i, j) of the scaled_h tensor.
+
+For each thread, it computes scaled_h_ij, then adds scaled_h_ij to a per-feature sum array (sum_scaled_h[j]), and adds scaled_h_ij squared to another per-feature array (sum_squared_scaled_h[j]).
+
+The problem is that multiple threads will be accessing the same elements of sum_scaled_h and sum_squared_scaled_h. So this requires atomic operations, which can be slow. Alternatively, use a reduction approach with shared memory.
+
+Let me think of the dimensions:
+
+The input is batch_size=16384, in_features=4096, out_features=4096.
+
+The scaled_h tensor has size (16384, 4096).
+
+The sum_scaled_h is of size (4096,), each element is the sum over the batch dimension (i) of scaled_h[i][j].
+
+Similarly for sum_squared_scaled_h.
+
+To compute these sums efficiently:
+
+Perhaps, for each feature j, we can have a thread block that handles all the batch elements for that feature. For example, a block for feature j, with 16384 threads, each thread computes scaled_h[i][j] for i = thread index. Then each thread can add their value to the sum and sum_squared for j. But with 4096 features, this would require 4096 blocks, each with 16384 threads. However, 16384 threads per block may be too many (max threads per block is 1024 in some architectures). So that might not be feasible.
+
+Alternatively, use a grid where each block handles a set of features. For example, each block could handle 32 features, and each thread in the block handles a batch element.
+
+Alternatively, use a tiled approach where each thread computes multiple elements.
+
+Alternatively, split the computation into two steps:
+
+1. Compute scaled_h and accumulate the sums using a tiled approach.
+
+Let me consider the matrix multiplication first. The gemm (matrix multiply) is the most computationally intensive part here. The rest (scaling, accumulating sums) are much less expensive.
+
+Wait, the gemm is O(batch_size * in_features * out_features) operations. With batch_size=16384, in_features=4096, out_features=4096, that's 16384 * 4096 * 4096 = ~274 billion operations, which is way too big. Wait, that can't be right. Wait, no, actually, the matrix multiplication for a single batch element is in_features * out_features operations. So for the entire batch, it's batch_size * in_features * out_features.
+
+Wait 16384 * 4096 * 4096 is indeed a huge number. That might not be feasible. Wait, but in the original code, the nn.Linear layer is a fully connected layer. So the computation is x @ W^T + b. Here x is (batch_size, in_features), W is (out_features, in_features), so the matrix multiply is O(batch_size * out_features * in_features). Which for 16384 *4096 *4096 is 274,877,906, 944 operations. That's way too large for a GPU. Perhaps the user made a mistake in the problem setup, but assuming it's correct, proceeding.
+
+Given that, the gemm is the most expensive part. So the fused kernel must handle this efficiently.
+
+Alternatively, perhaps we can compute the gemm using a standard implementation (like cuBLAS), and then perform the rest of the steps in custom kernels. But the user wants to replace PyTorch operators with custom CUDA kernels, so perhaps the gemm can be fused with scaling and the batch norm steps.
+
+Alternatively, use cuBLAS for the matrix multiplication, then handle the rest in custom kernels. But that might be acceptable if the goal is to optimize the batch norm part.
+
+Alternatively, perhaps the fusion is worth it for the batch norm, even if the gemm is done via cuBLAS.
+
+Alternatively, perhaps the user expects to fuse the scaling and batch norm with the gemm in a custom kernel. Let's proceed.
+
+Back to the kernel design.
+
+First, let's consider that the matrix multiply is the most expensive part. To compute it efficiently, we can use a tiled approach with shared memory, similar to the standard matrix multiplication kernel. But combining that with the scaling and the sum accumulation complicates things.
+
+Alternatively, let's see if we can structure the kernel to compute the gemm in a way that allows us to also compute the scaled_h and accumulate the sums.
+
+First, compute h_ij = x_in[i] @ W^T[j] + b[j]
+
+Then, scaled_h_ij = h_ij * scale[j]
+
+Then, sum_scaled_h[j] += scaled_h_ij
+
+sum_squared_scaled_h[j] += scaled_h_ij^2
+
+Finally, store scaled_h_ij in the output.
+
+The problem is that the sum and sum_squared arrays are per-feature, so each thread must be able to contribute to the correct feature's sum.
+
+In a standard matrix multiply kernel, each thread computes a block of elements (i,j) using shared memory tiles. For example, each thread processes a tile of the matrix, and writes to global memory.
+
+But for each h_ij, we need to compute scaled_h_ij, then add to sum_scaled_h[j] and sum_squared_scaled_h[j].
+
+This could be done as follows:
+
+Each thread computes h_ij, then scaled_h_ij, then writes scaled_h_ij to the output array.
+
+Additionally, the thread must accumulate scaled_h_ij into a per-feature sum. To do this efficiently, perhaps each thread can write their scaled_h_ij to a shared memory buffer for their feature j, then perform a reduction in shared memory for each feature's batch elements.
+
+Wait, but the batch dimension is huge (16384). So for each feature j, the batch size is 16384 elements. That's a lot to handle in shared memory.
+
+Alternatively, since the batch dimension is processed in parallel, perhaps each thread can compute multiple elements in the batch for a given feature.
+
+Alternatively, let's think of the problem in terms of the kernel grid and blocks.
+
+Suppose we launch a grid of threads where each thread is responsible for a particular (i, j) element. For each (i,j):
+
+1. Compute h_ij via the matrix multiply (sum_{k} x_in[i][k] * W[j][k] ) + b[j]
+
+2. scale it by scale[j] to get scaled_h_ij
+
+3. Store scaled_h_ij into the scaled_h array at (i,j)
+
+4. Accumulate scaled_h_ij to sum_scaled_h[j]
+
+5. Accumulate scaled_h_ij squared to sum_squared_scaled_h[j]
+
+The problem is steps 4 and 5. Each thread is writing to a global memory location (sum_scaled_h[j] and sum_squared_scaled_h[j]) which can lead to race conditions. So we need to use atomic operations, but atomics can be slow for large arrays.
+
+Alternatively, each block can handle a subset of features, and within a block, threads can handle different batch elements for those features. For example:
+
+- Let each block handle a single feature j. The block has 16384 threads (one per batch element), each thread computes scaled_h[i][j] for their batch index i, then adds it to the feature's sum and sum_squared.
+
+But the number of threads per block is limited (e.g., max 1024 on many GPUs). So for 16384 batch elements, this is not feasible. So perhaps split the batch into chunks.
+
+Alternatively, have a block handle a feature j, and each thread in the block handles a chunk of the batch. For example, if the block has 1024 threads, each thread handles 16 elements (since 16384 / 1024 = 16). So each thread would loop over their 16 batch elements, compute scaled_h for each, accumulate the sums.
+
+This could work. Let me outline this approach:
+
+For each feature j:
+
+- Launch a block for feature j.
+
+- The block has N threads (e.g., 1024 threads).
+
+- Each thread handles (batch_size / N) elements of the batch.
+
+- For each batch element i assigned to the thread:
+
+    - Compute h_ij via the matrix multiply. But this requires access to x_in[i] and W[j].
+
+    However, computing h_ij for a single feature j and multiple batch elements i would require for each i in the thread's batch indices:
+
+        h_ij = (dot product of x_in[i] and W[j]) + b[j]
+
+    But the dot product for each i and j requires iterating over all in_features elements (4096 terms), which is computationally expensive.
+
+Wait, this is the crux of the problem. To compute h_ij for a single feature j across all batch elements i would require O(in_features * batch_size) operations per feature. With in_features=4096 and batch_size=16384, that's 4096 * 16384 = ~66 million operations per feature. With 4096 features, that's 268 billion operations. This is way too much.
+
+Therefore, this approach is not feasible. The matrix multiply is too expensive to compute per feature in this way.
+
+Hence, the initial approach of trying to fuse the gemm with the scaling and batch norm steps is computationally infeasible because the matrix multiply is too expensive when structured this way.
+
+Therefore, perhaps we need to rethink the approach.
+
+Alternative idea: Instead of fusing the gemm, scaling, and batch norm into a single kernel, let's see if we can at least fuse the scaling and batch norm steps.
+
+The scaling is a simple element-wise multiplication, and the batch norm requires computing mean and variance. Maybe we can combine these into a single kernel that takes the output of the gemm (h) and computes the scaled_h, then computes the mean and variance, then applies batch norm.
+
+This would save one intermediate tensor (scaled_h) if we can compute the batch norm directly from h and scale, but still, the computation steps remain.
+
+Alternatively, perhaps the scaling can be incorporated into the batch norm parameters. Let me see:
+
+The scaled_h is h * scale. The batch norm formula is:
+
+y = (scaled_h - mean)/sqrt(var + eps) * gamma + beta
+
+We can rewrite this as:
+
+y = [(h * scale - mean) / sqrt(var + eps)] * gamma + beta
+
+Let me see if we can combine the scale with the gamma and beta terms.
+
+Suppose we let gamma_new = gamma * scale, then:
+
+y = (h - mean/scale) / sqrt(var/scale² + eps) * gamma_new + beta - (mean / scale) * gamma_new / sqrt(...) ?
+
+Hmm, not sure if this helps.
+
+Alternatively, perhaps we can precompute some terms. Since scale is a parameter, and gamma and beta are batch norm parameters, maybe we can combine them into new parameters during initialization, but that might not help with the computation.
+
+Alternatively, the scaling and batch norm can be combined in a single kernel.
+
+Let me think of the steps after the gemm:
+
+Given h = gemm(x), compute scaled_h = h * scale, then compute mean and var of scaled_h over the batch, then apply batch norm.
+
+This can be done in two steps:
+
+1. Compute scaled_h and accumulate sums for mean and variance.
+
+2. Compute mean and variance, then normalize scaled_h and apply gamma and beta.
+
+This would be two kernels: one to compute scaled_h and accumulate the sums, another to compute the normalization.
+
+Alternatively, do all of this in a single kernel, but that requires storing scaled_h and also accumulating the sums.
+
+Wait, but in a single kernel for scaled_h:
+
+- For each element (i,j):
+
+    scaled_h_ij = h_ij * scale_j
+
+    add scaled_h_ij to sum_scaled_h[j]
+
+    add scaled_h_ij^2 to sum_squared_scaled_h[j]
+
+But this requires writing to global memory for scaled_h and also accumulating to global arrays for the sums. The problem is that the scaled_h is needed as an input to the normalization step, so it must be stored.
+
+Thus, the first kernel computes scaled_h and the sums, the second computes mean and variance, then the third kernel applies the normalization.
+
+This reduces the number of kernels compared to the original approach (which would be gemm, scaling, batch norm), but perhaps still allows some speedup by reducing memory traffic.
+
+Alternatively, the scaling can be done in the same kernel as the gemm. Since scaling is an element-wise multiplication by scale[j], which is a per-feature parameter, this can be done immediately after computing h_ij in the gemm kernel.
+
+Thus, the gemm kernel can be modified to also compute scaled_h and accumulate the sums needed for batch norm.
+
+This way, the gemm kernel does three things:
+
+1. Compute h_ij = x @ W^T + b (matrix multiply with bias)
+
+2. Scale h_ij by scale[j] to get scaled_h_ij
+
+3. Accumulate scaled_h_ij and scaled_h_ij^2 into per-feature sums (sum_scaled_h and sum_squared_scaled_h)
+
+Additionally, store scaled_h_ij in the output tensor (scaled_h).
+
+Thus, the gemm kernel becomes more complex, but avoids an extra kernel for scaling and accumulating.
+
+This approach reduces the number of kernels, but requires integrating the scaling and sum accumulation into the gemm kernel.
+
+Given that the matrix multiply is the most computationally intensive part, this may be feasible if the additional operations (scaling and accumulating) are negligible in terms of computation time.
+
+Now, let's think about implementing this in CUDA.
+
+First, the matrix multiply part. The standard approach for a general matrix multiply is to use a tiled kernel with shared memory. However, in this case, the matrix multiply is between x (batch_size x in_features) and W (out_features x in_features), resulting in h (batch_size x out_features).
+
+Wait, the dimensions:
+
+x has shape (B, M), where B=batch_size=16384, M=in_features=4096
+
+W has shape (N, M), where N=out_features=4096
+
+Therefore, the matrix multiply is x @ W^T → which is (B, N), since W^T is (M, N).
+
+Thus, each element h_ij is the dot product of x[i] and W[j], plus bias[j].
+
+Therefore, the standard approach for this matrix multiply would be to have a kernel that for each thread block, handles a tile of the output matrix.
+
+However, given the large dimensions (B=16384, M=4096, N=4096), this may be challenging, but let's proceed.
+
+The standard tiled matrix multiply approach uses a block of threads to compute a tile of the output matrix. Each block is responsible for a block of rows (B dimension) and columns (N dimension), but given the large B, it's more efficient to process over the M dimension.
+
+Wait, perhaps it's better to use a batched matrix multiply approach. However, since the batch is in the first dimension, and we're doing x @ W^T, which is a standard matrix multiply between x and W^T.
+
+Alternatively, for each output element h_ij, we can compute it as:
+
+h_ij = sum_{k=0 to M-1} x[i][k] * W[j][k] + b[j]
+
+To compute this efficiently in parallel, we can use a grid of threads where each thread is responsible for a particular i and j.
+
+But with B*N threads (16384*4096 = ~65 million threads), this is too many for a GPU's thread limit.
+
+Therefore, we need a more efficient parallelization strategy.
+
+The standard approach for large matrices is to use a tiled approach where each thread block handles a tile of the output matrix (in terms of rows and columns), and each thread computes a single element within the tile.
+
+Alternatively, for a matrix multiply between A (BxM) and B (MxN), the standard kernel uses blocks of (block_size, block_size), but in this case, the matrices are very large.
+
+Alternatively, perhaps we can compute the gemm using cuBLAS, which is optimized, and then handle the scaling and batch norm steps in custom kernels.
+
+However, the problem requires replacing PyTorch operators with custom CUDA kernels, so perhaps the gemm can be done via a custom kernel, but fused with scaling and batch norm steps.
+
+Alternatively, let's proceed with the assumption that we can write a custom gemm kernel with scaling and sum accumulation.
+
+But given the size, this might be challenging, but let's try to outline it.
+
+First, the kernel will process tiles of the output matrix. Let's say the tile size is 16x16 (for rows and columns).
+
+The kernel would be launched with grid dimensions based on the tile size.
+
+However, in this case, the rows are B=16384, and columns N=4096. So for a tile size of 16x16, the grid would have (16384/16, 4096/16) blocks, which is about (1024, 256) blocks. Each block would handle a 16x16 tile of the output matrix.
+
+Wait, but the rows are along the batch dimension. Hmm, actually, in this case, the output matrix h is of size B x N.
+
+Wait, perhaps the rows are the batch dimension and columns are the features (N). So each element h_ij is row i, column j.
+
+The kernel would need to compute each h_ij.
+
+Alternatively, each thread block can handle a block of rows and columns, e.g., 16 rows and 16 columns.
+
+Each thread in the block handles one element in the block's tile.
+
+The matrix multiplication can be tiled as follows:
+
+Each block computes a tile of size block_rows x block_cols in the output matrix.
+
+Each thread in the block computes a single element in this tile.
+
+To compute h_ij for a particular i and j (within the tile), the thread would loop over the tiles of the input matrices, accumulating the dot product.
+
+But this is the standard approach.
+
+However, integrating the scaling and the sum accumulation complicates things.
+
+Alternatively, after computing h_ij, the thread can immediately multiply by scale[j] to get scaled_h_ij.
+
+Then, the thread can contribute scaled_h_ij to the per-feature sum and sum_squared.
+
+But the problem is that for each j, the sum_scaled_h[j] and sum_squared_scaled_h[j] must be accumulated across all i (batch elements).
+
+Therefore, for each j, we need to sum over all i scaled_h_ij.
+
+So for each thread computing h_ij (for a particular i and j), we can add scaled_h_ij to a per-block shared memory array for that j, then after all threads in the block have done their computations, perform a reduction in shared memory for each j in the block's tile.
+
+Then, write the accumulated partial sums to global memory.
+
+This way, the per-feature sums can be computed in parallel across blocks.
+
+This is similar to a parallel reduction.
+
+So here's a possible approach for the kernel:
+
+1. The kernel is launched with a grid of blocks, each handling a tile of the output matrix (block_rows x block_cols).
+
+2. Each block has a shared memory array to accumulate partial sums for the features in its tile.
+
+3. For each element in the tile (i,j):
+
+    a. Compute h_ij = dot product of x[i] and W[j] + b[j]
+
+    b. scaled_h_ij = h_ij * scale[j]
+
+    c. Store scaled_h_ij to global memory (output array)
+
+    d. Add scaled_h_ij to the block's shared memory array for feature j.
+
+    e. Add scaled_h_ij squared to another shared memory array for sum_squared.
+
+4. After processing all elements in the tile, each block reduces the shared memory arrays per feature j to get the block's contribution to the global sums.
+
+5. Each block writes its partial sums to global memory (sum_scaled_h and sum_squared_scaled_h arrays).
+
+Then, after all blocks have run, we can perform a final reduction over the partial sums to get the total sums for each feature.
+
+This final reduction could be done in another kernel or using atomic operations.
+
+However, the final reduction step is necessary to combine the partial sums from all blocks.
+
+This approach requires:
+
+- A shared memory buffer in each block for the partial sums and partial squared sums for the features in its tile.
+
+- Each block's tile must cover a subset of the features (columns), so that each feature is handled by exactly one block.
+
+Wait, to ensure that each feature j is handled by exactly one block, the blocks must partition the features (columns) among themselves. Therefore, the grid's columns (in terms of features) must be partitioned into chunks assigned to each block.
+
+This requires careful grid setup.
+
+Let me try to outline the kernel parameters.
+
+Suppose the block dimensions are set to handle block_rows=16 (rows of the output matrix, corresponding to batch elements) and block_cols=16 (columns of the output matrix, corresponding to features).
+
+The number of blocks in the grid would be:
+
+grid_rows = (B + block_rows - 1) / block_rows → (16384 + 15)/16 = 1024
+
+grid_cols = (N + block_cols - 1) / block_cols → (4096 + 15)/16 = 256
+
+Each block is responsible for a tile of size block_rows x block_cols in the output matrix.
+
+Each block processes a tile starting at (block_row_start, block_col_start).
+
+For each feature j in the block's column range (block_col_start to block_col_start + block_cols -1):
+
+    The block is responsible for accumulating the scaled_h contributions for feature j from all batch elements in its row range.
+
+Therefore, for each tile's feature j, the block can accumulate the scaled_h values from its batch rows.
+
+The shared memory in the block would need to store partial sums for each feature in its column range.
+
+The size of the shared memory needed per block would be:
+
+shared_sums = array of size block_cols (for each feature in the tile's columns)
+
+shared_squared_sums = array of size block_cols
+
+Additionally, to store the intermediate scaled_h values during computation (but maybe not necessary if we can compute and accumulate on the fly).
+
+Wait, actually, when computing h_ij, the thread can immediately compute scaled_h_ij and add it to the shared memory sums.
+
+Therefore, for each thread in the block:
+
+- The thread's position in the block is (thread_row, thread_col) within the block's tile.
+
+- The global indices are:
+
+    i = block_row_start + thread_row
+
+    j = block_col_start + thread_col
+
+- The thread computes h_ij via the dot product.
+
+Wait, but the dot product requires iterating over all in_features elements (M=4096). That's 4096 multiplications and additions per h_ij. That's a lot.
+
+This is where the tiled approach with shared memory comes into play.
+
+The standard matrix multiply kernel uses tiled blocks to load tiles of the input matrices into shared memory, so that multiple threads can reuse the data from shared memory.
+
+Therefore, to compute the dot product efficiently, we need to use a tiled approach within the kernel.
+
+Let me outline the steps for a standard tiled matrix multiply kernel, then integrate the scaling and sum accumulation.
+
+Standard tiled matrix multiply steps:
+
+- Each block computes a tile of the output matrix (block_rows x block_cols).
+
+- The block's tile is divided into tiles of size TILE_WIDTH (e.g., 16x16).
+
+- The input matrices A (BxM) and B (MxN) are loaded into shared memory tiles.
+
+- Each thread in the block computes a part of the dot product by accumulating over the tiles.
+
+But in our case, the matrices are:
+
+- A is x (BxM), but we are multiplying x by W^T (MxN).
+
+- The output is h (BxN).
+
+Thus, the standard approach would require loading tiles of W (MxN) and x (BxM),

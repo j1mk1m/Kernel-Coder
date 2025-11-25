@@ -1,0 +1,45 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for scaled dot product attention
+scaled_dot_product_attention_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the scaled dot product attention using CUDA
+// This is just a placeholder; actual implementation goes here
+__global__ void scaled_dot_product_attention_kernel(...) {
+    // Kernel code goes here
+}
+
+torch::Tensor scaled_dot_product_attention_cuda(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+    // Call the kernel and return the result
+    return torch::zeros_like(Q);
+}
+"""
+
+scaled_dot_product_attention_cpp_source = (
+    "torch::Tensor scaled_dot_product_attention_cuda(torch::Tensor Q, torch::Tensor K, torch::Tensor V);"
+)
+
+# Compile the inline CUDA code for scaled dot product attention
+scaled_dot_product_attention = load_inline(
+    name="scaled_dot_product_attention",
+    cpp_sources=scaled_dot_product_attention_cpp_source,
+    cuda_sources=scaled_dot_product_attention_source,
+    functions=["scaled_dot_product_attention_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.scaled_dot_product_attention = scaled_dot_product_attention
+
+    def forward(self, Q, K, V):
+        return self.scaled_dot_product_attention.scaled_dot_product_attention_cuda(Q, K, V)

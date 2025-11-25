@@ -1,0 +1,73 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication using shared memory
+matrix_multiplication_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matrix_multiplication_shared_memory_kernel(const float* A, const float* B, float* C, int n) {
+    __shared__ float As[16][16];
+    __shared__ float Bs[16][16];
+
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = row * n + col;
+
+    float sum = 0.0f;
+
+    for (int m = 0; m < n / 16; ++m) {
+        As[threadIdx.y][threadIdx.x] = A[r + m * 16 * n];
+        Bs[threadIdx.y][threadIdx.x] = B[m * 16 * n + r % n];
+
+        __syncthreads();
+
+        for (int k = 0; k < 16; ++k) {
+            sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < n && col < n) {
+        C[r] = sum;
+    }
+}
+
+torch::Tensor matrix_multiplication_cuda(torch::Tensor A, torch::Tensor B) {
+    auto n = A.size(0);
+    auto C = torch::zeros({n, n}, A.options());
+
+    dim3 threads_per_block(16, 16);
+    dim3 blocks_per_grid((n + threads_per_block.x - 1) / threads_per_block.x, (n + threads_per_block.y - 1) / threads_per_block.y);
+
+    matrix_multiplication_shared_memory_kernel<<<blocks_per_grid, threads_per_block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), n);
+
+    return C;
+}
+"""
+
+matrix_multiplication_cpp_source = (
+    "torch::Tensor matrix_multiplication_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matrix_multiplication = load_inline(
+    name="matrix_multiplication",
+    cpp_sources=matrix_multiplication_cpp_source,
+    cuda_sources=matrix_multiplication_source,
+    functions=["matrix_multiplication_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matrix_multiplication = matrix_multiplication
+    
+    def forward(self, A, B):
+        return self.matrix_multiplication.matrix_multiplication_cuda(A, B)

@@ -1,0 +1,41 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(float* a, float* b, float* c, int M, int N, int K) {
+    // TODO: Implement GEMM using shared memory and parallel reduction
+}
+"""
+
+gemm_cpp_source = (
+    "void gemm_kernel(float* a, float* b, float* c, int M, int N, int K);"
+)
+
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_kernel"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+        self.register_buffer('c', torch.zeros(out_features))
+
+    def forward(self, x):
+        x = x.view(-1, x.size(-1))  # Flatten the input tensor
+        x = gemm.gemm_kernel(x, self.weight, self.c, x.size(0), self.out_features, self.in_features)
+        x = x * self.scale
+        x = self.bn(x)
+        return x

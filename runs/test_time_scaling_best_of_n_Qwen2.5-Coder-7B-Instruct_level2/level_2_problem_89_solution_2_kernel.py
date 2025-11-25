@@ -1,0 +1,413 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for ConvTranspose3d
+conv_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose3d_forward_kernel(const float* input, const float* weight, float* output, int N, int C_in, int D_in, int H_in, int W_in, int C_out, int D_out, int H_out, int W_out, int kD, int kH, int kW, int sD, int sH, int sW, int pD, int pH, int pW) {
+    int n = blockIdx.z;
+    int c_out = blockIdx.y;
+    int d_out = blockIdx.x * sD + threadIdx.z;
+    int h_out = blockIdx.w * sH + threadIdx.y;
+    int w_out = blockIdx.v * sW + threadIdx.x;
+
+    if (d_out >= D_out || h_out >= H_out || w_out >= W_out) return;
+
+    float sum = 0.0f;
+    for (int cd = 0; cd < kD; ++cd) {
+        for (int ch = 0; ch < kH; ++ch) {
+            for (int cw = 0; cw < kW; ++cw) {
+                int id = d_out + cd - pD;
+                int ih = h_out + ch - pH;
+                int iw = w_out + cw - pW;
+                if (id >= 0 && id < D_in && ih >= 0 && ih < H_in && iw >= 0 && iw < W_in) {
+                    int i_index = n * C_in * D_in * H_in * W_in + c_out * D_in * H_in * W_in + cd * H_in * W_in + ch * W_in + cw;
+                    int w_index = c_out * C_in * kD * kH * kW + c_out * kD * kH * kW + cd * kH * kW + ch * kW + cw;
+                    sum += input[i_index] * weight[w_index];
+                }
+            }
+        }
+    }
+
+    int o_index = n * C_out * D_out * H_out * W_out + c_out * D_out * H_out * W_out + d_out * H_out * W_out + h_out * W_out + w_out;
+    output[o_index] = sum;
+}
+
+torch::Tensor conv_transpose3d_forward_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto D_in = input.size(2);
+    auto H_in = input.size(3);
+    auto W_in = input.size(4);
+    auto C_out = weight.size(0);
+    auto D_out = weight.size(2);
+    auto H_out = weight.size(3);
+    auto W_out = weight.size(4);
+    auto kD = weight.size(1);
+    auto kH = weight.size(2);
+    auto kW = weight.size(3);
+    auto sD = weight.size(4);
+    auto sH = weight.size(5);
+    auto sW = weight.size(6);
+    auto pD = weight.size(7);
+    auto pH = weight.size(8);
+    auto pW = weight.size(9);
+
+    auto output = torch::zeros({N, C_out, D_out, H_out, W_out}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks_d = (D_out + block_size - 1) / block_size;
+    const int num_blocks_h = (H_out + block_size - 1) / block_size;
+    const int num_blocks_w = (W_out + block_size - 1) / block_size;
+
+    conv_transpose3d_forward_kernel<<<N * C_out * num_blocks_d * num_blocks_h * num_blocks_w, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), N, C_in, D_in, H_in, W_in, C_out, D_out, H_out, W_out, kD, kH, kW, sD, sH, sW, pD, pH, pW);
+
+    return output;
+}
+"""
+
+conv_transpose_cpp_source = (
+    "torch::Tensor conv_transpose3d_forward_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for ConvTranspose3d
+conv_transpose = load_inline(
+    name="conv_transpose",
+    cpp_sources=conv_transpose_cpp_source,
+    cuda_sources=conv_transpose_source,
+    functions=["conv_transpose3d_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for MaxPool3d
+max_pool_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void max_pool3d_forward_kernel(const float* input, float* output, int N, int C, int D_in, int H_in, int W_in, int D_out, int H_out, int W_out, int kD, int kH, int kW, int sD, int sH, int sW, int pD, int pH, int pW) {
+    int n = blockIdx.z;
+    int c = blockIdx.y;
+    int d_out = blockIdx.x * sD + threadIdx.z;
+    int h_out = blockIdx.w * sH + threadIdx.y;
+    int w_out = blockIdx.v * sW + threadIdx.x;
+
+    if (d_out >= D_out || h_out >= H_out || w_out >= W_out) return;
+
+    float max_val = -FLT_MAX;
+    for (int cd = 0; cd < kD; ++cd) {
+        for (int ch = 0; ch < kH; ++ch) {
+            for (int cw = 0; cw < kW; ++cw) {
+                int id = d_out + cd - pD;
+                int ih = h_out + ch - pH;
+                int iw = w_out + cw - pW;
+                if (id >= 0 && id < D_in && ih >= 0 && ih < H_in && iw >= 0 && iw < W_in) {
+                    int index = n * C * D_in * H_in * W_in + c * D_in * H_in * W_in + id * H_in * W_in + ih * W_in + iw;
+                    max_val = fmax(max_val, input[index]);
+                }
+            }
+        }
+    }
+
+    int o_index = n * C * D_out * H_out * W_out + c * D_out * H_out * W_out + d_out * H_out * W_out + h_out * W_out + w_out;
+    output[o_index] = max_val;
+}
+
+torch::Tensor max_pool3d_forward_cuda(torch::Tensor input) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D_in = input.size(2);
+    auto H_in = input.size(3);
+    auto W_in = input.size(4);
+    auto D_out = (D_in + kD - 1) / sD;
+    auto H_out = (H_in + kH - 1) / sH;
+    auto W_out = (W_in + kW - 1) / sW;
+    auto kD = 2;
+    auto kH = 2;
+    auto kW = 2;
+    auto sD = 2;
+    auto sH = 2;
+    auto sW = 2;
+    auto pD = 0;
+    auto pH = 0;
+    auto pW = 0;
+
+    auto output = torch::zeros({N, C, D_out, H_out, W_out}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks_d = (D_out + block_size - 1) / block_size;
+    const int num_blocks_h = (H_out + block_size - 1) / block_size;
+    const int num_blocks_w = (W_out + block_size - 1) / block_size;
+
+    max_pool3d_forward_kernel<<<N * C * num_blocks_d * num_blocks_h * num_blocks_w, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, C, D_in, H_in, W_in, D_out, H_out, W_out, kD, kH, kW, sD, sH, sW, pD, pH, pW);
+
+    return output;
+}
+"""
+
+max_pool_cpp_source = (
+    "torch::Tensor max_pool3d_forward_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for MaxPool3d
+max_pool = load_inline(
+    name="max_pool",
+    cpp_sources=max_pool_cpp_source,
+    cuda_sources=max_pool_source,
+    functions=["max_pool3d_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void softmax_forward_kernel(const float* input, float* output, int N, int C, int D, int H, int W) {
+    int n = blockIdx.z;
+    int c = blockIdx.y;
+    int d = blockIdx.x / (H * W);
+    int h = blockIdx.x % (H * W) / W;
+    int w = blockIdx.x % (H * W) % W;
+
+    int index = n * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+    float max_val = input[index];
+    for (int i = 0; i < C; ++i) {
+        max_val = fmax(max_val, input[n * C * D * H * W + i * D * H * W + d * H * W + h * W + w]);
+    }
+
+    float sum_exp = 0.0f;
+    for (int i = 0; i < C; ++i) {
+        sum_exp += exp(input[n * C * D * H * W + i * D * H * W + d * H * W + h * W + w] - max_val);
+    }
+
+    output[index] = exp(input[index] - max_val) / sum_exp;
+}
+
+torch::Tensor softmax_forward_cuda(torch::Tensor input) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (N * C * D * H * W + block_size - 1) / block_size;
+
+    softmax_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, C, D, H, W);
+
+    return output;
+}
+"""
+
+softmax_cpp_source = (
+    "torch::Tensor softmax_forward_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for Softmax
+softmax = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Subtract
+subtract_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void subtract_forward_kernel(const float* input, const float* subtract, float* output, int N, int C, int D, int H, int W) {
+    int n = blockIdx.z;
+    int c = blockIdx.y;
+    int d = blockIdx.x / (H * W);
+    int h = blockIdx.x % (H * W) / W;
+    int w = blockIdx.x % (H * W) % W;
+
+    int index = n * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+    output[index] = input[index] - subtract[c];
+}
+
+torch::Tensor subtract_forward_cuda(torch::Tensor input, torch::Tensor subtract) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (N * C * D * H * W + block_size - 1) / block_size;
+
+    subtract_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), subtract.data_ptr<float>(), output.data_ptr<float>(), N, C, D, H, W);
+
+    return output;
+}
+"""
+
+subtract_cpp_source = (
+    "torch::Tensor subtract_forward_cuda(torch::Tensor input, torch::Tensor subtract);"
+)
+
+# Compile the inline CUDA code for Subtract
+subtract = load_inline(
+    name="subtract",
+    cpp_sources=subtract_cpp_source,
+    cuda_sources=subtract_source,
+    functions=["subtract_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Swish
+swish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void swish_forward_kernel(const float* input, float* output, int N, int C, int D, int H, int W) {
+    int n = blockIdx.z;
+    int c = blockIdx.y;
+    int d = blockIdx.x / (H * W);
+    int h = blockIdx.x % (H * W) / W;
+    int w = blockIdx.x % (H * W) % W;
+
+    int index = n * C * D * H * W + c * D * H * W + d * H * W + h * W + w;
+    output[index] = input[index] / (1.0f + exp(-input[index]));
+}
+
+torch::Tensor swish_forward_cuda(torch::Tensor input) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (N * C * D * H * W + block_size - 1) / block_size;
+
+    swish_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, C, D, H, W);
+
+    return output;
+}
+"""
+
+swish_cpp_source = (
+    "torch::Tensor swish_forward_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for Swish
+swish = load_inline(
+    name="swish",
+    cpp_sources=swish_cpp_source,
+    cuda_sources=swish_source,
+    functions=["swish_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Max
+max_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void max_forward_kernel(const float* input, float* output, int N, int C) {
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+
+    int index = n * C + c;
+    float max_val = input[index];
+    for (int i = 0; i < N; ++i) {
+        max_val = fmax(max_val, input[i * C + c]);
+    }
+
+    output[index] = max_val;
+}
+
+torch::Tensor max_forward_cuda(torch::Tensor input) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+
+    auto output = torch::zeros({C}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (C + block_size - 1) / block_size;
+
+    max_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, C);
+
+    return output;
+}
+"""
+
+max_cpp_source = (
+    "torch::Tensor max_forward_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for Max
+max_op = load_inline(
+    name="max_op",
+    cpp_sources=max_cpp_source,
+    cuda_sources=max_source,
+    functions=["max_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, pool_kernel_size, pool_stride, pool_padding):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = conv_transpose
+        self.max_pool = max_pool
+        self.subtract = subtract
+        self.swish = swish
+        self.max_op = max_op
+
+    def forward(self, x):
+        x = self.conv_transpose.conv_transpose3d_forward_cuda(x, self.weight)
+        x = self.max_pool.max_pool3d_forward_cuda(x)
+        x = self.softmax.softmax_forward_cuda(x)
+        x = self.subtract.subtract_forward_cuda(x, self.subtract_param.view(1, -1, 1, 1, 1))
+        x = self.swish.swish_forward_cuda(x)
+        x = self.max_op.max_forward_cuda(x)
+        return x
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 128
+    in_channels = 3
+    out_channels = 16
+    depth, height, width = 16, 32, 32
+    kernel_size = 3
+    stride = 2
+    padding = 1
+    output_padding = 1
+    pool_kernel_size = 2
+    pool_stride = 2
+    pool_padding = 0
+
+    model = ModelNew(in_channels, out_channels, kernel_size, stride, padding, output_padding, pool_kernel_size, pool_stride, pool_padding)
+    inputs = get_inputs()
+    outputs = model(inputs[0])
+    print(outputs.shape)

@@ -1,0 +1,811 @@
+The given architecture is a simple model that applies a Softmax activation to an input tensor. The goal is to optimize this using custom CUDA kernels. The original implementation uses torch.softmax, which may have some overhead or not be optimized for the specific dimensions given (batch_size=4096, dim=393216). 
+
+First, I need to analyze the softmax computation to see where improvements can be made. The standard softmax computation involves several steps: computing the exponentials of the input elements, subtracting the maximum value for numerical stability, summing the exponentials, and then normalizing. Each of these steps could be potential candidates for optimization.
+
+One possible optimization is to fuse these steps into a single kernel to reduce memory traffic and kernel launch overhead. Another is to exploit parallelism more efficiently. Since the input is a 2D tensor with shape (batch_size, num_features), each row (sample) can be processed independently. Thus, we can parallelize at the row level, with each thread block handling a single row. Within a row, each thread can handle a few elements, especially since the dimension is very large (393,216), which is a multiple of 3 (as 393,216 = 3*131072). This suggests that vectorization or using shared memory could help.
+
+Wait, 393,216 divided by 3 is 131,072, which is 2^17. That's a power of two, which might be useful for tiling or scheduling. The key is to process each row efficiently.
+
+Another consideration is the use of Tensor Cores if the hardware supports it, but for a general solution without assuming specific hardware features, we can proceed with standard CUDA.
+
+First, let's outline the steps for a single row:
+
+1. Compute the maximum value in the row to avoid overflow.
+2. Subtract the max from each element, compute exponentials, sum them, then divide each element by the sum.
+
+The challenge is to perform these steps efficiently in parallel. For the maximum, a reduction across the row is needed. Reductions in CUDA can be implemented with parallel reduction kernels. However, doing this per row might be slow if done naively.
+
+Alternatively, we can perform the computation in a way that combines steps. Let's think about how to structure the kernel.
+
+Let's structure the kernel such that each block handles a single row. Each thread in the block processes a segment of the row's elements. 
+
+First, for each row:
+
+- Compute the maximum value. This requires a reduction over the row's elements. The threads can compute partial maxima, then combine them.
+
+- Subtract the max from all elements, compute exponentials, accumulate the sum.
+
+- Then, divide each element by the sum.
+
+So the steps are:
+
+For each row (each block):
+
+1. Compute the max of the row.
+2. Subtract max from each element, compute exp, sum all exps.
+3. Normalize each element.
+
+The problem is that steps 1 and 2 are dependent; you need the max before you can proceed. So, the kernel would have to handle these steps in sequence within the same kernel.
+
+Alternatively, we can combine steps into a single kernel pass.
+
+Let me think of the kernel structure:
+
+Each block corresponds to a row. The block has enough threads to cover the elements. Let's say we have N elements per row. The block size should be a divisor of N or use a tiling approach.
+
+Wait, 393,216 is 3*131072, so if using 1024 threads per block, 131072 / 1024 = 128, so each thread would process 3 elements (since 3*1024*128 = 393,216). Alternatively, perhaps a block size of 512, etc. Alternatively, use a grid of blocks per row? No, each row should be handled by a single block.
+
+Wait, the batch size is 4096, so the grid size would be 4096 blocks, each handling a row. Each block must process 393,216 elements. That's a lot for a single block. So each block must have sufficient threads and shared memory.
+
+Alternatively, the block can have, say, 512 threads, and each thread handles multiple elements. Let's think:
+
+Number of elements per row: 393,216
+
+Let's say each thread handles K elements. The number of threads per block must be at least ceil(393216 / K). To keep K manageable, say K=3, so each thread handles 3 elements, then threads needed: 393216/3 = 131,072 threads per block. But the maximum threads per block in CUDA is 1024, so that won't work. Thus, this approach is not feasible.
+
+Therefore, need a different approach.
+
+Alternative approach: each block handles a row, and threads in the block process elements in parallel with shared memory for reduction.
+
+Let me think of a block processing a row. The block has T threads. Each thread is assigned a chunk of elements. For example, if the row has 393,216 elements, and the block has 1024 threads, each thread can handle 393,216 / 1024 = 384 elements. That's manageable.
+
+First, in the first step, each thread loads its chunk of elements into shared memory. Then, perform a parallel reduction to find the max. Once the max is found, each thread can compute the exp(x - max) for its elements, accumulate the sum in shared memory, then finally each element is divided by the sum.
+
+This approach requires using shared memory for the elements and partial sums.
+
+Let me outline the steps in code:
+
+Kernel outline:
+
+__global__ void softmax_kernel(float *input, float *output, int batch_size, int dim) {
+    int row = blockIdx.x; // Each block processes a row
+
+    // Each thread in the block processes a chunk of elements in the row
+    extern __shared__ float shared_memory[];
+    // shared_memory will be used for storing partial results during reduction
+
+    // Load data into shared memory (each thread handles a chunk)
+    int tid = threadIdx.x;
+    int elements_per_thread = (dim + blockDim.x -1) / blockDim.x;
+    for (int i = 0; i < elements_per_thread; i++) {
+        int idx = tid * elements_per_thread + i;
+        if (idx < dim) {
+            shared_memory[idx] = input[row * dim + idx];
+        }
+    }
+    __syncthreads();
+
+    // Now compute the max
+    // Implement a parallel reduction in shared memory
+    // ... code for reduction to find max ...
+
+    // Once the max is found, store it in shared memory
+    float max_val = ... 
+
+    // Now compute exponents and accumulate sum
+    // Each thread computes exp for its elements, sum into shared memory
+    // ... 
+
+    // Then, after the sum is computed, each thread divides its elements by the sum
+    // ... 
+
+    // Finally, write back to output
+    // ...
+
+}
+
+Wait, this approach requires that all elements of the row are in shared memory. But the row has 393,216 elements, each of which is a float (4 bytes). So shared memory needed is 393,216 *4 bytes = ~1.57 MB. But the maximum shared memory per block is 48 or 96 KB depending on the compute capability. So this won't work. Thus, this approach is not feasible.
+
+Hmm, that's a problem. So storing the entire row in shared memory is impossible due to memory constraints.
+
+Alternative approach: compute the max and sum without storing all elements in shared memory. Instead, each thread processes a subset of the elements, keeping track of their max and partial sums, then combine these.
+
+Let me think of the steps again, but using only per-thread variables and shared memory for intermediate steps.
+
+Here's a possible outline:
+
+Each block processes a row.
+
+Each thread in the block handles a chunk of elements (e.g., 256 elements per thread if the block has 1024 threads, then 1024*256=256k elements, but we have 393k so maybe 400 elements each?)
+
+Wait let's calculate:
+
+dim = 393216
+
+blockDim.x = 1024 threads per block (max possible on many GPUs)
+
+elements per thread: ceil(393216 / 1024) = 384 elements per thread.
+
+Each thread can process 384 elements, compute their max, and their sum of exponentials.
+
+Then, within the block, we can perform a reduction to find the global max (max over all thread's maxes).
+
+Once the max is known, each thread can subtract the max from their elements, compute exponentials, accumulate their partial sums, then the block reduces to get the total sum.
+
+Finally, each thread can compute the normalized exponentials (exp(x - max) / sum) and store the result.
+
+Let me outline this step by step:
+
+1. Each thread processes a chunk of elements (384 elements per thread if block is 1024 threads). The thread reads its elements from global memory.
+
+2. For each element in the chunk:
+   - Compute current element's value: x = input[row * dim + idx]
+   - Track the max of the chunk: local_max = max of the chunk's elements
+   - Compute x - local_max_temp (but actually, we need the global max, so perhaps this isn't helpful yet)
+
+Wait, no. To compute the global max, each thread first finds the max in its chunk. Then, the block does a reduction of all threads' max to get the global max.
+
+Similarly, once the global max is known, each thread can compute x - global_max for each element in their chunk, compute exp, and accumulate the sum of exps in their chunk. Then the block reduces all threads' partial sums to get the total sum.
+
+Then, each thread can compute exp(x - global_max) / total_sum for each element in their chunk, and write to output.
+
+This approach avoids storing all elements in shared memory, instead using per-thread variables.
+
+Here's a more detailed outline:
+
+Kernel:
+
+__global__ void softmax_kernel(float *input, float *output, int batch_size, int dim) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    // Each thread handles a chunk of elements
+    int elements_per_thread = (dim + blockDim.x - 1) / blockDim.x;
+    int start = tid * elements_per_thread;
+    int end = start + elements_per_thread;
+    if (end > dim) end = dim;
+    
+    // Per-thread storage for max and sum
+    float local_max = -INFINITY;
+    float local_sum = 0.0f;
+    
+    // Iterate over each element in the chunk
+    for (int idx = start; idx < end; idx++) {
+        float x = input[row * dim + idx];
+        if (x > local_max) {
+            local_max = x;
+        }
+    }
+    
+    // Now, compute the global max across all threads in the block (the row)
+    __shared__ float block_max;
+    // Use a reduction here to find the block_max
+    
+    // Wait, but how? Need to do a reduction in shared memory for the max.
+    // Maybe use a warp-reduction approach, but since it's a max, we can do a reduction step.
+    // For example, each thread's local_max is stored in shared memory, then do a reduction
+    
+    // First, store local_max into shared memory
+    __shared__ float shared_max[1024]; // assuming blockDim.x is 1024
+    shared_max[tid] = local_max;
+    __syncthreads();
+    
+    // Perform reduction to find the block max
+    for (int s = blockDim.x/2; s > 0; s >>=1) {
+        if (tid < s) {
+            if (shared_max[tid] < shared_max[tid + s]) {
+                shared_max[tid] = shared_max[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    float global_max = shared_max[0];
+    
+    // Now, each thread computes exp(x - global_max) for their elements, and accumulates the sum
+    local_sum = 0.0f;
+    for (int idx = start; idx < end; idx++) {
+        float x = input[row * dim + idx];
+        float exp_val = expf(x - global_max);
+        local_sum += exp_val;
+    }
+    
+    // Now reduce the local_sum to get the total_sum
+    __shared__ float shared_sum[1024];
+    shared_sum[tid] = local_sum;
+    __syncthreads();
+    
+    // Reduce sums
+    for (int s = blockDim.x/2; s > 0; s >>=1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    float total_sum = shared_sum[0];
+    
+    // Now compute the output
+    for (int idx = start; idx < end; idx++) {
+        float x = input[row * dim + idx];
+        float exp_val = expf(x - global_max);
+        output[row * dim + idx] = exp_val / total_sum;
+    }
+}
+
+Wait, but this requires that each thread first computes their local max, then the global max is found via reduction. Then, they compute the exp and accumulate sum again. This requires two passes over the data (once for max, once for sum and exp). Alternatively, can we do this in a single pass?
+
+Alternatively, during the first loop, we can compute both the max and the exp(x - local_max), but that might not help since we need the global max.
+
+Hmm, perhaps the two-pass approach is necessary. Let's see.
+
+First pass: compute the local_max and the max across all threads (global_max).
+
+Second pass: compute exp(x - global_max), accumulate sum, then finally normalize.
+
+This requires two loops over the data elements per thread, which could be slower, but maybe manageable given the high dimension.
+
+Another optimization: can we combine the two steps?
+
+Wait, in the first step, we could also compute the max and store it, but the second step requires the global max. So the first step must be done first.
+
+Alternatively, can we compute the max and the exp(x - global_max) in a single pass? No, because we need the global max to compute the exponent.
+
+Thus, the two-pass approach is needed.
+
+Now, considering the kernel's performance:
+
+- Each thread processes a chunk of 384 elements (for 1024 threads). 
+
+- The first pass over the elements to compute the max.
+
+- Then, the reduction step to find global_max (this is O(log2(N)) steps, but with 1024 threads, it's 10 steps).
+
+- Second pass over the elements to compute exp and accumulate sum.
+
+- Reduction of the sum (another log2 steps).
+
+- Final pass to write the result.
+
+This may be acceptable given the problem's parameters. Let's think about the block size.
+
+The blockDim.x is 1024, so each block has 1024 threads. Since the batch size is 4096, the grid size would be 4096 blocks. Each block handles a row.
+
+The shared memory usage is 1024 floats for the max and another 1024 floats for the sum. Total shared memory per block is 2048 floats, which is 8KB (since each float is 4 bytes: 2048 *4 = 8192 bytes). This is acceptable.
+
+Now, implementing this in code.
+
+Additionally, need to handle edge cases, like if dim is not divisible by the number of threads.
+
+Another thing: expf is a scalar function. For large dimensions, using vectorized intrinsics might be better, but that complicates things. Let's proceed with the scalar approach first.
+
+Now, let's code this kernel.
+
+Also, in the kernel launch, the blockDim.x should be chosen as 1024, which is a common maximum.
+
+Wait, the maximum number of threads per block is 1024 for many architectures (compute capability 3.5 and above), so using 1024 is safe.
+
+Now, the Python code would call this kernel via a wrapper function.
+
+Now, the kernel needs to be written as a CUDA C++ code, and the wrapper function in Python.
+
+Let me draft the CUDA code.
+
+The CUDA kernel code would be something like:
+
+#include <torch/extension.h>
+#include <math.h>
+
+__global__ void custom_softmax_kernel(const float* input, float* output, int batch_size, int dim) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int elements_per_thread = (dim + blockDim.x - 1) / blockDim.x;
+    int start = tid * elements_per_thread;
+    int end = start + elements_per_thread;
+    if (end > dim) end = dim;
+
+    // Step 1: Compute local max for each thread's chunk
+    float local_max = -INFINITY;
+    for (int idx = start; idx < end; ++idx) {
+        float x = input[row * dim + idx];
+        if (x > local_max) {
+            local_max = x;
+        }
+    }
+
+    // Step 2: Compute global max using block reduction
+    __shared__ float shared_max[1024];
+    shared_max[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (shared_max[tid] < shared_max[tid + s]) {
+                shared_max[tid] = shared_max[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    float global_max = shared_max[0];
+
+    // Step 3: Compute exponents and accumulate sum
+    float local_sum = 0.0f;
+    for (int idx = start; idx < end; ++idx) {
+        float x = input[row * dim + idx];
+        float exp_val = expf(x - global_max);
+        local_sum += exp_val;
+    }
+
+    // Step 4: Compute global sum using block reduction
+    __shared__ float shared_sum[1024];
+    shared_sum[tid] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    float total_sum = shared_sum[0];
+
+    // Step 5: Write the output
+    for (int idx = start; idx < end; ++idx) {
+        float x = input[row * dim + idx];
+        float exp_val = expf(x - global_max);
+        output[row * dim + idx] = exp_val / total_sum;
+    }
+}
+
+extern "C" {
+    void custom_softmax_cuda(torch::Tensor input, torch::Tensor output) {
+        const int batch_size = input.size(0);
+        const int dim = input.size(1);
+        const dim3 blocks(batch_size);
+        const dim3 threads(1024);
+        custom_softmax_kernel<<<blocks, threads>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, dim);
+    }
+}
+
+Wait, but in the kernel, blockDim.x must be 1024. The input tensor has size (batch_size, dim), so the row is input[row * dim + idx]. The output tensor is of the same size.
+
+Now, in the Python code:
+
+We need to define the CUDA source code as a string and compile it using load_inline.
+
+So the Python code would look like:
+
+First, the CUDA code is written as a string:
+
+custom_softmax_source = """
+#include <torch/extension.h>
+#include <math.h>
+
+__global__ void custom_softmax_kernel(const float* input, float* output, int batch_size, int dim) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int elements_per_thread = (dim + blockDim.x - 1) / blockDim.x;
+    int start = tid * elements_per_thread;
+    int end = start + elements_per_thread;
+    if (end > dim) end = dim;
+
+    // Step 1: Compute local max for each thread's chunk
+    float local_max = -FLT_MAX;
+    for (int idx = start; idx < end; ++idx) {
+        float x = input[row * dim + idx];
+        if (x > local_max) {
+            local_max = x;
+        }
+    }
+
+    // Step 2: Compute global max using block reduction
+    __shared__ float shared_max[1024];
+    shared_max[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (shared_max[tid] < shared_max[tid + s]) {
+                shared_max[tid] = shared_max[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    float global_max = shared_max[0];
+
+    // Step 3: Compute exponents and accumulate sum
+    float local_sum = 0.0f;
+    for (int idx = start; idx < end; ++idx) {
+        float x = input[row * dim + idx];
+        float exp_val = expf(x - global_max);
+        local_sum += exp_val;
+    }
+
+    // Step 4: Compute global sum using block reduction
+    __shared__ float shared_sum[1024];
+    shared_sum[tid] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    float total_sum = shared_sum[0];
+
+    // Step 5: Write the output
+    for (int idx = start; idx < end; ++idx) {
+        float x = input[row * dim + idx];
+        float exp_val = expf(x - global_max);
+        output[row * dim + idx] = exp_val / total_sum;
+    }
+}
+
+extern "C" {
+    void custom_softmax_cuda(torch::Tensor input, torch::Tensor output) {
+        const int batch_size = input.size(0);
+        const int dim = input.size(1);
+        const dim3 blocks(batch_size);
+        const dim3 threads(1024);
+        // Check that blockDim.x (1024) <= dim to avoid division by zero in elements_per_thread?
+        // Maybe add a check here, but for the given problem, dim=393216 is sufficient.
+        custom_softmax_kernel<<<blocks, threads>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, dim);
+    }
+}
+"""
+
+Then, the header for the cpp source:
+
+custom_softmax_header = """
+void custom_softmax_cuda(torch::Tensor input, torch::Tensor output);
+"""
+
+Then, compiling this inline:
+
+custom_softmax = load_inline(
+    name="custom_softmax",
+    cpp_sources=custom_softmax_header,
+    cuda_sources=custom_softmax_source,
+    functions=["custom_softmax_cuda"],
+    verbose=True,
+)
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.custom_softmax = custom_softmax
+
+    def forward(self, x):
+        output = torch.empty_like(x)
+        self.custom_softmax.custom_softmax_cuda(x, output)
+        return output
+
+Wait, but in PyTorch, the inputs must be on the GPU. The user's get_inputs() returns tensors on CPU (since they're generated with torch.rand). But in the original code, the model's forward is expecting a tensor, but the user's code may have to move it to CUDA. Wait, looking back:
+
+In the original code:
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+But in the problem statement, the user may have intended the inputs to be on CUDA, but in the original code, they are not. However, the example given in the problem's first example had inputs on CUDA. So perhaps the user expects the inputs to be on CUDA.
+
+Assuming that in the new code, the tensors are moved to CUDA. So the forward function should take x.cuda(), but in the problem's code, the user's model is designed to take x as input. So perhaps the ModelNew's forward should handle the CUDA transfer, but better to assume that the inputs are already on CUDA.
+
+Alternatively, the code should ensure that the input is on the same device as the kernel.
+
+In the current setup, the kernel is written for CUDA, so the input and output tensors must be on CUDA. Thus, in the get_inputs() function, the user should generate tensors on CUDA. But in the original code, get_inputs() uses torch.rand(), which is CPU by default. So, in the problem's original code, they may have forgotten to move to CUDA, but in our optimized code, we need to ensure that the tensors are on CUDA.
+
+Therefore, in the new code, the get_inputs() function should generate tensors on CUDA. However, the user's provided get_inputs() in the problem is not adjusted. Since the problem says to replace the operators, perhaps the get_inputs() remains as is, but in the ModelNew's forward, the kernel is on CUDA, so the input must be moved to CUDA.
+
+Alternatively, perhaps the problem's original code's get_inputs() is not part of the code to be changed, so we need to ensure that the model's forward function expects the input to be on CUDA. So, the user's code may need to have the inputs on CUDA.
+
+Assuming that in the problem's context, the inputs are passed to the model on CUDA, the code is okay.
+
+Now, compiling the code:
+
+Potential issues:
+
+- The blockDim.x is 1024, which must be compatible with the hardware's maximum block size (which it is for most modern GPUs).
+
+- The shared memory arrays are of size 1024. Since blockDim.x is 1024, the shared memory arrays are exactly the right size.
+
+- The elements_per_thread calculation is correct: ceil(dim / 1024).
+
+- The expf function is used, which is the float version of exp.
+
+- The initial local_max is set to -FLT_MAX (from float.h). In the CUDA code, we should include <limits.h> or use torch's headers?
+
+Wait, in the code above, I used -FLT_MAX. But in the first code, I had written -INFINITY, but in the later code, I changed to FLT_MAX. Let me check.
+
+In CUDA, the maximum float value is FLT_MAX, but initializing to -FLT_MAX would set the local_max to the smallest possible float, so that any element will be larger. Alternatively, using -INFINITY is better, as it's the lowest possible value.
+
+Wait, in the CUDA code above, the first code had:
+
+float local_max = -INFINITY;
+
+But in the later code, I wrote:
+
+float local_max = -FLT_MAX;
+
+Wait, that's a mistake. Because FLT_MAX is a positive value, so -FLT_MAX is the most negative number but not exactly -infty. To get negative infinity, we can use -INFINITY, but need to ensure it's properly defined.
+
+Alternatively, use the constant from math.h. However, in CUDA, the INFINITY is defined if __STDC_IEC_559__ is defined. Alternatively, initializing to -1e30f or something. 
+
+Alternatively, in the code, perhaps it's better to initialize to the minimum possible float value.
+
+Wait, in CUDA, the minimum finite value is -FLT_MAX, but the smallest representable number in magnitude is FLT_MIN, but the most negative is -FLT_MAX. However, for the purpose of finding the maximum, initializing to -INFINITY is better.
+
+To use -INFINITY, we can include <limits> and use std::numeric_limits<float>::lowest() or similar. But in CUDA C++, maybe using constants.
+
+Alternatively, in the code, replace:
+
+float local_max = -FLT_MAX;
+
+with:
+
+float local_max = -INFINITY;
+
+But to have INFINITY, include <math.h>.
+
+Wait, in the code above, we have included <math.h>, so INFINITY should be available.
+
+Thus, in the CUDA kernel code, the local_max initialization should be:
+
+float local_max = -INFINITY;
+
+So correcting that.
+
+Also, in the code above, when I pasted, I had:
+
+float local_max = -FLT_MAX;
+
+But that's incorrect. Must correct to -INFINITY.
+
+So the corrected kernel code:
+
+In the first step:
+
+float local_max = -INFINITY;
+
+Similarly, in the code.
+
+Other possible issues:
+
+- The output tensor must be initialized before the kernel is called. The user's forward function creates an empty output tensor of the same size as input. That's okay.
+
+Now, the Python code:
+
+The custom_softmax_cuda function is called with input and output tensors. The output is written in-place.
+
+Wait, in the code:
+
+output = torch.empty_like(x)
+self.custom_softmax.custom_softmax_cuda(x, output)
+return output
+
+This should work.
+
+Now, checking for possible errors:
+
+The kernel uses blockIdx.x to select the row. The input is stored as a 1D array (row-major order), so for a 2D tensor of shape (batch_size, dim), the element (row, idx) is at row*dim + idx. This is correct.
+
+Now, compiling the code. Since the user is using load_inline, the code must be correct in syntax.
+
+Another potential issue: in the CUDA kernel, the blockDim.x is fixed at 1024. The code assumes that blockDim.x is 1024, so in the shared memory arrays, we have:
+
+__shared__ float shared_max[1024];
+
+But if blockDim.x is not 1024, this would cause an error. Since we launch with threads=1024, this is okay. But in code, perhaps better to use blockDim.x as the size.
+
+Wait, in the code, we can use:
+
+__shared__ float shared_max[blockDim.x];
+
+But in CUDA, this is only allowed if the size is known at compile time. Since blockDim.x is 1024 at runtime, but the code is compiled for a specific blockDim.x. Hmm, this is a problem.
+
+Wait, in CUDA, dynamic shared memory can be allocated, but in this case, the shared arrays need to be of size blockDim.x. Since we are fixing blockDim.x to 1024, we can hardcode the size as 1024, which is what we did.
+
+Thus, the code is okay.
+
+Another point: in the reduction steps for the max and sum, the loops are:
+
+for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+
+Since blockDim.x is 1024, s starts at 512, then 256, etc., down to 1, then 0? Wait, no, the loop continues while s>0, so when s=1, it will run once, then s becomes 0 and exit.
+
+Wait, for s=1, after the loop iteration, s becomes 0.
+
+Wait, in each iteration, s is divided by two, so the loop runs log2(blockDim.x) times. Since blockDim.x is 1024, it will run 10 times (since 2^10=1024). The last iteration will have s=1, then s=0 next time, so it stops.
+
+Thus, the reduction is correct.
+
+Now, the code should be correct.
+
+Now, putting this all together in the Python code block.
+
+Wait, also, the header for the C++ code must declare the function:
+
+extern "C" {
+    void custom_softmax_cuda(torch::Tensor input, torch::Tensor output);
+}
+
+Hence, the header string should be:
+
+custom_softmax_header = """
+extern "C" {
+    void custom_softmax_cuda(torch::Tensor input, torch::Tensor output);
+}
+"""
+
+Wait, in the previous code I had:
+
+custom_softmax_header = """
+void custom_softmax_cuda(torch::Tensor input, torch::Tensor output);
+"""
+
+But since the function is defined inside an extern "C" block in the CUDA code, the header must also include the extern "C" to avoid name mangling.
+
+Thus, the header should have the extern "C" block as well.
+
+Hence, the corrected header:
+
+custom_softmax_header = """
+extern "C" {
+    void custom_softmax_cuda(torch::Tensor input, torch::Tensor output);
+}
+"""
+
+Now, compiling this code should work.
+
+Finally, the ModelNew class uses this function.
+
+Thus, the complete Python code would look like this.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+custom_softmax_source = """
+#include <torch/extension.h>
+#include <math.h>
+
+__global__ void custom_softmax_kernel(const float* input, float* output, int batch_size, int dim) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int elements_per_thread = (dim + blockDim.x - 1) / blockDim.x;
+    int start = tid * elements_per_thread;
+    int end = start + elements_per_thread;
+    if (end > dim) end = dim;
+
+    // Step 1: Compute local max for each thread's chunk
+    float local_max = -INFINITY;
+    for (int idx = start; idx < end; ++idx) {
+        float x = input[row * dim + idx];
+        if (x > local_max) {
+            local_max = x;
+        }
+    }
+
+    // Step 2: Compute global max using block reduction
+    __shared__ float shared_max[1024];
+    shared_max[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (shared_max[tid] < shared_max[tid + s]) {
+                shared_max[tid] = shared_max[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    float global_max = shared_max[0];
+
+    // Step 3: Compute exponents and accumulate sum
+    float local_sum = 0.0f;
+    for (int idx = start; idx < end; ++idx) {
+        float x = input[row * dim + idx];
+        float exp_val = expf(x - global_max);
+        local_sum += exp_val;
+    }
+
+    // Step 4: Compute global sum using block reduction
+    __shared__ float shared_sum[1024];
+    shared_sum[tid] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    float total_sum = shared_sum[0];
+
+    // Step 5: Write the output
+    for (int idx = start; idx < end; ++idx) {
+        float x = input[row * dim + idx];
+        float exp_val = expf(x - global_max);
+        output[row * dim + idx] = exp_val / total_sum;
+    }
+}
+
+extern "C" {
+    void custom_softmax_cuda(torch::Tensor input, torch::Tensor output) {
+        const int batch_size = input.size(0);
+        const int dim = input.size(1);
+        const dim3 blocks(batch_size);
+        const dim3 threads(1024);
+        custom_softmax_kernel<<<blocks, threads>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, dim);
+    }
+}
+"""
+
+custom_softmax_header = """
+extern "C" {
+    void custom_softmax_cuda(torch::Tensor input, torch::Tensor output);
+}
+"""
+
+custom_softmax = load_inline(
+    name="custom_softmax",
+    cpp_sources=custom_softmax_header,
+    cuda_sources=custom_softmax_source,
+    functions=["custom_softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.custom_softmax = custom_softmax
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = torch.empty_like(x)
+        self.custom_softmax.custom_softmax_cuda(x, output)
+        return output
+```
+
+```python
+# Original code for reference (not part of the solution)
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Softmax activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        return torch.softmax(x, dim=1)
+
+batch_size = 4096
+dim = 393216
+
+def get_inputs():
+    x = torch.rand(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```

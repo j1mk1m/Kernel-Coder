@@ -1,0 +1,179 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom fused kernel for element-wise addition and multiplication
+fused_addmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void fused_addmul_kernel(
+    const scalar_t* x,
+    const scalar_t* y,
+    scalar_t* out,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        scalar_t add_val = x[idx] + y[idx];
+        out[idx] = add_val * y[idx];
+    }
+}
+
+std::tuple<torch::Tensor, torch::Tensor> fused_addmul_cuda(
+    torch::Tensor x,
+    torch::Tensor y
+) {
+    auto size = x.numel();
+    auto out = torch::empty_like(x);
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    AT_DISPATCH_FLOATING_TYPES(x.type(), "fused_addmul_cuda", ([&] {
+        fused_addmul_kernel<scalar_t><<<num_blocks, block_size>>>(
+            x.data_ptr<scalar_t>(),
+            y.data_ptr<scalar_t>(),
+            out.data_ptr<scalar_t>(),
+            size
+        );
+    }));
+
+    return std::make_tuple(out);
+}
+"""
+
+# Compile the fused add-multiply kernel
+fused_addmul = load_inline(
+    name="fused_addmul",
+    cpp_sources="",
+    cuda_sources=fused_addmul_source,
+    functions=["fused_addmul_cuda"],
+    verbose=True,
+    extra_cflags=["-DWITH_CUDA"],
+    extra_cuda_cflags=["-arch=sm_86"],
+)
+
+# Custom fused kernel for instance norm with reshaping
+instance_norm_fused_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+
+template <typename scalar_t>
+__global__ void instance_norm_fused_kernel(
+    const scalar_t* input,
+    scalar_t* output,
+    const scalar_t* weight,
+    const scalar_t* bias,
+    const scalar_t eps,
+    int batch_size,
+    int channels,
+    int height,
+    int width
+) {
+    int h_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h_idx >= channels) return;
+
+    for (int b = 0; b < batch_size; ++b) {
+        scalar_t mean = 0;
+        scalar_t var = 0;
+        for (int w = 0; w < height * width; ++w) {
+            int idx = b * channels * height * width + h_idx * height * width + w;
+            mean += input[idx];
+        }
+        mean /= (height * width);
+
+        for (int w = 0; w < height * width; ++w) {
+            int idx = b * channels * height * width + h_idx * height * width + w;
+            var += (input[idx] - mean) * (input[idx] - mean);
+        }
+        var = var / (height * width) + eps;
+        scalar_t inv_std = 1.0f / sqrt(var);
+
+        for (int w = 0; w < height * width; ++w) {
+            int idx = b * channels * height * width + h_idx * height * width + w;
+            output[idx] = (input[idx] - mean) * inv_std * weight[h_idx] + bias[h_idx];
+        }
+    }
+}
+
+torch::Tensor instance_norm_fused_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps
+) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (channels + block_size - 1) / block_size;
+
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "instance_norm_fused_cuda", ([&] {
+        instance_norm_fused_kernel<scalar_t><<<num_blocks, block_size>>>(
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            bias.data_ptr<scalar_t>(),
+            eps,
+            batch_size,
+            channels,
+            height,
+            width
+        );
+    }));
+
+    return output;
+}
+"""
+
+# Compile the instance norm fused kernel
+instance_norm_fused = load_inline(
+    name="instance_norm_fused",
+    cpp_sources="",
+    cuda_sources=instance_norm_fused_source,
+    functions=["instance_norm_fused_cuda"],
+    verbose=True,
+    extra_cflags=["-DWITH_CUDA"],
+    extra_cuda_cflags=["-arch=sm_86"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm_weight = nn.Parameter(torch.ones(1, out_features, 1, 1))
+        self.instance_norm_bias = nn.Parameter(torch.zeros(1, out_features, 1, 1))
+        self.instance_norm_eps = eps
+        self.fused_addmul = fused_addmul
+        self.instance_norm_fused = instance_norm_fused
+
+    def forward(self, x, y):
+        x = self.bmm(x)
+        # Fused instance norm with reshaping
+        x_reshaped = x.unsqueeze(1).unsqueeze(1)
+        x_norm = self.instance_norm_fused.instance_norm_fused_cuda(
+            x_reshaped,
+            self.instance_norm_weight,
+            self.instance_norm_bias,
+            self.instance_norm_eps
+        ).squeeze(1).squeeze(1)
+        # Fused add and multiply
+        fused_out = self.fused_addmul.fused_addmul_cuda(x_norm, y)
+        return fused_out[0]
+
+# Ensure these remain unchanged as per original
+def get_inputs():
+    return [torch.rand(batch_size, in_features), torch.rand(batch_size, out_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192

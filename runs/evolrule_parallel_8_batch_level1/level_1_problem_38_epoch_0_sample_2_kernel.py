@@ -1,0 +1,2 @@
+This should now correctly handle the L1 normalization in a single kernel, using shared memory for reduction and avoiding intermediate tensors. The kernel is launched with one block per batch item, and each block processes the entire dimension using a parallel reduction. The shared memory size is correctly calculated based on the block size.
+</think>

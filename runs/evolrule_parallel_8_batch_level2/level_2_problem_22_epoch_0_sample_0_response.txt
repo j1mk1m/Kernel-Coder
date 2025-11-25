@@ -1,0 +1,233 @@
+The code must be valid and work with the following test: 
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The given Model and ModelNew are in the same file
+
+# Test initialization
+model = Model(input_size, hidden_size, scale_factor, clamp_min, clamp_max)
+model_new = ModelNew(input_size, hidden_size, scale_factor, clamp_min, clamp_max)
+
+# Test forward pass equivalence
+inputs = get_inputs()
+output_original = model(*inputs)
+output_new = model_new(*inputs)
+
+# Check if outputs are close
+assert torch.allclose(output_original, output_new, atol=1e-4)
+```
+The test must pass. 
+
+You can assume that the following imports and functions are already present in the environment:
+- torch
+- torch.nn
+- torch.cuda
+- get_inputs() and get_init_inputs() are already defined as per the original code.
+
+You must not use any third-party libraries. All custom CUDA kernels must be implemented inline using the load_inline function. 
+
+The output code must be compatible with PyTorch 2.0 and above, and CUDA 11.0 or higher.
+
+You may replace multiple operators and combine them into fused kernels. For instance, matmul followed by scaling and addition can be fused into a single kernel. Or, clamping followed by logsumexp can be another fused kernel. You can also try to combine Mish activation into the fused kernel.
+
+The goal is to maximize the performance (minimize the execution time) of the forward pass while ensuring correctness. 
+
+Now, write the optimized ModelNew class with custom CUDA kernels.
+
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom fused kernel: MatMul + Scale + Add (x + x)
+matmul_scale_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_matmul_scale_add(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* output,
+    int batch_size,
+    int input_size,
+    int hidden_size,
+    float scale_factor) {
+
+    int batch_idx = blockIdx.y;
+    int hidden_idx = blockIdx.x * blockDim.y + threadIdx.y;
+    int thread_idx = threadIdx.x;
+
+    if (hidden_idx >= hidden_size) return;
+
+    float sum = 0.0;
+    for (int i = 0; i < input_size; i += blockDim.x) {
+        int idx = i + thread_idx;
+        if (idx < input_size) {
+            sum += input[batch_idx * input_size + idx] * weight[hidden_idx * input_size + idx];
+        }
+        __syncthreads();
+    }
+
+    // Apply scale and add (x + x)
+    output[batch_idx * hidden_size + hidden_idx] = (sum * scale_factor) * 2.0;
+}
+
+torch::Tensor fused_matmul_scale_add_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    float scale_factor) {
+
+    const int batch_size = input.size(0);
+    const int input_size = input.size(1);
+    const int hidden_size = weight.size(0);
+
+    auto output = torch::empty({batch_size, hidden_size}, input.options());
+
+    const int block_dim_x = 256;
+    const int block_dim_y = 32;
+    dim3 threads(block_dim_x, block_dim_y);
+    dim3 blocks(hidden_size / block_dim_y, batch_size);
+
+    fused_matmul_scale_add<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        input_size,
+        hidden_size,
+        scale_factor);
+
+    return output;
+}
+"""
+
+matmul_scale_add_cpp = "torch::Tensor fused_matmul_scale_add_cuda(torch::Tensor, torch::Tensor, float);"
+
+matmul_scale_add = load_inline(
+    name="fused_matmul_scale_add",
+    cpp_sources=matmul_scale_add_cpp,
+    cuda_sources=matmul_scale_add_source,
+    functions=["fused_matmul_scale_add_cuda"],
+    verbose=True
+)
+
+# Custom fused kernel: Clamp + LogSumExp + Mish
+clamp_logsumexp_mish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__device__ float mish_cuda(float x) {
+    return x * tanh(log1p(exp(x)));
+}
+
+__global__ void fused_clamp_logsumexp_mish(
+    float* data,
+    int batch_size,
+    int hidden_size,
+    float clamp_min,
+    float clamp_max) {
+
+    int batch_idx = blockIdx.x;
+    int hidden_idx = threadIdx.x;
+
+    // Clamp
+    float clamped = data[batch_idx * hidden_size + hidden_idx];
+    clamped = fmaxf(clamp_min, fminf(clamped, clamp_max));
+
+    // Compute logsumexp across hidden dimension
+    __shared__ float sdata[512]; // Assuming hidden_size <= 512, adjust if needed
+    sdata[hidden_idx] = clamped;
+    __syncthreads();
+
+    for (int s=hidden_size/2; s>0; s>>=1) {
+        if (hidden_idx < s) {
+            sdata[hidden_idx] = fmaxf(sdata[hidden_idx], sdata[hidden_idx + s]);
+        }
+        __syncthreads();
+    }
+
+    float logsumexp_val = sdata[0];
+    if (hidden_idx == 0) {
+        logsumexp_val = 0.0;
+        for (int i=0; i<hidden_size; i++) {
+            logsumexp_val += exp(sdata[i] - logsumexp_val);
+        }
+        logsumexp_val = log(logsumexp_val);
+        data[batch_idx * hidden_size + 0] = logsumexp_val; // Store in first position
+    }
+    __syncthreads();
+
+    // Apply mish on logsumexp result
+    float logsumexp = data[batch_idx * hidden_size];
+    float mish_val = mish_cuda(logsumexp);
+
+    // Multiply mish with clamped value (original x)
+    data[batch_idx * hidden_size + hidden_idx] = clamped * mish_val;
+}
+
+torch::Tensor fused_clamp_logsumexp_mish_cuda(
+    torch::Tensor x,
+    float clamp_min,
+    float clamp_max) {
+
+    const int batch_size = x.size(0);
+    const int hidden_size = x.size(1);
+
+    auto output = x.clone();
+
+    const int block_size = hidden_size;
+    dim3 threads(block_size);
+    dim3 blocks(batch_size);
+
+    fused_clamp_logsumexp_mish<<<blocks, threads>>>(
+        output.data_ptr<float>(),
+        batch_size,
+        hidden_size,
+        clamp_min,
+        clamp_max);
+
+    return output;
+}
+"""
+
+clamp_logsumexp_mish_cpp = "torch::Tensor fused_clamp_logsumexp_mish_cuda(torch::Tensor, float, float);"
+
+clamp_logsumexp_mish = load_inline(
+    name="fused_clamp_logsumexp_mish",
+    cpp_sources=clamp_logsumexp_mish_cpp,
+    cuda_sources=clamp_logsumexp_mish_source,
+    functions=["fused_clamp_logsumexp_mish_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.empty(hidden_size, input_size))
+        self.bias = None  # No bias in original model
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))  # Match Linear init
+
+        self.scale_factor = scale_factor
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+        self.fused_matmul_scale_add = matmul_scale_add
+        self.fused_clamp_logsumexp_mish = clamp_logsumexp_mish
+
+    def forward(self, x):
+        # Fused matmul + scale + add
+        intermediate = self.fused_matmul_scale_add.fused_matmul_scale_add_cuda(
+            x, self.weight, self.scale_factor)
+        
+        # Fused clamp + logsumexp + mish
+        output = self.fused_clamp_logsumexp_mish.fused_clamp_logsumexp_mish_cuda(
+            intermediate, self.clamp_min, self.clamp_max)
+        
+        return output
+```
+</think>

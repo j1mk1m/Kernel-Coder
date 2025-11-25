@@ -1,0 +1,152 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA implementation of BatchNorm2d forward pass
+batchnorm2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+
+template <typename T>
+__global__ void batch_norm_forward(
+    const T* input, T* output, const T* weight, const T* bias,
+    const T* running_mean, const T* running_var, T eps,
+    int N, int C, int H, int W) {
+
+    const int HxW = H * W;
+    const int channels_per_block = 16;  // Tune this for better occupancy
+    const int block_size = 256;
+    __shared__ T shared_data[block_size * channels_per_block];
+    __shared__ T shared_mean[channels_per_block];
+    __shared__ T shared_var[channels_per_block];
+
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < C; c += gridDim.x * blockDim.x) {
+        T sum = 0;
+        T sq_sum = 0;
+        for (int n = 0; n < N; ++n) {
+            for (int hw = 0; hw < HxW; ++hw) {
+                int idx = n * C * HxW + c * HxW + hw;
+                T val = input[idx];
+                sum += val;
+                sq_sum += val * val;
+            }
+        }
+        // Atomic operations to accumulate across all threads
+        atomicAdd(&shared_data[threadIdx.x * channels_per_block + c % channels_per_block], sum);
+        atomicAdd(&shared_data[threadIdx.x * channels_per_block + c % channels_per_block + channels_per_block * (blockDim.x/2)], sq_sum);
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        for (int c = 0; c < C; c += channels_per_block) {
+            T mean = 0;
+            T var = 0;
+            for (int i = 0; i < blockDim.x; ++i) {
+                mean += shared_data[i * channels_per_block + c % channels_per_block];
+                var += shared_data[i * channels_per_block + c % channels_per_block + channels_per_block * (blockDim.x/2)];
+            }
+            mean /= (N * HxW);
+            var = (var / (N * HxW)) - mean * mean;
+            shared_mean[c] = mean;
+            shared_var[c] = var;
+        }
+    }
+    __syncthreads();
+
+    for (int idx = blockIdx.y * blockDim.x + threadIdx.x; idx < N * C * HxW; idx += gridDim.y * blockDim.x) {
+        int c = (idx / (HxW)) % C;
+        T mean = shared_mean[c];
+        T var = shared_var[c];
+        T inv_std = 1.0 / sqrt(var + eps);
+        T x = input[idx] - mean;
+        output[idx] = (weight[c] * inv_std * x) + bias[c];
+    }
+}
+
+torch::Tensor batch_norm_forward_cuda(
+    torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
+    torch::Tensor running_mean, torch::Tensor running_var, float eps) {
+
+    const int N = input.size(0);
+    const int C = input.size(1);
+    const int H = input.size(2);
+    const int W = input.size(3);
+
+    auto output = torch::empty_like(input);
+
+    dim3 threads(256);
+    dim3 blocks((C + 15) / 16, (N * C * H * W + 255) / 256);
+
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "batch_norm_forward", ([&] {
+        batch_norm_forward<scalar_t><<<blocks, threads>>>(
+            input.data<scalar_t>(), output.data<scalar_t>(),
+            weight.data<scalar_t>(), bias.data<scalar_t>(),
+            running_mean.data<scalar_t>(), running_var.data<scalar_t>(),
+            eps, N, C, H, W);
+    }));
+
+    return output;
+}
+"""
+
+batchnorm2d_cpp_source = (
+    "torch::Tensor batch_norm_forward_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::Tensor running_mean, torch::Tensor running_var, float eps);"
+)
+
+# Compile the inline CUDA code
+batch_norm_cuda = load_inline(
+    name="batch_norm_cuda",
+    cpp_sources=batchnorm2d_cpp_source,
+    cuda_sources=batchnorm2d_source,
+    functions=["batch_norm_forward_cuda"],
+    verbose=True,
+    extra_cflags=["-I/usr/local/cuda/include"],
+    extra_ldflags=["-lcublas", "-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.num_features = num_features
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        self.running_mean = nn.Parameter(torch.zeros(num_features), requires_grad=False)
+        self.running_var = nn.Parameter(torch.ones(num_features), requires_grad=False)
+        self.eps = 1e-5  # Default PyTorch epsilon
+        self.batch_norm_cuda = batch_norm_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure all tensors are on the same device (GPU)
+        x = x.cuda()
+        weight = self.weight.cuda()
+        bias = self.bias.cuda()
+        running_mean = self.running_mean.cuda()
+        running_var = self.running_var.cuda()
+
+        # Call custom CUDA kernel
+        output = self.batch_norm_cuda.batch_norm_forward_cuda(
+            x, weight, bias, running_mean, running_var, self.eps
+        )
+
+        return output
+
+# Compatibility layer to match original Model's interface
+class BatchNorm2dWrapper(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.model_new = ModelNew(num_features)
+
+    def forward(self, x):
+        return self.model_new(x)
+
+# Override the original Model class's bn layer with the wrapper
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.bn = BatchNorm2dWrapper(num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.bn(x)

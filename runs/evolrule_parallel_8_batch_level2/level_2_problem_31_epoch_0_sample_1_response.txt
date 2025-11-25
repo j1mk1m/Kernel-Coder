@@ -1,0 +1,785 @@
+        When writing kernels, consider the following tips:
+            - Use __global__ functions for CUDA kernels.
+            - Use torch.utils.cpp_extension.load_inline to embed code in the script.
+            - Make sure to handle memory allocation and error checking.
+            - Use the same inputs and outputs as the PyTorch operators you are replacing.
+            - Avoid unnecessary memory allocations (for example, by fusing operations).
+            - If you're unsure about the details, make a reasonable assumption and proceed.
+            - Do not use any third-party libraries other than PyTorch.
+            - You may also consider fusing operators, for example, fusing conv + min + add + mul into a single kernel.
+
+Okay, I need to optimize the given Model using custom CUDA kernels. Let's see the architecture first. The model has a convolution, then a min with a constant, adds a bias, and multiplies by a scaling factor. The goal is to replace these operations with custom CUDA kernels for speedup.
+
+First, looking at the sequence: conv -> min -> add bias -> multiply scaling. Since these are sequential operations, maybe I can fuse them into a single kernel to reduce memory access and kernel launch overhead. That would be better than separate kernels.
+
+Convolution itself is a complex operation, but since PyTorch's Conv2d is already optimized, maybe replacing it isn't worth it. However, the subsequent operations (min, add, mul) are element-wise, so fusing those with the convolution output might help.
+
+Wait, the convolution is the first step. The subsequent steps are element-wise. So perhaps after the convolution, instead of doing each step separately, we can process all of them in one kernel.
+
+So the plan is: write a CUDA kernel that takes the output of the convolution (x), and then in a single kernel, compute min(x, constant), add the bias, and multiply by scaling_factor. Since the bias is a parameter with shape (out_channels, 1, 1), it's broadcastable to the tensor's dimensions. The constant is a scalar (0.5), so min is per element with that value. The scaling factor is also a scalar.
+
+Let me think about the dimensions. The output of the convolution will be (batch, out_channels, H', W'), where H' and W' depend on the input size and kernel. The bias is (out_channels, 1, 1), so when adding, it's broadcast to each spatial position. The min with 0.5 is element-wise. So the fused kernel can process each element as follows:
+
+out[i] = min(x[i], 0.5) + bias[channel] * scaling_factor
+
+Wait, no, the sequence is: min first, then add bias, then multiply scaling. Wait, the original code:
+
+x = torch.min(x, torch.tensor(self.constant_value)) --> this is element-wise min between x and the constant.
+
+Then x = x + self.bias --> the bias is added. Then multiplied by scaling_factor.
+
+Wait, the order is min, add, multiply. So the formula is (min(x, c) + b) * s.
+
+Wait, the code says:
+
+x = torch.min(x, torch.tensor(self.constant_value))
+x = x + self.bias
+x = x * self.scaling_factor
+
+So the operations are min, add bias, then multiply scaling factor. So the formula is (min(x, c) + b) * s. Wait, no:
+
+Wait the code is:
+
+x = min(...)
+
+then x = x + bias --> adding the bias to the min result.
+
+then x = x * scaling_factor --> multiply by the scaling factor.
+
+So the overall formula is ( (min(x, c) ) + bias ) * s ?
+
+Wait, the code is (min(x, c) + bias) * s?
+
+Yes. So each element is first min with the constant, then add the bias (which is per channel, since the bias has shape (out_channels,1,1)), then multiply by the scaling factor.
+
+So in a single kernel, for each element, we can compute this.
+
+So the fused kernel would take the output of the convolution, then apply min, add bias, multiply scaling, all in one step.
+
+That would avoid intermediate tensors and memory copies, which is good for performance.
+
+Therefore, I can write a CUDA kernel that takes the conv output, the constant, the bias, and scaling factor, and compute the fused operations.
+
+Now, how to structure the kernel.
+
+First, the inputs to the kernel are:
+
+- The conv output tensor (x): shape (batch, out_channels, H, W)
+
+- The constant value (scalar)
+
+- The bias tensor (shape (out_channels, 1, 1))
+
+- The scaling factor (scalar)
+
+The output tensor is the same shape as x.
+
+In the kernel, for each element, we can compute the value as:
+
+value = (min(x_val, constant) + bias_val) * scaling_factor
+
+Wait, the bias is per channel, so for a given position (b, c, h, w), the bias value is bias[c][0][0].
+
+So in the kernel:
+
+for each element (b, c, h, w):
+
+current_val = x[b][c][h][w]
+
+min_val = min(current_val, constant)
+
+add_bias = min_val + bias[c][0][0]
+
+result = add_bias * scaling_factor
+
+store in output.
+
+So the kernel needs to loop over all elements.
+
+To implement this in CUDA, the kernel will need to compute the linear index, then compute the indices (b, c, h, w) from that. Alternatively, use a grid that maps threads to elements.
+
+The steps to write the CUDA code:
+
+First, define the CUDA kernel function.
+
+The kernel will take pointers to the input data, output data, the constant, bias data, scaling factor, and the dimensions.
+
+The kernel's parameters would be:
+
+- const float* input,
+
+- const float* bias,
+
+- float constant_value,
+
+- float scaling_factor,
+
+- int batch_size,
+
+- int out_channels,
+
+- int height,
+
+- int width,
+
+- float* output,
+
+Then each thread handles one element.
+
+The total number of elements is batch_size * out_channels * height * width.
+
+The kernel can be launched with a 1D grid, where each thread computes one element.
+
+The thread index can be calculated as:
+
+int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+Then, compute the indices:
+
+int w = idx % width;
+
+int h = (idx / width) % height;
+
+int c = (idx / (width * height)) % out_channels;
+
+int b = idx / (width * height * out_channels);
+
+Alternatively, maybe better to compute in a different order, but this should work.
+
+Then, get the input value at (b,c,h,w):
+
+float in_val = input[ idx ];
+
+The bias value is at bias[c], since the bias has shape (out_channels,1,1), so bias[c * 1 * 1 + 0 + 0] = bias[c].
+
+Then compute:
+
+float min_val = fminf(in_val, constant_value);
+
+float add_bias = min_val + bias[c];
+
+float out_val = add_bias * scaling_factor;
+
+output[idx] = out_val;
+
+Wait, but the input's storage is contiguous? The input is a tensor, so the layout depends on strides. Assuming that the input is in a contiguous format, the linear index calculation works as above.
+
+But need to make sure that the input and output tensors are contiguous. So in the PyTorch wrapper, we can call .contiguous() to ensure that.
+
+So the CUDA kernel code would look like:
+
+__global__ void fused_kernel(const float* input, const float* bias, float constant, float scaling, int batch, int channels, int h, int w, float* output) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= batch * channels * h * w) return;
+
+    int w_pos = idx % w;
+
+    int h_pos = (idx / w) % h;
+
+    int c = (idx / (w*h)) % channels;
+
+    int b = idx / (w*h*channels);
+
+    float in_val = input[idx];
+
+    float min_val = fminf(in_val, constant);
+
+    float bias_val = bias[c]; // since bias is (channels, 1,1), so index c*1*1 + 0 +0 is just c.
+
+    float temp = min_val + bias_val;
+
+    float out_val = temp * scaling;
+
+    output[idx] = out_val;
+
+}
+
+Then the wrapper function in PyTorch would be:
+
+def fused_op_cuda(input, bias, constant, scaling):
+
+    # Compute the total elements
+
+    batch, channels, h, w = input.shape
+
+    assert bias.shape == (channels, 1, 1), "Bias shape mismatch"
+
+    output = torch.empty_like(input)
+
+    threads_per_block = 256
+
+    blocks_per_grid = (batch * channels * h * w + threads_per_block - 1) // threads_per_block
+
+    # Launch the kernel
+
+    fused_kernel<<<blocks_per_grid, threads_per_block>>>(
+        input.data_ptr(),
+        bias.data_ptr(),
+        constant,
+        scaling,
+        batch,
+        channels,
+        h,
+        w,
+        output.data_ptr()
+    )
+
+    return output
+
+Wait, but the parameters passed to the kernel have to be the same as the kernel's parameters. Let me check:
+
+The kernel's parameters are:
+
+input: const float*
+
+bias: const float*
+
+constant: float
+
+scaling: float
+
+batch: int
+
+channels: int
+
+h: int
+
+w: int
+
+output: float*
+
+Yes, so the kernel is called with those parameters. The wrapper function will take those parameters.
+
+Now, in the ModelNew class, instead of doing the convolution and then the element-wise operations, we can replace those steps with:
+
+But wait, the convolution is already done by PyTorch's Conv2d, so the first step is still the same. Then, after the convolution, we can apply the fused kernel.
+
+Wait, the original code in Model is:
+
+x = self.conv(x)
+
+then the element-wise operations. So in the new model, we can keep the convolution as is (since it's already optimized), and replace the min, add, multiply steps with the fused kernel.
+
+Alternatively, if possible, can we fuse the convolution with the element-wise operations? Probably not, because convolution is a complex operation and the element-wise steps are separate. So the best approach is to fuse the element-wise steps into a single kernel.
+
+Thus, in the ModelNew, the forward would be:
+
+x = self.conv(x)
+
+x = fused_kernel(x, self.bias, self.constant_value, self.scaling_factor)
+
+Therefore, the fused kernel replaces the three operations (min, add, multiply) with a single kernel, which is more efficient.
+
+Now, to implement this in code:
+
+First, define the CUDA kernel and the wrapper in the Python script.
+
+The CUDA code will be written as a string for inline compilation.
+
+So in the code:
+
+from torch.utils.cpp_extension import load_inline
+
+Then, the CUDA source code for the fused kernel.
+
+Wait, the kernel needs to be written in CUDA C++. Let's write the kernel code.
+
+The CUDA source code would be:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* input,
+    const float* bias,
+    float constant,
+    float scaling_factor,
+    int batch_size,
+    int out_channels,
+    int height,
+    int width,
+    float* output
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_channels * height * width) return;
+
+    // Compute indices
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c = (idx / (width * height)) % out_channels;
+    int b = idx / (width * height * out_channels);
+
+    float in_val = input[idx];
+    float min_val = fminf(in_val, constant);
+    float bias_val = bias[c]; // since bias is (out_channels, 1, 1)
+    float temp = min_val + bias_val;
+    float out_val = temp * scaling_factor;
+
+    output[idx] = out_val;
+}
+
+Then the wrapper function in the CUDA code:
+
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    torch::Tensor bias,
+    float constant,
+    float scaling_factor
+) {
+    // Ensure input and bias are contiguous
+    input = input.contiguous();
+    bias = bias.contiguous();
+
+    // Get dimensions
+    int batch_size = input.size(0);
+    int out_channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    // Check bias dimensions
+    TORCH_CHECK(bias.sizes() == torch::IntArrayRef({out_channels, 1, 1}), "Bias shape mismatch");
+
+    // Output tensor
+    auto output = torch::empty_like(input);
+
+    const int threads_per_block = 256;
+    int elements = batch_size * out_channels * height * width;
+    int blocks_per_grid = (elements + threads_per_block - 1) / threads_per_block;
+
+    // Launch kernel
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        constant,
+        scaling_factor,
+        batch_size,
+        out_channels,
+        height,
+        width,
+        output.data_ptr<float>()
+    );
+
+    cudaDeviceSynchronize(); // For safety, but may not be needed if using in a forward pass
+    return output;
+}
+
+Wait, but in the CUDA kernel, the parameters are passed as batch_size, out_channels, height, width. The wrapper function computes those from input's shape.
+
+Now, the corresponding C++ header declarations:
+
+The .cpp source would have the function declaration:
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor input, torch::Tensor bias, float constant, float scaling_factor);
+
+So in the inline code, the CUDA sources and CPP sources must be provided.
+
+Putting this together, the Python code would have:
+
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* input,
+    const float* bias,
+    float constant,
+    float scaling_factor,
+    int batch_size,
+    int out_channels,
+    int height,
+    int width,
+    float* output
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_channels * height * width) return;
+
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c = (idx / (width * height)) % out_channels;
+    int b = idx / (width * height * out_channels);
+
+    float in_val = input[idx];
+    float min_val = fminf(in_val, constant);
+    float bias_val = bias[c]; // bias is (out_channels, 1, 1)
+    float temp = min_val + bias_val;
+    float out_val = temp * scaling_factor;
+
+    output[idx] = out_val;
+}
+
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    torch::Tensor bias,
+    float constant,
+    float scaling_factor
+) {
+    input = input.contiguous();
+    bias = bias.contiguous();
+
+    int batch_size = input.size(0);
+    int out_channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    TORCH_CHECK(bias.sizes() == torch::IntArrayRef({out_channels, 1, 1}), "Bias shape mismatch");
+
+    auto output = torch::empty_like(input);
+
+    const int threads_per_block = 256;
+    int elements = batch_size * out_channels * height * width;
+    int blocks_per_grid = (elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        constant,
+        scaling_factor,
+        batch_size,
+        out_channels,
+        height,
+        width,
+        output.data_ptr<float>()
+    );
+
+    return output;
+}
+"""
+
+Then the cpp sources:
+
+fused_elementwise_cpp = """
+torch::Tensor fused_elementwise_cuda(torch::Tensor input, torch::Tensor bias, float constant, float scaling_factor);
+"""
+
+Then, compiling this:
+
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True
+)
+
+Wait, in the ModelNew class, the parameters are stored, so in the forward:
+
+def forward(self, x):
+    x = self.conv(x)
+    x = self.fused_elementwise.fused_elementwise_cuda(x, self.bias, self.constant_value, self.scaling_factor)
+    return x
+
+Wait, but in the original Model, the constant_value is a scalar stored as an attribute, and scaling_factor is also a scalar.
+
+Wait, in the original code, the Model has:
+
+self.constant_value = constant_value (a float)
+
+self.scaling_factor = scaling_factor (a float)
+
+Therefore, in the new model, those attributes are still present, so in the forward, we can pass them as arguments.
+
+Thus, the code for the new model would be:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, constant_value, bias_shape, scaling_factor):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.constant_value = constant_value
+        self.scaling_factor = scaling_factor
+        self.fused_elementwise = fused_elementwise  # the loaded module
+
+    def forward(self, x):
+        x = self.conv(x)
+        # The fused kernel takes input, bias, constant, scaling_factor
+        x = self.fused_elementwise.fused_elementwise_cuda(
+            x, self.bias, self.constant_value, self.scaling_factor
+        )
+        return x
+
+Wait, but the fused_elementwise is a module loaded via load_inline, so perhaps the syntax is to call the function through the module.
+
+Alternatively, perhaps when you load the inline extension, the function is added to the module. The way in the example code, they did:
+
+elementwise_add = load_inline(...)
+
+then in the model, they called elementwise_add.elementwise_add_cuda(a, b)
+
+So similarly here, the fused_elementwise module's function is called as fused_elementwise.fused_elementwise_cuda(...).
+
+Yes, that's right.
+
+Now, need to make sure that all parameters are correctly passed. The bias is a parameter of the model, so it's a tensor, and the constant and scaling are scalars stored in the model's attributes.
+
+Testing the code:
+
+The get_inputs and get_init_inputs functions are the same as before, so when creating the model, the parameters are passed correctly.
+
+Potential issues:
+
+- The bias tensor must be of shape (out_channels, 1, 1). Since in the original model, the bias is initialized as nn.Parameter(torch.randn(bias_shape)), which is correct.
+
+- The kernel must be launched with the correct grid and block dimensions.
+
+- The CUDA kernel must handle all indices correctly.
+
+Another thing: in the kernel, the input and output are assumed to be contiguous. The code in the wrapper calls input.contiguous() and bias.contiguous() to ensure that. The output is created via torch.empty_like(input), which will have the same memory layout as input, so if input is contiguous, output is too.
+
+Thus, this should work.
+
+Additionally, the original code's min operation is between the tensor and a tensor of the constant value. However, in PyTorch, torch.min(a, b) takes two tensors and returns the element-wise min. But when the second argument is a scalar, like torch.tensor(0.5), then it would broadcast the scalar to match the tensor's shape. So the min operation is indeed element-wise between the tensor and the scalar.
+
+Therefore, the kernel correctly implements that by comparing each element to the constant.
+
+So this fused kernel should replace the three operations (min, add, multiply) into one kernel, improving performance by reducing memory access and kernel launches.
+
+Now, putting all this into code:
+
+The full code would be:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused element-wise kernel
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* input,
+    const float* bias,
+    float constant,
+    float scaling_factor,
+    int batch_size,
+    int out_channels,
+    int height,
+    int width,
+    float* output
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_channels * height * width) return;
+
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c = (idx / (width * height)) % out_channels;
+    int b = idx / (width * height * out_channels);
+
+    float in_val = input[idx];
+    float min_val = fminf(in_val, constant);
+    float bias_val = bias[c]; // bias is (out_channels, 1, 1)
+    float temp = min_val + bias_val;
+    float out_val = temp * scaling_factor;
+
+    output[idx] = out_val;
+}
+
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    torch::Tensor bias,
+    float constant,
+    float scaling_factor
+) {
+    input = input.contiguous();
+    bias = bias.contiguous();
+
+    int batch_size = input.size(0);
+    int out_channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    // Check bias dimensions
+    TORCH_CHECK(bias.sizes() == torch::IntArrayRef({out_channels, 1, 1}), 
+                "Bias tensor must have shape (out_channels, 1, 1)");
+
+    auto output = torch::empty_like(input);
+
+    const int threads_per_block = 256;
+    int elements = batch_size * out_channels * height * width;
+    int blocks_per_grid = (elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        constant,
+        scaling_factor,
+        batch_size,
+        out_channels,
+        height,
+        width,
+        output.data_ptr<float>()
+    );
+
+    return output;
+}
+"""
+
+fused_elementwise_cpp = """
+torch::Tensor fused_elementwise_cuda(torch::Tensor input, torch::Tensor bias, float constant, float scaling_factor);
+"""
+
+# Load the fused element-wise CUDA extension
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, constant_value, bias_shape, scaling_factor):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.constant_value = constant_value
+        self.scaling_factor = scaling_factor
+        self.fused_elementwise = fused_elementwise  # Reference to the CUDA module
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Apply fused operations using the custom CUDA kernel
+        x = self.fused_elementwise.fused_elementwise_cuda(
+            x, self.bias, self.constant_value, self.scaling_factor
+        )
+        return x
+
+# The existing get_inputs and get_init_inputs remain the same as in the original code
+```
+
+Wait, but in the original problem, the user provided the get_inputs and get_init_inputs functions. The user's code includes those, so the new code should include them as well, but according to the problem statement, the user's code includes them, but the output should only have the ModelNew and related code, not the get_inputs, since the instructions say to output the new architecture in the code block, and not to include testing code.
+
+So in the problem, the user is to output ModelNew in a code block. The rest of the functions like get_inputs can remain as in the original code, so we don't need to include them in the new code. The user's original code has those functions, so we don't need to redefine them unless required. Since the problem says to output the optimized architecture named ModelNew, the code should include that class and the CUDA extensions.
+
+Therefore, the code above is correct.
+
+Potential issues:
+
+- The kernel uses fminf, which is okay.
+
+- The bias is accessed as bias[c], since the bias is a 1D array when contiguous? Wait, the bias is a tensor of shape (out_channels, 1, 1). When we call contiguous(), it's stored as a contiguous array, so for the index c, the element at position c is the first element of the c-th channel. Since all the elements in that channel's 1x1 are the same, accessing bias[c] gives the correct value. Because the bias tensor is (C,1,1), so when flattened, the first element of each channel is at c * 1 * 1 + 0 + 0 = c. Therefore, yes, the code is correct.
+
+Another thing: the kernel's grid and block sizes are chosen as 256 threads per block, which is standard. The number of blocks is computed correctly.
+
+Also, in the wrapper function, after launching the kernel, we return the output immediately. CUDA is asynchronous, so the kernel runs in the background. However, in the forward pass, since subsequent operations depend on the output, PyTorch's autograd will handle dependencies, so no need for cudaDeviceSynchronize() unless there's a need for synchronization. But the example code from the user included a synchronize in their kernel. Wait, in the user's example, they didn't have a synchronize. Let me check:
+
+In the example given by the user for elementwise_add, the kernel launch is followed by returning the tensor, no synchronize. So perhaps it's unnecessary here too. The code in the fused_elementwise_cuda does not have synchronize. It might be okay, since the output tensor's data is not read immediately, but in PyTorch, the dependencies should be tracked via events. So probably safe to omit.
+
+Therefore, this code should be correct.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused element-wise kernel
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* input,
+    const float* bias,
+    float constant,
+    float scaling_factor,
+    int batch_size,
+    int out_channels,
+    int height,
+    int width,
+    float* output
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_channels * height * width) return;
+
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c = (idx / (width * height)) % out_channels;
+    int b = idx / (width * height * out_channels);
+
+    float in_val = input[idx];
+    float min_val = fminf(in_val, constant);
+    float bias_val = bias[c]; // bias is (out_channels, 1, 1)
+    float temp = min_val + bias_val;
+    float out_val = temp * scaling_factor;
+
+    output[idx] = out_val;
+}
+
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    torch::Tensor bias,
+    float constant,
+    float scaling_factor
+) {
+    input = input.contiguous();
+    bias = bias.contiguous();
+
+    int batch_size = input.size(0);
+    int out_channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    // Check bias dimensions
+    TORCH_CHECK(bias.sizes() == torch::IntArrayRef({out_channels, 1, 1}), 
+                "Bias tensor must have shape (out_channels, 1, 1)");
+
+    auto output = torch::empty_like(input);
+
+    const int threads_per_block = 256;
+    int elements = batch_size * out_channels * height * width;
+    int blocks_per_grid = (elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        constant,
+        scaling_factor,
+        batch_size,
+        out_channels,
+        height,
+        width,
+        output.data_ptr<float>()
+    );
+
+    return output;
+}
+"""
+
+fused_elementwise_cpp = """
+torch::Tensor fused_elementwise_cuda(torch::Tensor input, torch::Tensor bias, float constant, float scaling_factor);
+"""
+
+# Load the fused element-wise CUDA extension
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, constant_value, bias_shape, scaling_factor):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.constant_value = constant_value
+        self.scaling_factor = scaling_factor
+        self.fused_elementwise = fused_elementwise  # Reference to the CUDA module
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Apply fused operations using the custom CUDA kernel
+        x = self.fused_elementwise.fused_elementwise_cuda(
+            x, self.bias, self.constant_value, self.scaling_factor
+        )
+        return x
+```

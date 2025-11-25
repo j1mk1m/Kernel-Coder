@@ -1,0 +1,674 @@
+You are to replace the mean operator with a custom CUDA kernel. The kernel must be a vectorized implementation using shared memory to achieve high performance. The kernel should handle tensors of arbitrary shape, but the mean is taken over all dimensions except the batch dimension (i.e., dimensions 1 to 4). Your kernel should compute the sum across all non-batch dimensions first, then divide by the total number of elements in those dimensions. 
+
+You should also replace the Conv3d operator with a custom CUDA kernel. For the convolution, you must implement an optimized version of the 3D convolution using a tiled approach to maximize compute efficiency. You can assume the input and output tensors are on the GPU. You may use PyTorch's existing CUDA functions for memory allocation and data access, but the convolution computation itself must be done in your kernel. 
+
+Do not replace the GroupNorm operator.
+
+I will judge your code based on:
+1. Correctness: Does the code work and produce the same output as the original?
+2. Performance: Does your implementation effectively utilize GPU resources (e.g., shared memory, thread tiling) to reduce memory access latency and maximize parallelism?
+3. Adherence to instructions: Did you only replace the specified operators (mean and conv3d) and leave the group norm untouched?
+
+First, write the code for the custom mean kernel, then the custom conv3d kernel. Make sure to include all necessary headers and compilation flags. Also, ensure that the ModelNew class uses the custom kernels correctly. 
+
+The input and output shapes must remain the same as the original model. Also, note that the original model's mean is taken over all dimensions except the batch dimension (dim [1,2,3,4]).
+
+To simplify, assume the convolution has a kernel size of 3x3x3 (since kernel_size is 3 in the example), padding is automatically handled to keep spatial dimensions, but you may set padding to 1 to maintain input spatial dimensions. You can assume stride=1 and dilation=1 for simplicity.
+
+When implementing convolution, focus on the compute-bound part (the actual computation of the output) and not the memory allocation or data movement, but you must handle the input and output tensors correctly. 
+
+For the convolution kernel, use a tiled approach where threads process tiles of the input and output, using shared memory to cache input and weight tiles to reduce global memory accesses.
+
+To implement the convolution, you can structure your kernel to process output channels in blocks and use thread collaboration to compute multiple output values per thread.
+
+For the mean kernel, the key is to use shared memory to accumulate partial sums across threads in a block, then sum those partials to get the total sum for each sample in the batch. The division by the total elements (after summing) should be done in a separate kernel or in the same kernel, but must be vectorized.
+
+Make sure to handle arbitrary input shapes (but the mean is over non-batch dimensions). The convolution should work for any input shape given the kernel size and padding. 
+
+When writing the code, use PyTorch's extension API to load the CUDA kernels inline, similar to the example provided.
+
+Okay, I need to optimize the given Model by replacing the mean and Conv3d operators with custom CUDA kernels, while leaving GroupNorm untouched. Let me start with the mean kernel first.
+
+The mean operation in the original model is over dimensions [1,2,3,4], which are all except the batch. The custom kernel needs to compute the sum over these dimensions first, then divide by the total number of elements in those dimensions.
+
+For the mean kernel using shared memory, I should have each thread handle a portion of the input tensor. The idea is to accumulate partial sums in shared memory to reduce global memory accesses. Since the input is 5D (batch, channels, D, H, W), each batch element's non-batch dimensions need to be summed. 
+
+The plan is: for each batch element, all threads in a block process their assigned elements, store partial sums in shared memory, then sum those to get the total per batch. The division can be done in a separate kernel or within the same one. But combining might be better for efficiency.
+
+Wait, maybe the kernel can process all elements of a single batch sample. So, the block is per batch element. Each thread in the block processes a chunk of the elements. They accumulate into shared memory, then the block's threads can sum the shared memory to get the total sum. Then divide by the total elements (stored as a constant). 
+
+The total elements per batch element is the product of the last four dimensions. So, for each batch element, the number of elements is C*D*H*W. 
+
+So, for the kernel:
+
+- Launch a kernel with one block per batch element. Each block handles one batch sample.
+- Each thread in the block processes a portion of the elements in that sample.
+- Use shared memory to accumulate the partial sums from all threads in the block.
+- After all threads have written their partial sums to shared memory, have one thread (or a reduction step) sum the shared memory to get the total.
+- Then write that total divided by (C*D*H*W) to the output tensor for that batch element.
+
+To compute the total elements per sample, since the input tensor's shape is known at runtime, each kernel instance can calculate it as (input.size(1) * input.size(2) * input.size(3) * input.size(4)). 
+
+But how to handle this in the kernel? Each block needs to compute this. Alternatively, we can precompute the number of elements per sample and pass it as an argument. Wait, but in the kernel, since the input tensor's shape can vary, perhaps we can compute it inside the kernel. Let me think:
+
+Inside the kernel, for a given batch index, the number of elements is the product of the shape dimensions 1 to 4. So, in the kernel, each block (representing a batch element) can compute this as:
+
+int elements = input.size(1) * input.size(2) * input.size(3) * input.size(4);
+
+Wait, but in CUDA kernels, we can't directly access tensor metadata like size(). So we need to pass the dimensions as arguments. Alternatively, perhaps we can compute it via the total elements per batch. Hmm, better to pass the dimensions as parameters. 
+
+Wait, the problem states that the kernel should handle arbitrary shapes, but the mean is over all non-batch dimensions. So the dimensions after the batch can vary, so the kernel must dynamically compute the total elements. 
+
+But in CUDA, we can't compute the tensor's size inside the kernel. So perhaps the kernel must be called with the total elements per sample as an argument. So in the Python code, before launching the kernel, we can compute the total elements (prod(input.shape[1:])) and pass that as a parameter.
+
+Therefore, the plan is:
+
+In the Python function for the mean kernel:
+
+Compute the total_elements = input.size(1) * input.size(2) * input.size(3) * input.size(4)
+
+Then, pass total_elements as an integer parameter to the kernel.
+
+The kernel will process each batch element in a block. Each block processes one batch element.
+
+Within each block:
+
+- The threads collectively process all elements of the batch element. The number of threads per block can be chosen such that it's a reasonable size (like 256 or 512), and they each process a chunk of the elements.
+
+- Each thread loads its assigned elements, sums them, and writes the partial sum to shared memory.
+
+- Then, perform a reduction in shared memory to get the total sum for the batch element.
+
+- Finally, divide the total sum by total_elements and write to the output tensor.
+
+The output tensor is of shape (batch_size, 1), so for each batch element, the result is a single value.
+
+Now, code outline for the mean kernel:
+
+First, the kernel function:
+
+__global__ void custom_mean_kernel(const float* input, float* output, int batch_size, int total_elements, int elements_per_sample) {
+    // blockIdx.x corresponds to the batch element index
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    extern __shared__ float partial_sums[];
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float sum = 0.0f;
+
+    // Compute the offset for this batch element
+    int offset = batch_idx * elements_per_sample;
+
+    // Each thread processes elements from offset + tid, offset + tid + stride, etc.
+    for (int i = tid; i < elements_per_sample; i += stride) {
+        sum += input[offset + i];
+    }
+
+    // Write partial sum to shared memory
+    partial_sums[tid] = sum;
+    __syncthreads();
+
+    // Perform reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_sums[tid] += partial_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // The final sum is in partial_sums[0]
+    if (tid == 0) {
+        float total = partial_sums[0];
+        output[batch_idx] = total / total_elements;
+    }
+}
+
+Wait, but elements_per_sample is total_elements, right? Because elements_per_sample is the product of the dimensions except batch. So total_elements is the same as elements_per_sample for each batch element. So maybe passing elements_per_sample is redundant, but in any case, let's see:
+
+Wait, the total_elements is the number of elements per sample (since all samples have the same shape). So passing that once is okay.
+
+Wait, the parameters would be:
+
+input: the input tensor pointer
+
+output: output tensor pointer (shape [batch_size])
+
+batch_size: the number of batches
+
+total_elements: the number of elements per batch sample (C*D*H*W)
+
+elements_per_sample: same as total_elements? Maybe redundant. Let's just pass total_elements.
+
+Wait, in the code above, elements_per_sample is the same as total_elements. So maybe just pass total_elements. So the parameters would be:
+
+input, output, batch_size, total_elements.
+
+Wait, let's adjust the kernel parameters. 
+
+Wait, in the kernel code, the offset for a batch element is batch_idx * total_elements, because each batch element has total_elements elements. So the total elements per sample is total_elements.
+
+Hence, the kernel parameters can be:
+
+input, output, batch_size, total_elements.
+
+Wait, but the input tensor has shape (batch_size, C, D, H, W). So the stride between elements of different batches is C*D*H*W, which is exactly total_elements. 
+
+So the kernel code would have:
+
+offset = batch_idx * total_elements.
+
+Therefore, the kernel function can be written with those parameters.
+
+Now, the shared memory size is the number of threads per block, which is blockDim.x. So when launching the kernel, we need to allocate enough shared memory. 
+
+The number of threads per block can be chosen as, say, 256, so that the shared memory per block is 256 floats, which is 1KB, acceptable.
+
+Now, in the Python wrapper for this kernel:
+
+The function would be:
+
+def custom_mean_cuda(input, total_elements):
+
+    output = torch.empty(batch_size, dtype=input.dtype, device=input.device)
+
+    threads_per_block = 256
+
+    blocks_per_grid = input.size(0)
+
+    # Compute total_elements = input[1:].numel() per sample? Wait, total_elements is passed as an argument.
+
+    # Launch kernel
+
+    custom_mean_kernel[blocks_per_grid, threads_per_block, 0, threads_per_block * sizeof(float)] (
+        input.data_ptr(), output.data_ptr(), input.size(0), total_elements)
+
+Wait, but in the Python code, when calling the kernel, we have to compute total_elements as the product of the input's shape[1:], which can be done via:
+
+total_elements = input.size(1) * input.size(2) * input.size(3) * input.size(4)
+
+So in the Python function, we need to compute that before calling the CUDA kernel.
+
+Putting it all together, the CUDA code for the mean kernel would be:
+
+First, the CUDA source code for the mean kernel:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename T>
+__global__ void custom_mean_kernel(const T* input, T* output, int batch_size, int total_elements) {
+    extern __shared__ T partial_sums[];
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    T sum = 0.0;
+
+    int offset = batch_idx * total_elements;
+    for (int i = tid; i < total_elements; i += stride) {
+        sum += input[offset + i];
+    }
+
+    partial_sums[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial_sums[tid] += partial_sums[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[batch_idx] = partial_sums[0] / static_cast<T>(total_elements);
+    }
+}
+
+// Since PyTorch uses float, we can specialize for float.
+void custom_mean_cuda(torch::Tensor input, torch::Tensor output, int total_elements) {
+    int batch_size = input.size(0);
+    int threads_per_block = 256;
+    int blocks_per_grid = batch_size;
+
+    const int shared_size = threads_per_block * sizeof(float);
+
+    custom_mean_kernel<float><<<blocks_per_grid, threads_per_block, shared_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        total_elements);
+}
+
+Wait, but in the wrapper function, the output tensor must be preallocated. So the Python function would create the output tensor as torch.empty([batch_size], device='cuda'), then call the kernel.
+
+Wait, the kernel function in the example uses a separate launcher function. Let me adjust:
+
+Alternatively, the Python wrapper can be written as a function that takes input and returns output. But in the CUDA code, the kernel is launched in a function. So:
+
+The CUDA code would have a function like:
+
+torch::Tensor custom_mean_cuda(torch::Tensor input) {
+    int batch_size = input.size(0);
+    int total_elements = input.size(1)*input.size(2)*input.size(3)*input.size(4);
+    auto output = torch::empty({batch_size}, input.options());
+    
+    int threads_per_block = 256;
+    int blocks_per_grid = batch_size;
+
+    const int shared_size = threads_per_block * sizeof(float);
+
+    custom_mean_kernel<float><<<blocks_per_grid, threads_per_block, shared_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        total_elements);
+    return output;
+}
+
+Wait, but in the code, the kernel function is templated, but when calling, we need to use float as the type. 
+
+Alternatively, perhaps better to write the kernel without templates and assume float.
+
+Alternatively, let me adjust the kernel code to be for float:
+
+__global__ void custom_mean_kernel(const float* input, float* output, int batch_size, int total_elements) {
+    // ... same as before ...
+}
+
+Then the launcher function:
+
+torch::Tensor custom_mean_cuda(torch::Tensor input) {
+    int batch_size = input.size(0);
+    int total_elements = input.size(1) * input.size(2) * input.size(3) * input.size(4);
+    auto output = torch::empty({batch_size}, input.options());
+    
+    int threads_per_block = 256;
+    int blocks_per_grid = batch_size;
+
+    const int shared_size = threads_per_block * sizeof(float);
+
+    custom_mean_kernel<<<blocks_per_grid, threads_per_block, shared_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        total_elements);
+    return output;
+}
+
+This should work. The function computes the total_elements as the product of the dimensions after the first (batch).
+
+Now, moving to the Conv3D kernel. This is more complex.
+
+The original model uses a Conv3d layer. We need to replace it with a custom CUDA kernel using tiled approach, shared memory, etc.
+
+First, the convolution parameters: in_channels=3, out_channels=24, kernel_size=3 (so 3x3x3 kernel). The padding is automatically handled to keep spatial dimensions. Assuming stride=1, padding=1 (since kernel_size 3 needs padding 1 for same spatial dimensions).
+
+The Conv3d operation is compute-intensive. The naive implementation would have each thread compute a single output element, but that's inefficient. Instead, a tiled approach where threads collaborate to load tiles of input and kernel into shared memory, then compute their portion.
+
+The standard approach for optimized convolution is to use the tiled im2col approach, but since we are doing it manually, let's think:
+
+Each output element (for a given output channel, spatial position) is the sum over the input channels, and over the kernel's spatial positions.
+
+The input has shape (N, C_in, D, H, W)
+
+The kernel (weights) has shape (C_out, C_in, Kd, Kh, Kw)
+
+The output is (N, C_out, D_out, H_out, W_out), here with padding=1, stride=1, so D_out = D, H_out=H, W_out=W.
+
+The convolution computation for a single output element at position (n, c_out, d, h, w) is:
+
+sum_{c_in=0 to C_in-1} sum_{kd=0 to Kd-1} sum_{kh=0 to Kh-1} sum_{kw=0 to Kw-1} 
+
+input[n, c_in, d + kd - pad_d, h + kh - pad_h, w + kw - pad_w] * weight[c_out, c_in, kd, kh, kw]
+
+But with padding=1, the input is padded, so the actual input indices are adjusted. Since padding is 1 in all dimensions, the input is effectively padded to (D+2, H+2, W+2). So the indices without padding would be:
+
+input_padded[n, c_in, d + kd, h + kh, w + kw]
+
+Wait, perhaps better to think in terms of the padded input. But since PyTorch's Conv3d handles padding automatically, the input given to the kernel is already padded? Or does the kernel need to handle padding?
+
+Wait, in the original model, the Conv3d is defined with kernel_size=3, but the problem states that "padding is automatically handled to keep spatial dimensions". Therefore, the padding is 1 in all spatial dimensions. So the input to the convolution (in our custom kernel) must have already been padded. Wait, no. The original model uses the PyTorch Conv3d, which when given padding=1 would handle it. But in our custom kernel, since we are replacing the Conv3d, we must handle the padding ourselves, or assume that the input is already padded.
+
+Alternatively, perhaps the problem expects us to handle the padding as part of the kernel. But to simplify, perhaps we can assume that the kernel uses the same padding as PyTorch's default for 'same' dimensions. Since kernel_size is 3, padding=1 is needed. So the input must be padded with 1 on each side in each spatial dimension. 
+
+However, in the given code, the get_inputs() function provides an input tensor without padding. So when replacing the Conv3d, the custom kernel must handle padding.
+
+Therefore, in the kernel, we need to pad the input tensor with zeros on all sides by 1 in each spatial dimension. Alternatively, the kernel can compute the indices with padding in mind.
+
+Alternatively, perhaps the input is passed to the kernel without padding, and the kernel's code must access the padded regions by checking boundaries. For example, when accessing input[d, h, w], if d is outside the original input's spatial dimensions, it returns 0. This could be done via conditional statements, but that would introduce divergence and slow down the kernel. Hence, better to pad the input tensor first.
+
+So, the approach would be:
+
+1. Pad the input tensor with a border of 1 in all spatial dimensions. So the padded input has shape (N, C_in, D+2, H+2, W+2).
+
+2. The kernel computes the output using this padded input.
+
+Therefore, in the kernel, we can assume that the input has been pre-padded with 1 in each spatial dimension.
+
+Hence, the first step in the kernel is to handle the padding by expanding the input. But how?
+
+Wait, in the code, the custom Conv3d kernel must handle the padding internally. So in the Python code that wraps the kernel, before launching the kernel, we can pad the input tensor using PyTorch's functional.pad or manually.
+
+Alternatively, the kernel can handle the padding by checking if the index is within bounds. For example, when computing the input index:
+
+int id = d_in + kd - 1;
+
+Wait, perhaps it's better to have the kernel work with the original input tensor and handle the padding via conditionals, but that might be slow. Alternatively, to pre-pad the input.
+
+Let me think of the steps in the kernel.
+
+The standard tiled approach for convolution is to use blocks to process output regions. Each thread block processes a tile of the output, and uses shared memory to cache the input and kernel tiles needed for that region.
+
+The steps for the kernel:
+
+- The kernel is designed to process a 3D output region (in terms of spatial dimensions), and handle the input channels and output channels.
+
+But given the complexity, perhaps the best way is to follow the tiled approach from literature. For 3D convolution, the problem is more complex than 2D, but the same principles apply.
+
+Alternatively, here's a plan for the kernel:
+
+Each thread block processes a block of output channels and spatial positions. For simplicity, let's assume that each block handles a single output channel and a spatial tile.
+
+Alternatively, for 3D convolution, the following parameters can be considered:
+
+- Tile size in spatial dimensions (e.g., 4x4x4)
+
+- Number of input channels per tile (e.g., 3)
+
+- Number of output channels per tile (e.g., 8)
+
+But since the input channels are 3 (as per the example), we can handle all input channels in one go.
+
+Wait, given the problem's example parameters: in_channels=3, out_channels=24, kernel_size=3, so the kernel has shape (24, 3, 3,3,3). 
+
+The output for a single output channel is computed over all input channels and the kernel.
+
+The computational load is significant, so the tiled approach must maximize shared memory usage.
+
+The general approach for tiled convolution:
+
+1. Each block is responsible for a tile of the output in spatial dimensions and a subset of output channels.
+
+Wait, perhaps splitting the work into spatial tiles and output channels.
+
+The following steps outline the kernel:
+
+Each thread block processes a tile of the output volume. For example, a block could handle a tile of size T_D x T_H x T_W in spatial dimensions and a subset of output channels (e.g., 1 or more channels).
+
+Each thread in the block is responsible for computing a specific output element within the tile.
+
+But with 3D convolution, the spatial dimensions are D, H, W. 
+
+Alternatively, the block can handle a small tile in spatial dimensions, and each thread computes a single output element.
+
+The key idea is to load a tile of the input into shared memory, along with the corresponding kernel weights, so that multiple output elements can reuse the same input data, reducing global memory accesses.
+
+The steps would be:
+
+For each output element in the tile:
+
+1. Load the corresponding input window (kernel_size x kernel_size x kernel_size) into shared memory.
+
+2. Load the corresponding kernel weights into shared memory or into registers.
+
+3. Each thread computes the dot product between the input window and the kernel for their assigned output channels.
+
+But this is vague. Let me try to think of the kernel structure.
+
+First, the input is 5D (N, C_in, D, H, W). The output is (N, C_out, D_out, H_out, W_out). 
+
+Assuming padding=1 and stride=1, D_out = D, H_out=H, W_out=W. 
+
+The kernel's computation for an output element at (n, c_out, d, h, w) is:
+
+output[n][c_out][d][h][w] = sum_{c_in=0}^{C_in-1} sum_{kd=0}^{Kd-1} sum_{kh=0}^{Kh-1} sum_{kw=0}^{Kw-1} input_padded[n][c_in][d + kd][h + kh][w + kw] * weight[c_out][c_in][kd][kh][kw]
+
+So for each output position (d, h, w), the input window is a cube around that position, offset by the kernel indices.
+
+The challenge is to parallelize this efficiently.
+
+A possible approach is to have each block process a tile of output spatial positions and a subset of output channels. 
+
+Suppose each block handles a block of output channels and spatial tiles.
+
+Alternatively, given the example's small kernel (3x3x3), the tile size could be 16x16x16 spatially, but that's large. Maybe smaller.
+
+Alternatively, here's a more concrete approach inspired by the NVIDIA cuDNN tiled approach:
+
+The kernel can be structured as follows:
+
+- Each thread block is responsible for computing a tile of output channels and spatial locations.
+
+- The spatial tile is of size T_D x T_H x T_W (e.g., 4x4x4).
+
+- The number of output channels processed per block is, say, 1 (since out_channels=24, and 24 is divisible by 8, perhaps).
+
+Wait, perhaps the following:
+
+Each block computes a 4x4x4 spatial tile in D, H, W, and a single output channel.
+
+The block will process all input channels for each spatial position in the tile.
+
+The steps:
+
+1. Each block is assigned a tile of the output spatial dimensions and a specific output channel.
+
+2. The threads in the block load the necessary input data into shared memory for the spatial window (kernel_size=3 in each dimension), covering the input region needed for the output tile.
+
+3. Each thread computes the contribution of a subset of the input channels and kernel weights to the output.
+
+But this requires careful coordination.
+
+Alternatively, here's a step-by-step plan for the kernel:
+
+1. The kernel is launched with one block per output channel and per spatial tile.
+
+Wait, perhaps the grid is divided such that each block handles a small spatial tile (like 8x8x8) and one output channel.
+
+Alternatively, to handle multiple output channels per block, but given the example's out_channels=24, it's manageable.
+
+Alternatively, let's structure the kernel as follows:
+
+- The block is responsible for a single output channel and a tile of the spatial dimensions (D, H, W). The tile is of size TD x TH x TW.
+
+- The threads in the block are divided into smaller groups to handle each spatial element in the tile.
+
+- For each spatial element in the tile, the input window (3x3x3) is loaded into shared memory, and the kernel's weights for that channel are applied.
+
+- The output values for each spatial position in the tile are computed by summing over the input channels and kernel elements.
+
+Let me think in terms of code.
+
+First, the kernel parameters:
+
+- input: the input tensor (N, C_in, D, H, W) (already padded with 1 in all spatial dimensions?)
+
+Wait, no, in our case, the input to the kernel must be padded. Hence, the kernel will have an input tensor that is already padded. So in the Python code, before calling the kernel, we can pad the input using torch.nn.functional.pad.
+
+Wait, in the problem statement, when replacing the Conv3d, the padding is to be handled automatically. So the original PyTorch Conv3d would have padding=1. Hence, in the custom kernel, we need to pad the input with padding=1 in all spatial dimensions. So in the Python code:
+
+def conv3d_forward(input, weight, bias=None):
+    # input has shape (N, C_in, D, H, W)
+    # pad with 1 on each spatial dimension
+    padded_input = F.pad(input, (1,1,1,1,1,1), mode='constant', value=0)
+    # then compute the convolution
+    ...
+
+Hence, the kernel can assume that the input is already padded.
+
+Now, the kernel's code:
+
+The kernel will take as input the padded input tensor, the weight tensor, and the bias (if any). Since the original model's conv has a bias, but the problem says to replace only the Conv3d operator (not the bias?), but actually, the Conv3d includes the bias addition. Since the problem says to replace the Conv3d operator, which includes the convolution and bias addition.
+
+Wait, the problem says: "replace the Conv3d operator with a custom CUDA kernel". The Conv3d in PyTorch includes the bias addition (if the layer has a bias). Since the original Model's conv layer's constructor doesn't specify bias, but by default, Conv3d has bias=True. Wait, looking at the given code:
+
+The Model is initialized with:
+
+self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+
+The default for Conv3d is bias=True, unless specified otherwise. So the original model includes a bias. Therefore, the custom kernel must also handle the bias addition.
+
+Therefore, the kernel must compute output = convolution(input) + bias, where the bias is a tensor of shape (out_channels,).
+
+Hence, the kernel parameters are:
+
+input: padded input tensor (N, C_in, D_padded, H_padded, W_padded)
+
+weight: (out_channels, C_in, kernel_d, kernel_h, kernel_w)
+
+bias: (out_channels, )
+
+The output tensor is of shape (N, out_channels, D, H, W) (since padding=1 and stride=1).
+
+Now, the kernel must compute for each output position (n, c_out, d, h, w):
+
+sum_{c_in, kd, kh, kw} input[n][c_in][d + kd][h + kh][w + kw] * weight[c_out][c_in][kd][kh][kw]
+
+plus the bias[c_out].
+
+The problem is to compute this efficiently using shared memory.
+
+Let me think of the kernel structure.
+
+Suppose each thread block handles a tile of the output in spatial dimensions (D, H, W) and a specific output channel.
+
+Let’s define the block dimensions:
+
+- blockIdx.x: output channel index.
+
+- blockIdx.y: tile index in D dimension.
+
+- blockIdx.z: tile index in H and W dimensions (or split further).
+
+Alternatively, it's complex in 3D. Maybe a 2D grid with blocks handling a spatial tile and channel.
+
+Alternatively, let's consider that for a given output channel, the spatial computation can be tiled. So the blocks are divided as:
+
+Each block handles a block of output channels (e.g., 1 channel), and a spatial tile.
+
+Suppose each block handles:
+
+- One output channel (c_out).
+
+- A spatial tile of size TD x TH x TW in the output spatial dimensions.
+
+The block's threads are divided to handle each element in the tile.
+
+The steps for the block:
+
+1. For each spatial position (d, h, w) in the tile:
+
+   a. Load the corresponding input window (3x3x3) into shared memory.
+
+   b. Compute the sum over c_in and kernel indices for that position and channel.
+
+2. Add the bias.
+
+3. Store the result in the output tensor.
+
+But how to manage shared memory for the input window?
+
+The input window is 3x3x3, so 27 elements per input channel. Since there are C_in=3 input channels, the total per window is 3*3*3*3 = 81 elements? Wait, no:
+
+Wait, for each input channel, the window is 3x3x3, so per channel, 27 elements. With 3 channels, total 3*27 = 81 elements per window. This is manageable in shared memory.
+
+Each block can load the input window for the current spatial position into shared memory. 
+
+Wait, but for a tile of spatial positions, each spatial position requires a different window. So for a tile of size TD x TH x TW, we would need to load all the required windows for those positions.
+
+Alternatively, the tile is chosen such that the spatial positions in the tile are covered by a larger input window, and the shared memory caches that larger window.
+
+For example, a tile of 4x4x4 spatial positions would require an input window of 5x5x5 (since the kernel is 3x3x3), but with padding.
+
+Alternatively, let's choose a spatial tile size that allows the input window to be loaded once for multiple output positions.
+
+Let me consider a tile of TD=4, TH=4, TW=4. The output positions in the tile are:
+
+d from d_start to d_start + 3,
+
+h from h_start to h_start + 3,
+
+w from w_start to w_start + 3.
+
+The required input window for these positions would be from:
+
+d_start -1 to d_start + 3 + 1 (since kernel size is 3)
+
+Wait, no. For the first position in the tile (d_start, h_start, w_start), the input window is from d_start to d_start + 2 in the kernel's kd direction? Wait, the kernel's kd is 0,1,2 (since kernel size 3). So for the output position (d, h, w), the input indices are:
+
+d_in = d + kd (since padded input is already there).
+
+Wait, the input window for a given output position (d, h, w) is:
+
+input[:, :, d + kd, h + kh, w + kw] for kd in 0,1,2; kh in 0,1,2; kw in 0,1,2.
+
+Therefore, for a spatial tile of size TD x TH x TW (e.g., 4x4x4), the input region needed is:
+
+d_min = d_start - 1 (since kd can be 0 to 2, so the input's d_min is d_start + 0 - 1? Wait, perhaps better to see:
+
+The first output position in the tile is at (d_start, h_start, w_start). The required input window for this position starts at d_start -1 (since kd=0 corresponds to d_start + 0 - 0 (no, perhaps I'm mixing up). 
+
+Actually, since the output position (d, h, w) corresponds to an input window centered at that position (with padding), the required input indices for the window are:
+
+d_start - 1 to d_start +1 (since the kernel is 3x3x3), but for the entire tile.
+
+Wait, this is getting complicated. Perhaps a better approach is to have each thread block handle a small tile of output spatial positions (e.g., 4x4x4) and a single output channel. 
+
+The block will:
+
+- For each spatial position in the tile, load the corresponding input window into shared memory.
+
+Wait, but for each spatial position in the tile, the window overlaps with neighboring positions, so we can load a larger block into shared memory to cover all the required input for the tile.
+
+Suppose the tile is of size 4x4x4. The input region required to cover all windows for the tile would be:
+
+In D dimension: d_start -1 to d_start + 4 +1 (since the last position in the tile is d_start +3, and the kernel needs up to +2). So total 6 elements (d_start -1, d_start, ..., d_start+4).
+
+Similarly for H and W.
+
+Therefore, the input region needed is a cube of (kernel_size + tile_size -1) in each dimension.
+
+For kernel_size=3 and tile_size=4, that's 3+4-1=6 in each dimension.
+
+Hence, the block can load a 6x6x6 cube of input data (for all input channels) into shared memory. 
+
+This cube will cover the input required for all positions in the 4x4x4 tile.
+
+Then, each thread in the block can compute one or more output positions in the tile.
+
+Let me outline the steps:
+
+1. Each block is assigned an output channel (c_out) and a tile in the spatial dimensions (starting at (d_start, h_start, w_start)).
+
+2. The block's threads load the input cube (6x6x6 in D, H, W) into shared memory. Since the input has C_in channels, the shared memory must hold C_in * 6*6*6 elements.
+
+3. Once the input is in shared memory, each thread computes the convolution for one or more positions in the tile.
+
+4. The output is written to global memory.
+
+The number of threads per block should be sufficient to cover the tile's elements. For a 4x4x4 tile, there are 64 positions. So a block size of 64 threads can handle one position per thread.
+
+The shared memory size required is C_in (3) * 6^3 = 3*216 = 648 floats. Which is about 2.5KB, manageable.
+
+Now, let's structure the code:
+
+The kernel function:
+
+template <typename T>
+__global__ void custom_conv3d_kernel(
+    const T* input_padded,
+    const T* weight,
+    const T* bias,
+    T* output,
+    int batch_size,
+    int input_channels,
+    int output_channels,
+    int input_d, int input_h, int input_w,
+    int output_d, int output_h, int output_w,
+    int kernel_d, int kernel_h, int kernel_w,
+    int tile_size_d, int tile_size_h, int tile_size_w

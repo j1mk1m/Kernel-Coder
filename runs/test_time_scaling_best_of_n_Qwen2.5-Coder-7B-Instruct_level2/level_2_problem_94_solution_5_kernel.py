@@ -1,0 +1,188 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for each operation
+
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+void gemm_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor c) {
+    int m = a.size(0);
+    int n = b.size(1);
+    int k = a.size(1);
+
+    dim3 blocks((n + 255) / 256, (m + 255) / 256);
+    dim3 threads(256, 1);
+
+    gemm_kernel<<<blocks, threads>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+}
+"""
+
+gemm_cpp_source = (
+    "void gemm_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor c);"
+)
+
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+bias_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bias_add_kernel(const float* a, const float* b, float* c, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        c[idx] = a[idx] + b[0];
+    }
+}
+
+void bias_add_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor c) {
+    auto size = a.numel();
+
+    dim3 blocks((size + 255) / 256);
+    dim3 threads(256, 1);
+
+    bias_add_kernel<<<blocks, threads>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), size);
+}
+"""
+
+bias_add_cpp_source = (
+    "void bias_add_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor c);"
+)
+
+bias_add = load_inline(
+    name="bias_add",
+    cpp_sources=bias_add_cpp_source,
+    cuda_sources=bias_add_source,
+    functions=["bias_add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+hardtanh_mish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void hardtanh_mish_kernel(const float* a, float* b, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = a[idx];
+        b[idx] = x > -1.0f ? (x < 1.0f ? x : 1.0f) : -1.0f;
+        b[idx] *= x > -1.7159f ? (x < 1.7159f ? tanh(x) : 1.0f) : 0.0f;
+    }
+}
+
+void hardtanh_mish_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+
+    dim3 blocks((size + 255) / 256);
+    dim3 threads(256, 1);
+
+    hardtanh_mish_kernel<<<blocks, threads>>>(a.data_ptr<float>(), b.data_ptr<float>(), size);
+}
+"""
+
+hardtanh_mish_cpp_source = (
+    "void hardtanh_mish_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+hardtanh_mish = load_inline(
+    name="hardtanh_mish",
+    cpp_sources=hardtanh_mish_cpp_source,
+    cuda_sources=hardtanh_mish_source,
+    functions=["hardtanh_mish_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+groupnorm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void groupnorm_kernel(const float* a, float* b, float* mean, float* var, int batch_size, int num_groups, int channels_per_group) {
+    int g = blockIdx.z;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (g < num_groups && row < batch_size && col < channels_per_group) {
+        float sum = 0.0f;
+        float sum_squares = 0.0f;
+        for (int i = 0; i < batch_size; ++i) {
+            sum += a[(i * num_groups + g) * channels_per_group + col];
+            sum_squares += a[(i * num_groups + g) * channels_per_group + col] * a[(i * num_groups + g) * channels_per_group + col];
+        }
+        mean[g * channels_per_group + col] = sum / batch_size;
+        var[g * channels_per_group + col] = sum_squares / batch_size - mean[g * channels_per_group + col] * mean[g * channels_per_group + col];
+        b[(row * num_groups + g) * channels_per_group + col] = (a[(row * num_groups + g) * channels_per_group + col] - mean[g * channels_per_group + col]) / sqrt(var[g * channels_per_group + col] + 1e-5f);
+    }
+}
+
+void groupnorm_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor mean, torch::Tensor var) {
+    int batch_size = a.size(0);
+    int num_groups = a.size(1);
+    int channels_per_group = a.size(2);
+
+    dim3 blocks((channels_per_group + 255) / 256, (batch_size + 255) / 256, num_groups);
+    dim3 threads(256, 1, 1);
+
+    groupnorm_kernel<<<blocks, threads>>>(a.data_ptr<float>(), b.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), batch_size, num_groups, channels_per_group);
+}
+"""
+
+groupnorm_cpp_source = (
+    "void groupnorm_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor mean, torch::Tensor var);"
+)
+
+groupnorm = load_inline(
+    name="groupnorm",
+    cpp_sources=groupnorm_cpp_source,
+    cuda_sources=groupnorm_source,
+    functions=["groupnorm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super(ModelNew, self).__init__()
+        self.gemm = gemm
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.groupnorm = groupnorm
+
+    def forward(self, x):
+        x = torch.zeros_like(x)
+        gemm.gemm_cuda(x, x, x)
+        bias_add.bias_add_cuda(x, self.bias, x)
+        hardtanh_mish.hardtanh_mish_cuda(x, x)
+        groupnorm.groupnorm_cuda(x, x, torch.zeros_like(x), torch.zeros_like(x))
+        return x

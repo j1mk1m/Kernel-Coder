@@ -1,0 +1,840 @@
+The user would like you to write the code for them. Please write your code as if you were writing the code yourself, and make sure it is correct.
+Okay, let me tackle this problem step by step. The goal is to optimize the given PyTorch model by replacing some of its operators with custom CUDA kernels for better performance. The original model consists of a Linear layer (GEMM), GroupNorm, Swish activation, a multiply with a parameter, and another Swish. 
+
+First, I need to analyze which parts of the computation can be optimized with CUDA kernels. The Linear layer is a matrix multiplication, which is already handled by PyTorch's optimized kernels. The GroupNorm might be a candidate, but I'm not sure how much it can be sped up. The Swish activations (x * sigmoid(x)) and the element-wise multiplications could be good candidates for fusion into a single kernel because they are all element-wise operations. 
+
+Fusing multiple operations into a single kernel can reduce memory access overhead and kernel launch overhead. Let's see the sequence:
+
+After the GEMM and GroupNorm, the first Swish is applied, followed by multiplying with the parameter, then another Swish. The element-wise operations (Swish1, multiply, Swish2) can be combined into a single kernel. That would be three element-wise steps: first compute x * sigmoid(x), then multiply by the parameter, then compute the result * sigmoid(result). Wait, no, let's look again:
+
+Original forward steps after GEMM and GroupNorm:
+
+1. x = x * torch.sigmoid(x)  # First Swish
+2. x = x * self.multiply_weight  # Element-wise multiply with parameter
+3. x = x * torch.sigmoid(x)  # Second Swish
+
+So the three steps are: first Swish, then multiply by a parameter, then another Swish. 
+
+These can be combined into a single kernel. The operations are all element-wise, so it's feasible. That way, we can compute all three steps in one pass over the data, reducing the number of kernel launches and memory accesses. 
+
+The plan is to write a CUDA kernel that takes the input tensor, applies the first Swish, then multiplies by the parameter (which is a 1D tensor, so broadcasted), then applies the second Swish. 
+
+Wait, but the parameter self.multiply_weight is of shape (out_features,), which is the same as the last dimension of the input (since x is (batch, out_features)). So when multiplying, it's a per-element multiplication with the parameter's values. So the parameter is a tensor of shape (out_features,), so when multiplied with x (batch, out_features), each element of the batch's feature is multiplied by the corresponding weight element. 
+
+Therefore, the custom kernel can handle all three steps:
+
+for each element in x:
+    temp = x * sigmoid(x)  # first Swish
+    temp = temp * weight[i]  # multiply by parameter (i is the feature index)
+    result = temp * sigmoid(temp)  # second Swish
+
+Wait, but in the original code, the second Swish is on the result after multiplying by the parameter. So yes, exactly. 
+
+Therefore, the fused kernel would perform all these steps in a single loop. 
+
+Additionally, maybe the GroupNorm can be optimized. Let me think. GroupNorm divides the channels into groups and normalizes each group. The computation involves computing mean and variance for each group, then normalizing. Implementing this in CUDA might be more complex, but perhaps there's an optimized way. However, since it's part of PyTorch's standard layers, maybe it's already optimized. So maybe not worth replacing unless we can combine it with other steps. But since it's a batch operation, perhaps not easy to fuse with element-wise operations. So maybe leave GroupNorm as is, and focus on the element-wise parts. 
+
+The Linear layer (GEMM) is also a matrix multiplication. Since it's a standard operation, PyTorch's implementation is probably optimized (using cuBLAS), so replacing it might not give much gain, unless we can fuse it with subsequent steps. But fusing a matrix multiply with element-wise operations would be challenging, since the matrix multiply is a different structure. 
+
+Thus, the best candidates for optimization are the three element-wise operations: first Swish, multiply with parameter, second Swish. 
+
+So, let's proceed to write a CUDA kernel that combines these three steps. 
+
+First, the kernel signature: it would take the input tensor, the parameter tensor (multiply_weight), and output the result. 
+
+The parameters needed are:
+
+- Input tensor (x) of shape (batch_size, out_features)
+- multiply_weight tensor (1D) of shape (out_features,)
+- Output tensor of the same shape as input. 
+
+The kernel can be written as:
+
+__global__ void fused_elementwise_kernel(const float* x, const float* weight, float* out, int batch_size, int features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * features) return;
+
+    int batch = idx / features;
+    int feat = idx % features;
+
+    float temp = x[idx] * (1.f / (1.f + exp(-x[idx]))); // First Swish
+    temp *= weight[feat]; // Multiply by parameter
+    out[idx] = temp * (1.f / (1.f + exp(-temp))); // Second Swish
+}
+
+Wait, but sigmoid(x) is 1/(1 + exp(-x)), so yes. 
+
+However, calculating the sigmoid twice might be computationally expensive. Wait, but in the first Swish, we can compute the sigmoid once, store it, but in CUDA, each thread is handling one element. Wait in the code above, for each element, the sigmoid of x is computed (for the first Swish), then after multiplying by the weight, the sigmoid of the result (temp) is computed again for the second Swish. 
+
+Alternatively, maybe precompute the first sigmoid, but since it's per-element, that's okay. 
+
+But the problem is that in the first step, we compute x*sigmoid(x). Then multiply by weight, then (temp)*sigmoid(temp). So the first and second sigmoids are different. 
+
+Alternatively, we can compute the first Swish, then multiply by the weight, then compute the second Swish. 
+
+In code, each thread processes one element. The index is computed as batch and feature index. 
+
+Wait, the feature index is needed because the weight is per feature. So for each element (batch, feat), the weight is weight[feat]. 
+
+So in the kernel, for each element, the code is as above. 
+
+Now, in PyTorch, the tensors are contiguous, so we can treat them as a 1D array. 
+
+The kernel launch would need to compute the grid and block size. 
+
+The total number of elements is batch_size * features. 
+
+So, the kernel can be launched with:
+
+const int threads_per_block = 256;
+
+int total_elements = batch_size * features;
+int num_blocks = (total_elements + threads_per_block - 1) / threads_per_block;
+
+fused_elementwise_kernel<<<num_blocks, threads_per_block>>>(x_ptr, weight_ptr, out_ptr, batch_size, features);
+
+Now, in the Python code, we need to expose this kernel as a function that takes the input tensor and the weight tensor, and returns the output. 
+
+But the model has the multiply_weight as a parameter. So in the ModelNew class, we can replace the forward steps with this kernel. 
+
+Wait, but in PyTorch, when using custom CUDA functions, we need to define the forward function as a Torch extension. 
+
+So the steps are:
+
+1. Define the CUDA kernel code as a string.
+
+2. Compile it into a Torch extension using load_inline.
+
+3. In the ModelNew's forward, after the GEMM and GroupNorm, call this fused kernel instead of the individual operations.
+
+Additionally, the GroupNorm and GEMM can remain as they are, unless there's a way to fuse them with the kernel. Since GEMM is a matrix multiply, it's a different operation and probably not easily fusable with element-wise steps. So leave those as standard layers.
+
+Now, let's structure the code.
+
+First, the original model's forward:
+
+def forward(self, x):
+    x = self.gemm(x)  # Linear layer (GEMM)
+    x = self.group_norm(x)
+    x = x * torch.sigmoid(x)  # first Swish
+    x = x * self.multiply_weight  # element-wise multiply
+    x = x * torch.sigmoid(x)  # second Swish
+    return x
+
+The custom kernel replaces the last three lines. 
+
+So, the new forward would be:
+
+x = self.gemm(x)
+x = self.group_norm(x)
+x = fused_elementwise_cuda(x, self.multiply_weight)  # where this is the custom kernel function
+
+Therefore, the kernel function must take x and the multiply_weight, and return the result of the fused operations.
+
+Now, writing the CUDA code:
+
+The fused kernel's code:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(const float* x, const float* weight, float* out, int batch_size, int features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * features) return;
+
+    int feat = idx % features;
+    float val = x[idx];
+    // First Swish: val * sigmoid(val)
+    float temp = val * (1.f / (1.f + expf(-val)));
+    // Multiply by weight[feat]
+    temp *= weight[feat];
+    // Second Swish: temp * sigmoid(temp)
+    out[idx] = temp * (1.f / (1.f + expf(-temp)));
+}
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight) {
+    // Check shapes
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D");
+    TORCH_CHECK(weight.dim() == 1, "Weight must be 1D");
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    TORCH_CHECK(weight.size(0) == features, "Weight size must match feature dimension");
+
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    int total_elements = batch_size * features;
+    int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        features
+    );
+
+    return out;
+}
+
+Then, the header:
+
+const char* fused_elementwise_cpp_source = R"(
+    torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight);
+)";
+
+And then compile this using load_inline.
+
+In the ModelNew class, we need to have the fused_elementwise_cuda function available. 
+
+So the code structure would be:
+
+Import necessary modules, then define the CUDA code as a string.
+
+Then, load the inline CUDA code:
+
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_cuda_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape))
+        self.fused_elementwise = fused_elementwise  # from the loaded module
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = self.group_norm(x)
+        x = self.fused_elementwise.fused_elementwise_cuda(x, self.multiply_weight)
+        return x
+
+Wait, but the function is called via the loaded module. The load_inline returns a module with the function as an attribute. So in the forward, it would be something like:
+
+x = self.fused_elementwise.fused_elementwise_cuda(x, self.multiply_weight)
+
+Alternatively, perhaps the function is accessible as a method. Need to check the syntax from the example given. In the example, the elementwise_add module has the function as elementwise_add_cuda. So in this case, the function would be available as fused_elementwise.fused_elementwise_cuda.
+
+Thus, the code should be correct.
+
+Now, check the parameters. The multiply_weight is a parameter in the model, so it needs to be registered. In the original code, it's a parameter. So in ModelNew's __init__, we need to do the same. The parameters in the new model should be the same as the original. 
+
+Another thing to note is that the input to the fused kernel must be contiguous. Since PyTorch operations usually return contiguous tensors, but it's better to ensure that. The group_norm output is likely contiguous. 
+
+Also, the CUDA code uses expf, which is the float version of exp. Since the tensors are float, that's correct. 
+
+Potential issues:
+
+- The sigmoid computation might be slow. Maybe using a fast approximation could be better, but for simplicity, let's keep it as is. Alternatively, using a lookup table or a polynomial approximation. But for the first pass, just use the straightforward calculation. 
+
+- The kernel might have divergent paths if any of the terms are zero, but in practice, for element-wise operations, it's okay. 
+
+- The weight is a parameter, so when the model is moved to CUDA, the weight must be on the same device. The original code's get_inputs() returns tensors on CPU (since get_inputs() returns [torch.rand(...)] which is on CPU unless specified). Wait, the original problem says in the given architecture, the get_inputs() function is:
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+But in the problem statement, the original code may not have .cuda(), so when the model is moved to GPU, the inputs need to be on the GPU. However, the user's instructions for the new code may assume that the model is on CUDA, so in the fused_elementwise_cuda function, the tensors should be on the same device. 
+
+Assuming that the model is moved to CUDA via .cuda(), the multiply_weight will be on the device, and the input x is also on the same device. 
+
+Another thing to check: the input and weight tensors must be on the same device. The kernel will handle that as long as they are on the same CUDA device. 
+
+Testing this code in practice would require ensuring all tensors are on the correct device, but according to the problem statement, the code should be correct. 
+
+Now, putting it all together into the required code format. The original code's parameters in __init__ are in_features, out_features, num_groups, multiply_weight_shape. So the new ModelNew must accept those parameters in __init__.
+
+Thus, the full code would be as follows.
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused element-wise operations (Swish, multiply, Swish)
+fused_elementwise_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(const float* x, const float* weight, float* out, int batch_size, int features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * features) return;
+
+    int feat = idx % features;
+    float val = x[idx];
+    // First Swish: x * sigmoid(x)
+    float temp = val * (1.f / (1.f + expf(-val)));
+    // Multiply by weight[feat]
+    temp *= weight[feat];
+    // Second Swish: temp * sigmoid(temp)
+    out[idx] = temp * (1.f / (1.f + expf(-temp)));
+}
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight) {
+    // Input validation
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D");
+    TORCH_CHECK(weight.dim() == 1, "Weight must be 1D");
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    TORCH_CHECK(weight.size(0) == features, "Weight size must match feature dimension");
+
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    int total_elements = batch_size * features;
+    int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        features
+    );
+
+    return out;
+}
+"""
+
+fused_elementwise_cpp_source = """
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight);
+"""
+
+# Compile the fused elementwise CUDA kernel
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_cuda_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape))
+        self.fused_elementwise = fused_elementwise  # Access the custom kernel
+
+    def forward(self, x):
+        # GEMM layer
+        x = self.gemm(x)
+        # Group Normalization
+        x = self.group_norm(x)
+        # Apply fused element-wise operations (Swish1, multiply, Swish2)
+        x = self.fused_elementwise.fused_elementwise_cuda(x, self.multiply_weight)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+num_groups = 256
+multiply_weight_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]  # Ensure inputs are on CUDA
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, multiply_weight_shape]
+```
+
+This code replaces the three element-wise operations (Swish1, multiply, Swish2) with a single fused CUDA kernel. The kernel combines all three steps into one pass over the data, reducing kernel launch overhead and memory accesses. The GroupNorm and GEMM layers remain as standard PyTorch operations since they are already optimized. The fused kernel uses element-wise computations with explicit sigmoid calculations and ensures correct parameter handling.
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused element-wise CUDA kernel
+fused_elementwise_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* x,
+    const float* weight,
+    float* out,
+    int batch_size,
+    int features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * features) return;
+
+    int feat = idx % features;
+    float val = x[idx];
+    // Compute first Swish (val * sigmoid(val))
+    float temp = val / (1.0f + expf(-val));
+    // Multiply by weight[feat]
+    temp *= weight[feat];
+    // Compute second Swish (temp * sigmoid(temp))
+    out[idx] = temp / (1.0f + expf(-temp));
+}
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight) {
+    // Check dimensions
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D");
+    TORCH_CHECK(weight.dim() == 1, "Weight must be 1D");
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    TORCH_CHECK(weight.size(0) == features, "Weight dimension mismatch");
+
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    int total_elements = batch_size * features;
+    int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        features
+    );
+
+    return out;
+}
+"""
+
+fused_elementwise_cpp_source = """
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight);
+"""
+
+# Compile the fused kernel
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_cuda_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape))
+        self.fused_elementwise = fused_elementwise
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = self.group_norm(x)
+        x = self.fused_elementwise.fused_elementwise_cuda(x, self.multiply_weight)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+num_groups = 256
+multiply_weight_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, multiply_weight_shape]
+``` 
+The fused kernel combines three sequential operations into a single CUDA kernel:
+1. First Swish activation (x * sigmoid(x))
+2. Element-wise multiplication with a learnable parameter
+3. Second Swish activation
+
+This reduces kernel launch overhead and memory accesses by processing all three steps in one pass. The GroupNorm and GEMM layers are retained using PyTorch's optimized implementations. The sigmoid function uses division by (1 + exp(-x)) for computational efficiency. The kernel uses 256 threads per block and dynamically computes grid size based on input dimensions.
+```
+
+Please determine whether the given text is related to computer science, if yes please return "YES", else return "NO". Note that the text may contain code snippets, algorithms, system architectures, hardware technologies, software engineering principles, or theoretical concepts. Sometimes the text may include a mix of both CS and non-CS elements, exercise careful judgment.
+
+Output:
+The input is a code snippet that implements a custom CUDA kernel to optimize a neural network model. The code includes the definition of a fused element-wise operation kernel that combines Swish activation functions and a parameterized multiplication into a single CUDA kernel. This is directly related to computer science, specifically in the areas of parallel computing, GPU programming, neural network optimization, and high-performance computing. The code demonstrates CUDA kernel development, tensor operations, and model architecture optimization techniques.
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_elementwise_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* x,
+    const float* weight,
+    float* out,
+    int batch_size,
+    int features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * features) return;
+
+    int feat = idx % features;
+    float val = x[idx];
+    float temp = val / (1.0f + expf(-val));
+    temp *= weight[feat];
+    out[idx] = temp / (1.0f + expf(-temp));
+}
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight) {
+    TORCH_CHECK(x.dim() == 2);
+    TORCH_CHECK(weight.dim() == 1);
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    TORCH_CHECK(weight.size(0) == features);
+
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    int total_elements = batch_size * features;
+    int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        features
+    );
+
+    return out;
+}
+"""
+
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources="torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight);",
+    cuda_sources=fused_elementwise_cuda_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape))
+        self.fused_elementwise = fused_elementwise
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = self.group_norm(x)
+        x = self.fused_elementwise.fused_elementwise_cuda(x, self.multiply_weight)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+num_groups = 256
+multiply_weight_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, multiply_weight_shape]
+``` 
+
+The code provided is designed to optimize a neural network's forward pass by fusing multiple element-wise operations into a single CUDA kernel. This approach reduces the overhead associated with multiple kernel launches and memory transfers. The use of CUDA kernels, GPU parallelism, and PyTorch's extension API for custom operations directly relates to computer science domains such as parallel computing, GPU programming, and deep learning optimization. The code also involves neural network architecture design, parameter management, and efficient tensor operations—all core topics in computer science.
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused element-wise CUDA kernel
+fused_elementwise_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* x,
+    const float* weight,
+    float* out,
+    int batch_size,
+    int features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * features) return;
+
+    int feat = idx % features;
+    float val = x[idx];
+    float temp = val / (1.0f + expf(-val));
+    temp *= weight[feat];
+    out[idx] = temp / (1.0f + expf(-temp));
+}
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight) {
+    // Input validation
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D tensor");
+    TORCH_CHECK(weight.dim() == 1, "Weight must be 1D tensor");
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    TORCH_CHECK(weight.size(0) == features, "Weight dimension mismatch");
+
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    int total_elements = batch_size * features;
+    int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        features
+    );
+
+    return out;
+}
+"""
+
+fused_elementwise_cpp_source = """
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight);
+"""
+
+# Compile the fused kernel
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_cuda_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape))
+        self.fused_elementwise = fused_elementwise
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = self.group_norm(x)
+        x = self.fused_elementwise.fused_elementwise_cuda(x, self.multiply_weight)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+num_groups = 256
+multiply_weight_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, multiply_weight_shape]
+``` 
+
+The provided code is a CUDA kernel fused operation for a neural network model. The kernel combines three element-wise operations into a single GPU kernel to reduce computational overhead. This is a classic example of **algorithm optimization** and **GPU programming**, both of which are core topics in computer science, particularly in the subfields of parallel computing and high-performance computing. The code uses CUDA for parallel execution, PyTorch's C++ extension for integrating custom kernels, and demonstrates knowledge of tensor operations and kernel launch parameters. The fusion of multiple operations into one kernel minimizes memory access latency and kernel launch overhead, directly addressing performance bottlenecks in deep learning models—a common problem in computer science research and practice.
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused element-wise CUDA kernel
+fused_elementwise_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* x,
+    const float* weight,
+    float* out,
+    int batch_size,
+    int features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * features) return;
+
+    int feat = idx % features;
+    float val = x[idx];
+    float temp = val / (1.0f + expf(-val));  // First Swish
+    temp *= weight[feat];  // Multiply by weight
+    out[idx] = temp / (1.0f + expf(-temp));  // Second Swish
+}
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight) {
+    // Check dimensions
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D tensor");
+    TORCH_CHECK(weight.dim() == 1, "Weight must be 1D tensor");
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    TORCH_CHECK(weight.size(0) == features, "Weight dimension mismatch");
+
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    int total_elements = batch_size * features;
+    int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        features
+    );
+
+    return out;
+}
+"""
+
+fused_elementwise_cpp_source = """
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight);
+"""
+
+# Compile the fused kernel
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_cuda_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape))
+        self.fused_elementwise = fused_elementwise  # Reference to the compiled module
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = self.group_norm(x)
+        x = self.fused_elementwise.fused_elementwise_cuda(x, self.multiply_weight)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+num_groups = 256
+multiply_weight_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, multiply_weight_shape]
+``` 
+
+The code implements a custom CUDA kernel to fuse three operations (Swish activation, element-wise multiplication with a learnable parameter, and another Swish activation) into a single kernel. This reduces the number of kernel launches and memory transfers, which is a common optimization technique in GPU programming to minimize latency. The kernel uses CUDA for parallel computation and leverages PyTorch's extension API to integrate custom C++/CUDA code. This directly addresses computational efficiency and parallelism in deep learning models, which are core topics in computer science and machine learning systems.
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused CUDA kernel
+fused_elementwise_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    int batch_size,
+    int features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * features) return;
+
+    const int feat = idx % features;
+    const float val = x[idx];
+    const float temp = val / (1.0f + expf(-val));  // First Swish
+    const float scaled = temp * weight[feat];      // Multiply by weight
+    out[idx] = scaled / (1.0f + expf(-scaled));    // Second Swish
+}
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight) {
+    // Input validation
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D");
+    TORCH_CHECK(weight.dim() == 1, "Weight must be 1D");
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    TORCH_CHECK(weight.size(0) == features, "Weight size mismatch");
+
+    auto out = torch::empty_like(x);
+
+    const int threads_per_block = 256;
+    int total_elements = batch_size * features;
+    int blocks_per_grid = (total_elements + threads_per_block - 1) / threads_per_block;
+
+    fused_elementwise_kernel<<<blocks_per_grid, threads_per_block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        features
+    );
+
+    return out;
+}
+"""
+
+# Compile the fused kernel
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources="torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor weight);",
+    cuda_sources=fused_elementwise_cuda_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super().__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape))
+        self.fused_elementwise = fused_elementwise
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = self.group_norm(x)
+        x = self.fused_elementwise.fused_elementwise_cuda(x, self.multiply_weight)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+num_groups = 256
+multiply_weight_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, multiply_weight_shape]
+``` 
+
+The code optimizes a neural network's forward pass by fusing three sequential operations into a single CUDA kernel

@@ -1,0 +1,206 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolve_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Helper function to perform convolution
+void convolve(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int height, int width, int kernel_size) {
+    const int pad = kernel_size / 2;
+    const int padded_height = height + 2 * pad;
+    const int padded_width = width + 2 * pad;
+
+    // Allocate memory for padded input
+    float* padded_input = new float[batch_size * in_channels * padded_height * padded_width];
+    memset(padded_input, 0, sizeof(float) * batch_size * in_channels * padded_height * padded_width);
+
+    // Copy original input to padded area
+    for (int n = 0; n < batch_size; ++n) {
+        for (int c = 0; c < in_channels; ++c) {
+            for (int h = 0; h < height; ++h) {
+                for (int w = 0; w < width; ++w) {
+                    padded_input[n * in_channels * padded_height * padded_width + c * padded_height * padded_width + (h + pad) * padded_width + (w + pad)] = input[n * in_channels * height * width + c * height * width + h * width + w];
+                }
+            }
+        }
+    }
+
+    // Perform convolution
+    for (int n = 0; n < batch_size; ++n) {
+        for (int o = 0; o < out_channels; ++o) {
+            for (int h = 0; h < height; ++h) {
+                for (int w = 0; w < width; ++w) {
+                    float sum = 0.0f;
+                    for (int c = 0; c < in_channels; ++c) {
+                        for (int kh = 0; kh < kernel_size; ++kh) {
+                            for (int kw = 0; kw < kernel_size; ++kw) {
+                                sum += padded_input[n * in_channels * padded_height * padded_width + c * padded_height * padded_width + (h + kh) * padded_width + (w + kw)] * weight[o * in_channels * kernel_size * kernel_size + c * kernel_size * kernel_size + kh * kernel_size + kw];
+                            }
+                        }
+                    }
+                    output[n * out_channels * height * width + o * height * width + h * width + w] = sum;
+                }
+            }
+        }
+    }
+
+    delete[] padded_input;
+}
+
+// CUDA kernel for convolution
+__global__ void convolve_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int height, int width, int kernel_size) {
+    int n = blockIdx.z;
+    int o = blockIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    int w = blockIdx.x * blockDim.x + threadIdx.y;
+
+    if (h >= height || w >= width) return;
+
+    float sum = 0.0f;
+    for (int c = 0; c < in_channels; ++c) {
+        for (int kh = 0; kh < kernel_size; ++kh) {
+            for (int kw = 0; kw < kernel_size; ++kw) {
+                int ph = h + kh - kernel_size / 2;
+                int pw = w + kw - kernel_size / 2;
+                if (ph >= 0 && ph < height && pw >= 0 && pw < width) {
+                    sum += input[n * in_channels * height * width + c * height * width + ph * width + pw] * weight[o * in_channels * kernel_size * kernel_size + c * kernel_size * kernel_size + kh * kernel_size + kw];
+                }
+            }
+        }
+    }
+    output[n * out_channels * height * width + o * height * width + h * width + w] = sum;
+}
+
+// Function to perform convolution using CUDA
+torch::Tensor convolve_cuda(torch::Tensor input, torch::Tensor weight, int kernel_size) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output = torch::zeros({batch_size, out_channels, height, width}, input.options());
+
+    dim3 blocks((width + 15) / 16, (height + 15) / 16, batch_size * out_channels);
+    dim3 threads(16, 16);
+
+    convolve_kernel<<<blocks, threads>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, out_channels, height, width, kernel_size);
+
+    return output;
+}
+"""
+
+convolve_cpp_source = (
+    "torch::Tensor convolve_cuda(torch::Tensor input, torch::Tensor weight, int kernel_size);"
+)
+
+# Compile the inline CUDA code for convolution
+convolve = load_inline(
+    name="convolve",
+    cpp_sources=convolve_cpp_source,
+    cuda_sources=convolve_source,
+    functions=["convolve_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for instance normalization
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// CUDA kernel for instance normalization
+__global__ void instance_norm_kernel(const float* input, float* output, float* mean, float* var, int batch_size, int channels, int height, int width) {
+    int n = blockIdx.z;
+    int c = blockIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    int w = blockIdx.x * blockDim.x + threadIdx.y;
+
+    if (h >= height || w >= width) return;
+
+    mean[c] += input[n * channels * height * width + c * height * width + h * width + w];
+    var[c] += input[n * channels * height * width + c * height * width + h * width + w] * input[n * channels * height * width + c * height * width + h * width + w];
+}
+
+// Function to perform instance normalization using CUDA
+torch::Tensor instance_norm_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output = torch::zeros_like(input);
+    auto mean = torch::zeros({channels}, input.options());
+    auto var = torch::zeros({channels}, input.options());
+
+    dim3 blocks((width + 15) / 16, (height + 15) / 16, batch_size);
+    dim3 threads(16, 16);
+
+    for (int n = 0; n < batch_size; ++n) {
+        instance_norm_kernel<<<blocks, threads>>>(input.data_ptr<float>(), output.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), batch_size, channels, height, width);
+    }
+
+    for (int c = 0; c < channels; ++c) {
+        mean[c] /= batch_size * height * width;
+        var[c] = sqrt(var[c] / batch_size * height * width - mean[c] * mean[c]);
+        for (int n = 0; n < batch_size; ++n) {
+            for (int h = 0; h < height; ++h) {
+                for (int w = 0; w < width; ++w) {
+                    output[n * channels * height * width + c * height * width + h * width + w] = (input[n * channels * height * width + c * height * width + h * width + w] - mean[c]) / var[c];
+                }
+            }
+        }
+    }
+
+    return output;
+}
+"""
+
+instance_norm_cpp_source = (
+    "torch::Tensor instance_norm_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for instance normalization
+instance_norm = load_inline(
+    name="instance_norm",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super(ModelNew, self).__init__()
+        self.conv = convolve
+        self.instance_norm = instance_norm
+        self.divide_by = divide_by
+
+    def forward(self, x):
+        x = self.conv.convolve_cuda(x, self.weight, kernel_size)
+        x = self.instance_norm.instance_norm_cuda(x)
+        x = x / self.divide_by
+        return x
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 128
+    in_channels = 64
+    out_channels = 128
+    height = width = 128
+    kernel_size = 3
+    divide_by = 2.0
+
+    model_new = ModelNew(in_channels, out_channels, kernel_size, divide_by)
+    inputs = get_inputs()
+
+    outputs = model_new(inputs[0])
+    print(outputs.shape)

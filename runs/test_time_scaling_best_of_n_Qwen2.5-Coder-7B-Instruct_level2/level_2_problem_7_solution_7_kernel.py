@@ -1,0 +1,159 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for each activation function
+relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_kernel(const float* x, float* y, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        y[idx] = fmaxf(x[idx], 0);
+    }
+}
+
+torch::Tensor relu_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    relu_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+
+    return y;
+}
+"""
+
+leaky_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void leaky_relu_kernel(const float* x, float* y, int size, float negative_slope) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        y[idx] = fmaxf(x[idx], negative_slope * x[idx]);
+    }
+}
+
+torch::Tensor leaky_relu_cuda(torch::Tensor x, float negative_slope) {
+    auto size = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    leaky_relu_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size, negative_slope);
+
+    return y;
+}
+"""
+
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void gelu_kernel(const float* x, float* y, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        y[idx] = 0.5 * x[idx] * (1 + tanh(sqrt(2 / M_PI) * (x[idx] + 0.044715 * pow(x[idx], 3))));
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    gelu_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+
+    return y;
+}
+"""
+
+sigmoid_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void sigmoid_kernel(const float* x, float* y, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        y[idx] = 1 / (1 + exp(-x[idx]));
+    }
+}
+
+torch::Tensor sigmoid_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    sigmoid_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+
+    return y;
+}
+"""
+
+# Compile the inline CUDA code for each activation function
+relu = load_inline(
+    name="relu",
+    cpp_sources="torch::Tensor relu_cuda(torch::Tensor x);",
+    cuda_sources=relu_source,
+    functions=["relu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+leaky_relu = load_inline(
+    name="leaky_relu",
+    cpp_sources="torch::Tensor leaky_relu_cuda(torch::Tensor x, float negative_slope);",
+    cuda_sources=leaky_relu_source,
+    functions=["leaky_relu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+gelu = load_inline(
+    name="gelu",
+    cpp_sources="torch::Tensor gelu_cuda(torch::Tensor x);",
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+sigmoid = load_inline(
+    name="sigmoid",
+    cpp_sources="torch::Tensor sigmoid_cuda(torch::Tensor x);",
+    cuda_sources=sigmoid_source,
+    functions=["sigmoid_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = relu.relu_cuda(x)
+        x = leaky_relu.leaky_relu_cuda(x, negative_slope=0.01)
+        x = gelu.gelu_cuda(x)
+        x = sigmoid.sigmoid_cuda(x)
+        x = x + self.bias
+        return x

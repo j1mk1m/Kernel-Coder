@@ -1,0 +1,214 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for each operation
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Convolution kernel
+__global__ void convolution_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int height, int width, int kernel_size) {
+    // Implementation of convolution
+}
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, int kernel_size) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output = torch::zeros({batch_size, out_channels, height, width}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (output.numel() + block_size - 1) / block_size;
+
+    convolution_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, out_channels, height, width, kernel_size);
+
+    return output;
+}
+"""
+
+groupnorm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Group normalization kernel
+__global__ void groupnorm_kernel(const float* input, float* mean, float* var, float* output, int batch_size, int in_channels, int num_groups, int height, int width) {
+    // Implementation of group normalization
+}
+
+torch::Tensor groupnorm_cuda(torch::Tensor input, int num_groups) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    auto channels_per_group = in_channels / num_groups;
+
+    auto mean = torch::zeros({batch_size, num_groups, height, width});
+    auto var = torch::zeros({batch_size, num_groups, height, width});
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (output.numel() + block_size - 1) / block_size;
+
+    groupnorm_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, num_groups, height, width);
+
+    return output;
+}
+"""
+
+scaling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Scaling kernel
+__global__ void scaling_kernel(const float* input, const float* scale, float* output, int batch_size, int out_channels, int height, int width) {
+    // Implementation of scaling
+}
+
+torch::Tensor scaling_cuda(torch::Tensor input, torch::Tensor scale) {
+    auto batch_size = input.size(0);
+    auto out_channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (output.numel() + block_size - 1) / block_size;
+
+    scaling_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), scale.data_ptr<float>(), output.data_ptr<float>(), batch_size, out_channels, height, width);
+
+    return output;
+}
+"""
+
+maxpooling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Max pooling kernel
+__global__ void maxpooling_kernel(const float* input, float* output, int batch_size, int in_channels, int height, int width, int pool_size) {
+    // Implementation of max pooling
+}
+
+torch::Tensor maxpooling_cuda(torch::Tensor input, int pool_size) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output_height = height / pool_size;
+    auto output_width = width / pool_size;
+
+    auto output = torch::zeros({batch_size, in_channels, output_height, output_width}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (output.numel() + block_size - 1) / block_size;
+
+    maxpooling_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, height, width, pool_size);
+
+    return output;
+}
+"""
+
+clamp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Clamp kernel
+__global__ void clamp_kernel(const float* input, float min_val, float max_val, float* output, int numel) {
+    // Implementation of clamp
+}
+
+torch::Tensor clamp_cuda(torch::Tensor input, float min_val, float max_val) {
+    auto numel = input.numel();
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (numel + block_size - 1) / block_size;
+
+    clamp_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), min_val, max_val, output.data_ptr<float>(), numel);
+
+    return output;
+}
+"""
+
+# Compile the inline CUDA code for each operation
+convolution = load_inline(
+    name="convolution",
+    cpp_sources="torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, int kernel_size);",
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+groupnorm = load_inline(
+    name="groupnorm",
+    cpp_sources="torch::Tensor groupnorm_cuda(torch::Tensor input, int num_groups);",
+    cuda_sources=groupnorm_source,
+    functions=["groupnorm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+scaling = load_inline(
+    name="scaling",
+    cpp_sources="torch::Tensor scaling_cuda(torch::Tensor input, torch::Tensor scale);",
+    cuda_sources=scaling_source,
+    functions=["scaling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+maxpooling = load_inline(
+    name="maxpooling",
+    cpp_sources="torch::Tensor maxpooling_cuda(torch::Tensor input, int pool_size);",
+    cuda_sources=maxpooling_source,
+    functions=["maxpooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+clamp = load_inline(
+    name="clamp",
+    cpp_sources="torch::Tensor clamp_cuda(torch::Tensor input, float min_val, float max_val);",
+    cuda_sources=clamp_source,
+    functions=["clamp_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.group_norm = groupnorm
+        self.scale = scaling
+        self.maxpool = maxpooling
+        self.clamp = clamp
+
+    def forward(self, x):
+        x = self.conv.convolution_cuda(x, self.weight, kernel_size)
+        x = self.group_norm.groupnorm_cuda(x, num_groups)
+        x = self.scale.scaling_cuda(x, self.scale)
+        x = self.maxpool.maxpooling_cuda(x, maxpool_kernel_size)
+        x = self.clamp.clamp_cuda(x, clamp_min, clamp_max)
+        return x
+
+# Example usage
+model_new = ModelNew(in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max)
+inputs = get_inputs()
+output = model_new(inputs[0])
+print(output.shape)

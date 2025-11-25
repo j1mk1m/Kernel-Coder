@@ -1,0 +1,168 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Inline CUDA code for the fused convolution transpose, bias subtraction, and tanh kernel
+fused_conv_tanh_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+#define CUDA_KERNEL_LOOP(i, n) for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); i += blockDim.x * gridDim.x)
+
+template <typename scalar_t>
+__global__ void fused_conv_transpose_tanh_kernel(
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    scalar_t* __restrict__ output,
+    int batch_size, int in_channels, int out_channels,
+    int input_height, int input_width,
+    int output_height, int output_width,
+    int kernel_h, int kernel_w,
+    int stride_h, int stride_w,
+    int pad_h, int pad_w,
+    int out_pad_h, int out_pad_w
+) {
+    CUDA_KERNEL_LOOP(output_idx, batch_size * out_channels * output_height * output_width) {
+        int w = output_idx % output_width;
+        int h = (output_idx / output_width) % output_height;
+        int c_out = (output_idx / (output_width * output_height)) % out_channels;
+        int n = output_idx / (out_channels * output_height * output_width);
+
+        scalar_t sum = 0;
+
+        // Compute the input coordinates based on transposed convolution parameters
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                int h_in = (h + out_pad_h - kh) / stride_h;
+                int w_in = (w + out_pad_w - kw) / stride_w;
+                if ((h + out_pad_h - kh) % stride_h == 0 && (w + out_pad_w - kw) % stride_w == 0 &&
+                    h_in >= -pad_h && h_in < input_height + pad_h &&
+                    w_in >= -pad_w && w_in < input_width + pad_w) {
+                    h_in = h_in + pad_h;
+                    w_in = w_in + pad_w;
+                    if (h_in >= 0 && h_in < input_height && w_in >= 0 && w_in < input_width) {
+                        for (int c_in = 0; c_in < in_channels; ++c_in) {
+                            int weight_idx = c_in * kernel_h * kernel_w * out_channels +
+                                            kh * kernel_w * out_channels + kw * out_channels + c_out;
+                            sum += input[n * in_channels * input_height * input_width +
+                                        c_in * input_height * input_width +
+                                        h_in * input_width + w_in] *
+                                   weight[weight_idx];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Subtract bias and apply tanh activation
+        int bias_idx = c_out;
+        sum -= bias[bias_idx];
+        output[output_idx] = tanh(sum);
+    }
+}
+
+std::vector<torch::Tensor> fused_conv_transpose_tanh_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int output_height,
+    int output_width,
+    int kernel_size,
+    int stride,
+    int padding,
+    int output_padding
+) {
+    const int batch_size = input.size(0);
+    const int in_channels = input.size(1);
+    const int out_channels = weight.size(0) / (kernel_size * kernel_size); // Assuming weight is [out_channels * kh * kw, in_channels]
+    const int input_height = input.size(2);
+    const int input_width = input.size(3);
+    const int kernel_h = kernel_size;
+    const int kernel_w = kernel_size;
+    const int stride_h = stride;
+    const int stride_w = stride;
+    const int pad_h = padding;
+    const int pad_w = padding;
+    const int out_pad_h = output_padding;
+    const int out_pad_w = output_padding;
+
+    auto output = torch::empty({batch_size, out_channels, output_height, output_width}, input.options());
+
+    const int threads = 256;
+    const int elements = batch_size * out_channels * output_height * output_width;
+    const int blocks = (elements + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "fused_conv_transpose_tanh_cuda", ([&] {
+        fused_conv_transpose_tanh_kernel<scalar_t><<<blocks, threads>>>(
+            input.data<scalar_t>(),
+            weight.data<scalar_t>(),
+            bias.data<scalar_t>(),
+            output.data<scalar_t>(),
+            batch_size, in_channels, out_channels,
+            input_height, input_width,
+            output_height, output_width,
+            kernel_h, kernel_w,
+            stride_h, stride_w,
+            pad_h, pad_w,
+            out_pad_h, out_pad_w
+        );
+    }));
+
+    return {output};
+}
+"""
+
+fused_conv_tanh_cpp_source = (
+    "std::vector<torch::Tensor> fused_conv_transpose_tanh_cuda("
+    "torch::Tensor input, torch::Tensor weight, torch::Tensor bias, "
+    "int output_height, int output_width, int kernel_size, int stride, "
+    "int padding, int output_padding);"
+)
+
+# Compile the fused CUDA kernel
+fused_conv_tanh = load_inline(
+    name="fused_conv_tanh",
+    cpp_sources=fused_conv_tanh_cpp_source,
+    cuda_sources=fused_conv_tanh_source,
+    functions=["fused_conv_transpose_tanh_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
+        super(ModelNew, self).__init__()
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.kernel_size = kernel_size
+
+        # Initialize weights similar to ConvTranspose2d
+        weight = torch.randn(out_channels * kernel_size * kernel_size, in_channels)
+        self.weight = nn.Parameter(weight)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        # Compute output dimensions based on input and parameters
+        batch_size, _, input_height, input_width = x.size()
+        output_height = (input_height - 1) * self.stride - 2 * self.padding + self.kernel_size + self.output_padding
+        output_width = (input_width - 1) * self.stride - 2 * self.padding + self.kernel_size + self.output_padding
+
+        # Reshape bias to match output dimensions
+        bias_reshaped = self.bias.view(1, -1, 1, 1).expand(batch_size, -1, output_height, output_width)
+
+        # Call the fused CUDA kernel
+        output = fused_conv_tanh.fused_conv_transpose_tanh_cuda(
+            x,
+            self.weight,
+            self.bias,
+            output_height,
+            output_width,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.output_padding
+        )[0]
+
+        return output

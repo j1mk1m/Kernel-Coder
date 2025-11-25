@@ -1,0 +1,172 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for min operation along a specific dimension
+min_operation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define TILE_WIDTH 16
+
+__global__ void min_operation_kernel(const float* input, float* output, int batch_size, int out_channels, int spatial_dim) {
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int i = bid * blockDim.x + tid;
+
+    // Load data into shared memory
+    if (i < spatial_dim) {
+        sdata[tid] = input[i];
+    } else {
+        sdata[tid] = INFINITY;  // Initialize with infinity if index is out of bounds
+    }
+
+    __syncthreads();
+
+    // Reduce within shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmin(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // Write result back to global memory
+    if (tid == 0) {
+        output[bid] = sdata[0];
+    }
+}
+
+torch::Tensor min_operation_cuda(torch::Tensor input, int dim) {
+    auto batch_size = input.size(0);
+    auto out_channels = input.size(1);
+    auto spatial_dim = input.size(dim);
+
+    auto output = torch::zeros({batch_size, out_channels}, input.options());
+
+    const int block_size = 256;
+    const int grid_size = (batch_size * out_channels + block_size - 1) / block_size;
+
+    min_operation_kernel<<<grid_size, block_size, TILE_WIDTH * sizeof(float)>>>(
+        input.data_ptr<float>(), output.data_ptr<float>(), batch_size, out_channels, spatial_dim
+    );
+
+    return output;
+}
+"""
+
+min_operation_cpp_source = (
+    "torch::Tensor min_operation_cuda(torch::Tensor input, int dim);"
+)
+
+# Compile the inline CUDA code for min operation
+min_operation = load_inline(
+    name="min_operation",
+    cpp_sources=min_operation_cpp_source,
+    cuda_sources=min_operation_source,
+    functions=["min_operation_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for softmax along the channel dimension
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define TILE_WIDTH 16
+
+__global__ void softmax_kernel(const float* input, float* output, int batch_size, int out_channels, int spatial_dim) {
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    int i = bid * blockDim.x + tid;
+
+    // Load data into shared memory
+    if (i < spatial_dim) {
+        sdata[tid] = exp(input[i]);
+    } else {
+        sdata[tid] = 0.0f;  // Initialize with zero if index is out of bounds
+    }
+
+    __syncthreads();
+
+    // Reduce sum within shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Write result back to global memory
+    if (tid == 0) {
+        float sum_exp = sdata[0];
+        for (int j = 1; j < spatial_dim; ++j) {
+            sdata[j] = exp(input[j]) / sum_exp;
+        }
+        output[bid] = sdata[0];
+    }
+}
+
+torch::Tensor softmax_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto out_channels = input.size(1);
+    auto spatial_dim = input.size(2);
+
+    auto output = torch::zeros({batch_size, out_channels, spatial_dim}, input.options());
+
+    const int block_size = 256;
+    const int grid_size = (batch_size * out_channels + block_size - 1) / block_size;
+
+    softmax_kernel<<<grid_size, block_size, TILE_WIDTH * sizeof(float)>>>(
+        input.data_ptr<float>(), output.data_ptr<float>(), batch_size, out_channels, spatial_dim
+    );
+
+    return output;
+}
+"""
+
+softmax_cpp_source = (
+    "torch::Tensor softmax_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for softmax
+softmax = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dim):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.dim = dim
+        self.min_operation = min_operation
+        self.softmax = softmax
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.min_operation.min_operation_cuda(x, dim=self.dim)
+        x = self.softmax.softmax_cuda(x)
+        return x
+
+
+# Example usage
+if __name__ == "__main__":
+    model_new = ModelNew(in_channels, out_channels, kernel_size, dim).cuda()
+    inputs = get_inputs()[0].cuda()
+    outputs = model_new(inputs)
+    print(outputs.shape)

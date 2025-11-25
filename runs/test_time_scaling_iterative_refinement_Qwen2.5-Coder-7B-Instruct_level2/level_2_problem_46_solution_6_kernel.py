@@ -1,0 +1,223 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_kernel(const float* input, const float* weight, float* output, int in_channels, int out_channels, int height, int width, int kernel_size) {
+    int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_width = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (out_idx < out_channels && out_width < width) {
+        float sum = 0.0f;
+        for (int c = 0; c < in_channels; ++c) {
+            for (int k_h = 0; k_h < kernel_size; ++k_h) {
+                for (int k_w = 0; k_w < kernel_size; ++k_w) {
+                    int in_idx = ((out_idx * width + out_width) * in_channels + c) * height + (k_h * width + k_w);
+                    sum += input[in_idx] * weight[c * kernel_size * kernel_size + k_h * kernel_size + k_w];
+                }
+            }
+        }
+        output[out_idx * width + out_width] = sum;
+    }
+}
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto out_channels = weight.size(0);
+    auto in_channels = weight.size(1);
+    auto kernel_size = weight.size(2);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    auto output = torch::zeros({out_channels, height, width}, input.options());
+
+    const int block_size = 16;
+    const int num_blocks_height = (out_channels + block_size - 1) / block_size;
+    const int num_blocks_width = (width + block_size - 1) / block_size;
+
+    convolution_kernel<<<num_blocks_height, num_blocks_width, 0, at::cuda::getCurrentCUDAStream()>>>(
+        input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(),
+        in_channels, out_channels, height, width, kernel_size
+    );
+
+    return output;
+}
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for subtraction
+subtraction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void subtraction_kernel(const float* input, const float* value, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = input[idx] - value[0];
+    }
+}
+
+torch::Tensor subtraction_cuda(torch::Tensor input, float value) {
+    auto size = input.numel();
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    subtraction_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), &value, output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+subtraction_cpp_source = (
+    "torch::Tensor subtraction_cuda(torch::Tensor input, float value);"
+)
+
+# Compile the inline CUDA code for subtraction
+subtraction = load_inline(
+    name="subtraction",
+    cpp_sources=subtraction_cpp_source,
+    cuda_sources=subtraction_source,
+    functions=["subtraction_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for tanh activation
+tanh_activation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void tanh_activation_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = tanh(input[idx]);
+    }
+}
+
+torch::Tensor tanh_activation_cuda(torch::Tensor input) {
+    auto size = input.numel();
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    tanh_activation_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+tanh_activation_cpp_source = (
+    "torch::Tensor tanh_activation_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for tanh activation
+tanh_activation = load_inline(
+    name="tanh_activation",
+    cpp_sources=tanh_activation_cpp_source,
+    cuda_sources=tanh_activation_source,
+    functions=["tanh_activation_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for average pooling
+average_pooling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void average_pooling_kernel(const float* input, float* output, int in_channels, int height, int width, int kernel_size) {
+    int out_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_width = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (out_idx < in_channels && out_width < width) {
+        float sum = 0.0f;
+        int count = 0;
+        for (int h = 0; h < kernel_size; ++h) {
+            for (int w = 0; w < kernel_size; ++w) {
+                int in_idx = ((out_idx * width + out_width) * height + h * width + w);
+                sum += input[in_idx];
+                ++count;
+            }
+        }
+        output[out_idx * width + out_width] = sum / count;
+    }
+}
+
+torch::Tensor average_pooling_cuda(torch::Tensor input, int kernel_size) {
+    auto in_channels = input.size(0);
+    auto height = input.size(1);
+    auto width = input.size(2);
+    auto output = torch::zeros({in_channels, height, width}, input.options());
+
+    const int block_size = 16;
+    const int num_blocks_height = (in_channels + block_size - 1) / block_size;
+    const int num_blocks_width = (width + block_size - 1) / block_size;
+
+    average_pooling_kernel<<<num_blocks_height, num_blocks_width, 0, at::cuda::getCurrentCUDAStream()>>>(
+        input.data_ptr<float>(), output.data_ptr<float>(),
+        in_channels, height, width, kernel_size
+    );
+
+    return output;
+}
+"""
+
+average_pooling_cpp_source = (
+    "torch::Tensor average_pooling_cuda(torch::Tensor input, int kernel_size);"
+)
+
+# Compile the inline CUDA code for average pooling
+average_pooling = load_inline(
+    name="average_pooling",
+    cpp_sources=average_pooling_cpp_source,
+    cuda_sources=average_pooling_source,
+    functions=["average_pooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract1_value, subtract2_value, kernel_size_pool):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.subtract1 = subtraction
+        self.subtract2 = subtraction
+        self.tanh = tanh_activation
+        self.pool = average_pooling
+
+    def forward(self, x):
+        x = self.conv.convolution_cuda(x, self.weight)
+        x = self.subtract1.subtraction_cuda(x, self.subtract1_value)
+        x = self.tanh.tanh_activation_cuda(x)
+        x = self.subtract2.subtraction_cuda(x, self.subtract2_value)
+        x = self.pool.average_pooling_cuda(x, self.kernel_size_pool)
+        return x
+
+    def init_weights(self, in_channels, out_channels, kernel_size, subtract1_value, subtract2_value, kernel_size_pool):
+        self.weight = torch.randn(out_channels, in_channels, kernel_size, kernel_size).cuda()
+        self.subtract1_value = subtract1_value
+        self.subtract2_value = subtract2_value
+        self.kernel_size_pool = kernel_size_pool

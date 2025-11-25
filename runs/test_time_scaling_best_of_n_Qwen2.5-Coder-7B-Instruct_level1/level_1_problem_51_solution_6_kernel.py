@@ -1,0 +1,63 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+argmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void argmax_kernel(const float* x, int* out, int size, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        int max_idx = idx % dim;
+        float max_val = x[idx];
+        for (int i = 1; i < dim; ++i) {
+            int cur_idx = idx + i * dim;
+            float cur_val = x[cur_idx];
+            if (cur_val > max_val) {
+                max_idx = cur_idx % dim;
+                max_val = cur_val;
+            }
+        }
+        out[idx / dim] = max_idx;
+    }
+}
+
+torch::Tensor argmax_cuda(torch::Tensor x, int dim) {
+    auto size = x.size()[0] * x.size()[1];
+    auto out = torch::zeros(size, torch::kInt32);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    argmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<int>(), size, dim);
+
+    return out;
+}
+"""
+
+argmax_cpp_source = (
+    "torch::Tensor argmax_cuda(torch::Tensor x, int dim);"
+)
+
+# Compile the inline CUDA code for argmax
+argmax = load_inline(
+    name="argmax",
+    cpp_sources=argmax_cpp_source,
+    cuda_sources=argmax_source,
+    functions=["argmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.argmax = argmax
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.argmax.argmax_cuda(x, self.dim)

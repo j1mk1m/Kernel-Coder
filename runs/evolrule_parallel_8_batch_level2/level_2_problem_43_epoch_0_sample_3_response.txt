@@ -1,0 +1,652 @@
+You must also output the code for the kernel in the same codeblock. 
+
+You can choose which operators to replace. For example, you can choose to replace logsumexp or relu with a custom kernel. Or you can combine operators like logsumexp and relu. Or you can replace multiple operators. 
+
+You can also choose to optimize the existing convolution or pooling layers, but be aware that replacing these with custom CUDA may be more involved. 
+
+You may want to consider fusing operators, such as combining logsumexp and relu into a single kernel, which can save memory and computation time. 
+
+Make sure that the new code is correct and maintains the same functionality as the original code. 
+
+Do not use PyTorch's native CUDA kernels. All custom operators must be written in CUDA. 
+
+Also, when you write the new code, you must use torch.utils.cpp_extension.load_inline to embed the CUDA code in the Python file. 
+
+Make sure the code you write is compatible with PyTorch and can be compiled without errors. 
+
+Finally, make sure that the get_inputs() and get_init_inputs() functions are adjusted if necessary, but in most cases they should remain the same. 
+
+The user will run your code with:
+
+python -m torch.utils.benchmark.op_benchmark --testcase-params "model=ModelNew()"
+
+so make sure that the ModelNew class is compatible with this.
+
+
+
+Okay, let's tackle optimizing this Model by writing custom CUDA kernels. The original model has a Conv3d, MaxPool3d, logsumexp, and ReLU. The user wants me to replace some operators with custom CUDA code for speedups.
+
+First, I need to look at which operators might benefit the most from custom kernels. The logsumexp and ReLU are both element-wise operations, so combining them into a single kernel could save memory and reduce kernel launch overhead. That's a good candidate for fusion. The convolution and max pooling are more complex, but writing custom kernels for those might be more involved and could be error-prone. Since the user allows choosing which operators to replace, I'll focus on the logsumexp and ReLU first.
+
+So, I'll create a fused kernel for logsumexp followed by ReLU. The logsumexp function is log(sum(exp(x))), and ReLU is max(0, x). Since they are applied sequentially, combining them into one kernel can avoid an intermediate storage for the logsumexp result, which might save memory and time.
+
+Now, let's think about the CUDA kernel structure. The input to this fused operation is a tensor x of shape (batch, channels, depth, height, width). The logsumexp is taken along dimension 1 (channels), resulting in a tensor with channels=1. Then ReLU is applied. 
+
+The steps in the kernel would be:
+
+1. For each position in the output (excluding the channel dimension since we're summing over channels), compute the exp of each element in the channel dimension.
+2. Sum those exponentials across the channel dimension.
+3. Take the log of the sum.
+4. Apply ReLU to the result.
+
+Wait, but logsumexp is along dim=1. So for each spatial position (depth, height, width) and each batch, we need to compute across all in_channels. Wait, the original model's logsumexp is after MaxPool, so the input to logsumexp is after convolution and max pool. The convolution reduces channels from in_channels to out_channels (64 in the given parameters). Then MaxPool reduces spatial dimensions. So the input to logsumexp is (batch, out_channels, ..., ...) and the logsumexp is over dim=1 (out_channels), resulting in a tensor with channels=1. Then ReLU is applied to that.
+
+So in the fused kernel, the input tensor x has shape (B, C, D, H, W). For each position (b, d, h, w), we need to compute the log of the sum of exp(x[b, c, d, h, w] for all c), then apply ReLU. Wait no, actually, the logsumexp is along dim=1 (channels), so for each (b, d, h, w), the logsumexp is over the channel dimension. So for each spatial position, across all channels, compute the logsumexp, then ReLU that.
+
+So in the kernel, for each output element (since the output is (B, 1, D', H', W')), we can process each element as follows:
+
+Compute the sum of exp(x) across channels, then take log, then ReLU. Wait, but ReLU of logsumexp? Since logsumexp is the logarithm of the sum of exponentials, which is always non-negative (since sum of exponentials is positive, log of that is defined). So ReLU here would have no effect, because logsumexp is already non-negative. Wait that's a problem!
+
+Wait, the original code is:
+
+x = torch.logsumexp(x, dim=1, keepdim=True)
+x = torch.relu(x)
+
+But logsumexp(x, dim=1) is the log of the sum of exponentials of x along dim 1. Since the sum of exponentials is always positive, the log is a real number. However, the log could be negative if the sum is less than 1. For example, if all elements in the channel are negative and their exponentials sum to 0.5, then log(0.5) is negative. So ReLU here would clamp it to 0. But why would the original code do that? Maybe it's intentional.
+
+Therefore, the fused kernel must compute logsumexp followed by ReLU. So in the kernel, after computing the log(sum(exp(...))), we apply max(0, result).
+
+So, the kernel needs to process each spatial position (for each batch, and each spatial position), compute the logsumexp across channels, then ReLU.
+
+To implement this in CUDA, I can structure it as a kernel where each thread handles a single output element. The output element's position in the spatial dimensions corresponds to a position in the input, but considering the reduction over the channel dimension.
+
+Wait, let's think about the output dimensions. The input to the fused kernel is after the MaxPool3d, so let's see the dimensions:
+
+Original input to the model is (4, 32, 32, 128, 128).
+
+After Conv3d (kernel_size 3, stride 1, padding 1), the spatial dimensions remain the same (since padding=1 and stride=1). The channels go from 32 to 64.
+
+Then MaxPool3d with kernel_size 2, stride 2: the spatial dimensions (depth, height, width) each get halved. So after MaxPool, the shape is (4, 64, 16, 64, 64).
+
+Then logsumexp over dim=1 (channels), so the output becomes (4, 1, 16, 64, 64). ReLU leaves the shape the same.
+
+So each output element (b, 0, d, h, w) corresponds to the logsumexp over all 64 channels at position (b, *, d, h, w) in the input to the fused op, then ReLU.
+
+So each output element is processed by a thread. The total number of output elements is 4 * 1 * 16 * 64 * 64 = let's see, 4*1=4, 16*64=1024, 64*4=256? Wait 16 * 64 is 1024, times 64 would be 65536? Wait 16 (depth) * 64 (height) * 64 (width) = 16*64*64 = 65536 per batch. 4 batches gives 262,144 elements.
+
+So the kernel can have one thread per output element. Each thread is responsible for one output element (b, 0, d, h, w). For each such element, the thread needs to compute the sum over the 64 channels (the input's channel dimension) of exp(input[b, c, d', h', w']), where d' etc are the positions after max pool.
+
+Wait, actually, the spatial indices in the input to the fused op (after MaxPool) are depth=16, height=64, width=64. So for the thread's output position (d, h, w), the corresponding spatial indices in the input are exactly those (d, h, w). So each thread can loop over the channels (64 elements) for their specific spatial position, accumulate the sum of exponentials, then compute log(sum) and ReLU.
+
+So the steps in the kernel would be:
+
+1. For each output element (indexed by b, d, h, w), initialize sum to zero.
+
+2. Iterate over all channels c (0 to 63):
+
+   a. Read the value from the input tensor at (b, c, d, h, w).
+
+   b. Compute exp of that value and add to the sum.
+
+3. After all channels, compute log(sum), then apply ReLU (max(0, log_sum_exp)).
+
+4. Write the result to the output tensor at (b, 0, d, h, w).
+
+This approach would require each thread to process all channels. Since the number of channels is 64, which is manageable, especially since it's a loop within a thread. For 64 iterations, that's okay for a kernel.
+
+Now, how to structure the CUDA kernel:
+
+The input tensor is a 5D tensor, so we need to compute the linear index correctly. Let's think about the input tensor's strides and how to access elements. Since in CUDA, the memory is stored in a contiguous format, we can compute the linear index using the batch, channel, depth, height, and width indices.
+
+The output tensor is also 5D, but with the channel dimension fixed to 1. So for the output's linear index, the channel is always 0, so the index is computed as:
+
+output_offset = (b * output_depth + d) * output_height * output_width + h * output_width + w
+
+Similarly, for each channel c in the input, the input's linear index would be:
+
+input_offset = (b * in_channels + c) * depth * height * width + d * height * width + h * width + w
+
+Wait, but the input dimensions after MaxPool are (batch, 64, 16, 64, 64). So the strides would be:
+
+- batch: 64 * 16 * 64 * 64
+- channel: 16 * 64 * 64
+- depth: 64 * 64
+- height: 64
+- width: 1
+
+So to compute the linear index for (b, c, d, h, w):
+
+linear_idx = b * (in_channels * depth * height * width) + c * (depth * height * width) + d * (height * width) + h * width + w
+
+But in practice, since the tensors are in contiguous memory, we can just use pointers and strides. However, for simplicity, maybe it's better to have the kernel take pointers and handle the dimensions as parameters.
+
+Alternatively, the kernel can be written to take the input tensor as a 1D array, and compute the index based on the dimensions.
+
+So in the kernel code:
+
+Each thread is assigned to an output element (b, d, h, w). To get their thread ID, we can use a 3D or 1D grid. Let's make the threads cover the batch, depth, height, and width.
+
+But since the output is 5D (batch, 1, depth, height, width), the number of elements is batch * 1 * depth * height * width. So we can use a 1D grid where each thread corresponds to an output element's linear index.
+
+Alternatively, the block and grid dimensions can be structured to cover the spatial dimensions.
+
+But for simplicity, let's use a 1D grid. The total number of threads needed is the number of output elements, which is batch * out_depth * out_height * out_width (since the channel is 1). 
+
+In CUDA, we can compute the linear index as:
+
+int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+Then, compute the batch, depth, height, and width from the index. 
+
+Alternatively, using a 3D grid for better coalescing, but that might complicate.
+
+Let me structure the kernel as follows:
+
+__global__ void fused_logsumexp_relu_kernel(
+    const float* input, float* output,
+    int batch_size, int in_channels, 
+    int out_depth, int out_height, int out_width) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_depth * out_height * out_width) return;
+
+    // Compute the indices
+    int w = idx % out_width;
+    int h = (idx / out_width) % out_height;
+    int d = (idx / (out_width * out_height)) % out_depth;
+    int b = idx / (out_depth * out_height * out_width);
+
+    // Initialize sum
+    float sum = 0.0f;
+    for (int c = 0; c < in_channels; ++c) {
+        // Compute the input index
+        int in_idx = b * in_channels * out_depth * out_height * out_width
+                    + c * out_depth * out_height * out_width
+                    + d * out_height * out_width
+                    + h * out_width
+                    + w;
+        float val = input[in_idx];
+        sum += expf(val);
+    }
+
+    // Compute log(sum)
+    float log_sum_exp = logf(sum);
+    // Apply ReLU
+    float result = log_sum_exp > 0.0f ? log_sum_exp : 0.0f;
+
+    // Write to output
+    int out_idx = b * out_depth * out_height * out_width
+                 + 0 * out_depth * out_height * out_width  // channel 0
+                 + d * out_height * out_width
+                 + h * out_width
+                 + w;
+    output[out_idx] = result;
+}
+
+Wait, but in the output's dimensions, the channel dimension is size 1, so the channel index is 0 for all elements. So the output index formula would be correct.
+
+However, I need to ensure that the input and output are stored in contiguous memory. So when the kernel is called, the input tensor must be contiguous. Therefore, in the Python code, before calling this kernel, we should make sure the input is contiguous.
+
+Now, in the Python code, the function that wraps the kernel needs to handle the input and output tensors.
+
+The kernel parameters are:
+
+- input: the input tensor (after MaxPool3d)
+- output: the output tensor (initialized)
+- batch_size, in_channels (number of channels of input, which is 64 in this case)
+- out_depth, out_height, out_width (the spatial dimensions after MaxPool)
+
+Wait, in the example given, after MaxPool, the depth is 32/2=16, height and width 128/2=64 each. So out_depth, etc. are parameters that can be extracted from the input tensor's shape. So in the wrapper function, we can get these values from input.size().
+
+Thus, the wrapper function in Python would be something like:
+
+def fused_logsumexp_relu_cuda(input):
+    batch_size, in_channels, out_depth, out_height, out_width = input.size()
+    output = torch.empty_like(input[:, :1, :, :, :])  # create a tensor with channels=1
+
+    # calculate the number of elements
+    numel = batch_size * out_depth * out_height * out_width
+
+    threads_per_block = 256
+    blocks_per_grid = (numel + threads_per_block - 1) // threads_per_block
+
+    fused_logsumexp_relu_kernel[blocks_per_grid, threads_per_block](
+        input.contiguous(), output,
+        batch_size, in_channels, out_depth, out_height, out_width
+    )
+
+    return output
+
+Wait, but the kernel uses the input's dimensions, so the wrapper needs to pass those parameters.
+
+Now, the CUDA kernel code must include all these parameters.
+
+Potential issues:
+
+- Numerical stability: when sum is very small, log(sum) could be very negative. But ReLU clamps it to zero, so that's okay.
+
+- Exp of very large values could cause overflow. But since we are taking the sum of exps, maybe we can use a max trick to avoid overflow, like in the standard logsumexp implementation. However, the problem states to make sure the code is correct and matches the original, so perhaps the original code does not use such tricks, so we can proceed as is.
+
+Alternatively, the original code might have that, but the user's code uses torch.logsumexp, which is numerically stable. Hmm. Wait, the standard torch.logsumexp implementation uses the log-sum-exp trick to prevent overflow/underflow by subtracting the maximum value first. So maybe in the kernel, to be accurate, we should implement that.
+
+Wait, this is important because if not, the kernel might give different results than the original code. For example, if the input has very large values, exp would overflow. So to match torch.logsumexp, we need to compute it correctly.
+
+Let me think:
+
+The correct way to compute logsumexp is:
+
+max_val = max(x)
+sum_exp = sum(exp(x_i - max_val) for all x_i)
+log_sum_exp = max_val + log(sum_exp)
+
+This avoids overflow because x_i - max_val is <=0, so exp won't be too big.
+
+So in the kernel, for each spatial position, we need to first find the maximum value across the channels, then compute the sum of exp(x_i - max_val), then add max_val to the log(sum).
+
+Then apply ReLU.
+
+Therefore, modifying the kernel code:
+
+Inside the per-thread loop over spatial positions (b, d, h, w):
+
+Compute the maximum value among all channels for this position first, then compute the sum.
+
+So the steps would be:
+
+for each (b, d, h, w):
+
+    float max_val = -INFINITY;
+    for (c in 0..in_channels-1):
+        val = input[b,c,d,h,w]
+        if (val > max_val) max_val = val
+    sum = 0
+    for (c in 0..in_channels-1):
+        val = input[b,c,d,h,w]
+        sum += exp(val - max_val)
+    log_sum_exp = max_val + log(sum)
+    result = max(0, log_sum_exp)
+
+This way, it's numerically stable. So the kernel needs to first find the maximum, then compute the sum.
+
+Therefore, in the kernel, for each thread's spatial position (b, d, h, w), we need two loops: first to find the max, then to compute the sum.
+
+This doubles the loop iterations (two passes over the channels for each position), but since the number of channels (64) isn't too large, it's manageable.
+
+Alternatively, can do it in a single loop:
+
+float max_val = -INFINITY;
+float sum = 0;
+for (c in 0..in_channels-1):
+    val = input[...];
+    if (val > max_val) max_val = val;
+    sum += exp(val - max_val); // Wait, no, because max_val is being updated.
+
+Wait, no, because if the max is found incrementally, the subtraction won't be correct for previous terms. So this approach won't work. Hence, the two-pass approach is needed.
+
+Therefore, the kernel code must have two loops. Let me adjust the kernel accordingly.
+
+So the revised kernel code would be:
+
+__global__ void fused_logsumexp_relu_kernel(
+    const float* input, float* output,
+    int batch_size, int in_channels, 
+    int out_depth, int out_height, int out_width) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_depth * out_height * out_width) return;
+
+    int w = idx % out_width;
+    int h = (idx / out_width) % out_height;
+    int d = (idx / (out_width * out_height)) % out_depth;
+    int b = idx / (out_depth * out_height * out_width);
+
+    float max_val = -INFINITY;
+    // First pass to find the maximum
+    for (int c = 0; c < in_channels; ++c) {
+        int in_idx = b * in_channels * out_depth * out_height * out_width
+                    + c * out_depth * out_height * out_width
+                    + d * out_height * out_width
+                    + h * out_width
+                    + w;
+        float val = input[in_idx];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    // Second pass to compute the sum of exp(val - max_val)
+    float sum = 0.0f;
+    for (int c = 0; c < in_channels; ++c) {
+        int in_idx = b * in_channels * out_depth * out_height * out_width
+                    + c * out_depth * out_height * out_width
+                    + d * out_height * out_width
+                    + h * out_width
+                    + w;
+        float val = input[in_idx];
+        sum += expf(val - max_val);
+    }
+
+    float log_sum_exp = max_val + logf(sum);
+    float result = log_sum_exp > 0.0f ? log_sum_exp : 0.0f;
+
+    int out_idx = b * out_depth * out_height * out_width
+                 + 0 * out_depth * out_height * out_width  // channel 0
+                 + d * out_height * out_width
+                 + h * out_width
+                 + w;
+    output[out_idx] = result;
+}
+
+This should now be numerically stable.
+
+Now, in Python code, the wrapper function is similar as before, but passes the input dimensions correctly.
+
+Testing for correctness is important, but the user says not to write testing code, just the model.
+
+Now, the next step is to replace the logsumexp and ReLU in the forward pass with the custom kernel.
+
+The original forward is:
+
+def forward(self, x):
+    x = self.conv(x)
+    x = self.max_pool(x)
+    x = torch.logsumexp(x, dim=1, keepdim=True)
+    x = torch.relu(x)
+    return x
+
+In the new model, after the max_pool, instead of those two lines, we call the fused kernel.
+
+So the new forward would be:
+
+def forward(self, x):
+    x = self.conv(x)
+    x = self.max_pool(x)
+    x = self.fused_logsumexp_relu(x)
+    return x
+
+Now, the ModelNew class will need to have the fused kernel loaded via load_inline.
+
+Putting it all together:
+
+The CUDA code for the fused kernel is written as a string, then loaded.
+
+Let me structure the code step by step.
+
+First, define the CUDA source code for the fused kernel:
+
+fused_logsumexp_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_logsumexp_relu_kernel(
+    const float* input, float* output,
+    int batch_size, int in_channels, 
+    int out_depth, int out_height, int out_width) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_depth * out_height * out_width) return;
+
+    int w = idx % out_width;
+    int h = (idx / out_width) % out_height;
+    int d = (idx / (out_width * out_height)) % out_depth;
+    int b = idx / (out_depth * out_height * out_width);
+
+    float max_val = -INFINITY;
+    for (int c = 0; c < in_channels; ++c) {
+        int in_idx = b * in_channels * out_depth * out_height * out_width
+                    + c * out_depth * out_height * out_width
+                    + d * out_height * out_width
+                    + h * out_width
+                    + w;
+        float val = input[in_idx];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    float sum = 0.0f;
+    for (int c = 0; c < in_channels; ++c) {
+        int in_idx = b * in_channels * out_depth * out_height * out_width
+                    + c * out_depth * out_height * out_width
+                    + d * out_height * out_width
+                    + h * out_width
+                    + w;
+        float val = input[in_idx];
+        sum += expf(val - max_val);
+    }
+
+    float log_sum_exp = max_val + logf(sum);
+    float result = log_sum_exp > 0.0f ? log_sum_exp : 0.0f;
+
+    int out_idx = b * out_depth * out_height * out_width
+                 + 0 * out_depth * out_height * out_width
+                 + d * out_height * out_width
+                 + h * out_width
+                 + w;
+    output[out_idx] = result;
+}
+
+torch::Tensor fused_logsumexp_relu_cuda(torch::Tensor input) {
+    // Get input dimensions
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int out_depth = input.size(2);
+    int out_height = input.size(3);
+    int out_width = input.size(4);
+
+    // Output has shape (batch, 1, depth, height, width)
+    auto output = torch::zeros({batch_size, 1, out_depth, out_height, out_width}, input.options());
+
+    // Number of elements to process (batch * depth * height * width)
+    int numel = batch_size * out_depth * out_height * out_width;
+
+    // Launch kernel
+    const int threads_per_block = 256;
+    const int blocks_per_grid = (numel + threads_per_block - 1) / threads_per_block;
+
+    fused_logsumexp_relu_kernel<<<blocks_per_grid, threads_per_block>>>(
+        input.contiguous().data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_channels,
+        out_depth,
+        out_height,
+        out_width
+    );
+
+    return output;
+}
+"""
+
+Then, the corresponding cpp source for the function declarations:
+
+fused_logsumexp_relu_cpp = (
+    "torch::Tensor fused_logsumexp_relu_cuda(torch::Tensor input);"
+)
+
+Then, load the inline CUDA code:
+
+fused_logsumexp_relu = load_inline(
+    name="fused_logsumexp_relu",
+    cpp_sources=fused_logsumexp_relu_cpp,
+    cuda_sources=fused_logsumexp_relu_source,
+    functions=["fused_logsumexp_relu_cuda"],
+    verbose=True,
+    extra_cflags=["-std=c++14"],
+    extra_ldflags=[""]
+)
+
+Wait, need to make sure the CUDA code is correct. Also, in the CUDA kernel, the output's index computation: the output's first dimension is batch, then the channel (which is 0), then depth, height, width. So the out_idx calculation is correct.
+
+Now, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.max_pool = nn.MaxPool3d(kernel_size=2, stride=2)
+        # Load the fused kernel
+        self.fused_logsumexp_relu = fused_logsumexp_relu
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.max_pool(x)
+        x = self.fused_logsumexp_relu.fused_logsumexp_relu_cuda(x)
+        return x
+
+Wait, the way to call the function from the loaded module is via the name given in the functions parameter. The function is named fused_logsumexp_relu_cuda, so:
+
+x = self.fused_logsumexp_relu.fused_logsumexp_relu_cuda(x)
+
+Yes.
+
+Now, checking for compilation:
+
+The CUDA code includes math functions like expf and logf. Need to include <math.h>.
+
+Also, the kernel uses torch::Tensor, which requires including torch/extension.h.
+
+The code should compile as long as the inline CUDA is correctly formatted.
+
+Potential issues:
+
+- The input to the kernel must be contiguous, so in the wrapper function, we call input.contiguous().data_ptr<float>().
+
+- The output tensor is initialized with the correct size.
+
+Testing the code's correctness is important, but the user doesn't require it.
+
+Now, putting all together in the required code block.
+
+Also, need to ensure that the get_inputs and get_init_inputs functions remain the same. Since the model's __init__ parameters are the same (in_channels etc.), get_init_inputs is unchanged. The inputs are the same as well.
+
+Thus, the final code is as follows.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_logsumexp_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_logsumexp_relu_kernel(
+    const float* input, float* output,
+    int batch_size, int in_channels, 
+    int out_depth, int out_height, int out_width) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_depth * out_height * out_width) return;
+
+    int w = idx % out_width;
+    int h = (idx / out_width) % out_height;
+    int d = (idx / (out_width * out_height)) % out_depth;
+    int b = idx / (out_depth * out_height * out_width);
+
+    float max_val = -INFINITY;
+    for (int c = 0; c < in_channels; ++c) {
+        int in_idx = b * in_channels * out_depth * out_height * out_width
+                    + c * out_depth * out_height * out_width
+                    + d * out_height * out_width
+                    + h * out_width
+                    + w;
+        float val = input[in_idx];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    float sum = 0.0f;
+    for (int c = 0; c < in_channels; ++c) {
+        int in_idx = b * in_channels * out_depth * out_height * out_width
+                    + c * out_depth * out_height * out_width
+                    + d * out_height * out_width
+                    + h * out_width
+                    + w;
+        float val = input[in_idx];
+        sum += expf(val - max_val);
+    }
+
+    float log_sum_exp = max_val + logf(sum);
+    float result = log_sum_exp > 0.0f ? log_sum_exp : 0.0f;
+
+    int out_idx = b * out_depth * out_height * out_width
+                 + 0 * out_depth * out_height * out_width
+                 + d * out_height * out_width
+                 + h * out_width
+                 + w;
+    output[out_idx] = result;
+}
+
+torch::Tensor fused_logsumexp_relu_cuda(torch::Tensor input) {
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int out_depth = input.size(2);
+    int out_height = input.size(3);
+    int out_width = input.size(4);
+
+    auto output = torch::zeros({batch_size, 1, out_depth, out_height, out_width}, input.options());
+
+    int numel = batch_size * out_depth * out_height * out_width;
+    const int threads_per_block = 256;
+    const int blocks_per_grid = (numel + threads_per_block - 1) / threads_per_block;
+
+    fused_logsumexp_relu_kernel<<<blocks_per_grid, threads_per_block>>>(
+        input.contiguous().data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_channels,
+        out_depth,
+        out_height,
+        out_width
+    );
+
+    return output;
+}
+"""
+
+fused_logsumexp_relu_cpp = (
+    "torch::Tensor fused_logsumexp_relu_cuda(torch::Tensor input);"
+)
+
+fused_logsumexp_relu = load_inline(
+    name="fused_logsumexp_relu",
+    cpp_sources=fused_logsumexp_relu_cpp,
+    cuda_sources=fused_logsumexp_relu_source,
+    functions=["fused_logsumexp_relu_cuda"],
+    verbose=True,
+    extra_cflags=["-std=c++14"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.max_pool = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.fused_logsumexp_relu = fused_logsumexp_relu
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.max_pool(x)
+        x = self.fused_logsumexp_relu.fused_logsumexp_relu_cuda(x)
+        return x
+
+batch_size = 4
+in_channels = 32
+out_channels = 64
+depth, height, width = 32, 128, 128
+kernel_size = 3
+stride = 1
+padding = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding]
+```

@@ -1,0 +1,68 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for argmin operation
+argmin_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void argmin_kernel(const float* x, int* out, int batch_size, int dim1, int dim2) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        float min_val = INFINITY;
+        int min_idx = -1;
+        for (int i = 0; i < dim1; ++i) {
+            for (int j = 0; j < dim2; ++j) {
+                int linear_idx = idx * dim1 * dim2 + i * dim2 + j;
+                float val = x[linear_idx];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = linear_idx;
+                }
+            }
+        }
+        out[idx] = min_idx;
+    }
+}
+
+torch::Tensor argmin_cuda(torch::Tensor x) {
+    auto batch_size = x.size(0);
+    auto dim1 = x.size(1);
+    auto dim2 = x.size(2);
+    auto out = torch::zeros({batch_size}, torch::kInt32);
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size + block_size - 1) / block_size;
+
+    argmin_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), out.data_ptr<int>(), batch_size, dim1, dim2);
+
+    return out;
+}
+"""
+
+argmin_cpp_source = (
+    "torch::Tensor argmin_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for argmin operation
+argmin = load_inline(
+    name="argmin",
+    cpp_sources=argmin_cpp_source,
+    cuda_sources=argmin_source,
+    functions=["argmin_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.argmin = argmin
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.argmin.argmin_cuda(x)

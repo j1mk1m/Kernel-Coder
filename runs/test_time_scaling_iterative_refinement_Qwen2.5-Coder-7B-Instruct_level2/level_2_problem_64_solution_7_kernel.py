@@ -1,0 +1,235 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication (Gemm)
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 32;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    gemm_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication (Gemm)
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for LogSumExp
+logsumexp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void logsumexp_kernel(const float* x, float* y, int size) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < size) {
+        sdata[tid] = x[i];
+        __syncthreads();
+
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            atomicAdd(y, sdata[0]);
+        }
+    }
+}
+
+torch::Tensor logsumexp_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto y = torch::zeros(1, x.options());
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    logsumexp_kernel<<<num_blocks, block_size, block_size * sizeof(float)>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+
+    return y;
+}
+"""
+
+logsumexp_cpp_source = (
+    "torch::Tensor logsumexp_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for LogSumExp
+logsumexp = load_inline(
+    name="logsumexp",
+    cpp_sources=logsumexp_cpp_source,
+    cuda_sources=logsumexp_source,
+    functions=["logsumexp_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for LeakyReLU
+leakyrelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void leakyrelu_kernel(const float* x, float* y, int size, float negative_slope) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        y[idx] = x[idx] > 0 ? x[idx] : x[idx] * negative_slope;
+    }
+}
+
+torch::Tensor leakyrelu_cuda(torch::Tensor x, float negative_slope) {
+    auto size = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    leakyrelu_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size, negative_slope);
+
+    return y;
+}
+"""
+
+leakyrelu_cpp_source = (
+    "torch::Tensor leakyrelu_cuda(torch::Tensor x, float negative_slope);"
+)
+
+# Compile the inline CUDA code for LeakyReLU
+leakyrelu = load_inline(
+    name="leakyrelu",
+    cpp_sources=leakyrelu_cpp_source,
+    cuda_sources=leakyrelu_source,
+    functions=["leakyrelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for GELU
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_kernel(const float* x, float* y, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        float z = 0.7978845608 * (x[idx] + 0.044715 * x[idx] * x[idx] * x[idx]);
+        y[idx] = 0.5 * x[idx] * (1.0 + tanh(z));
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    gelu_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+
+    return y;
+}
+"""
+
+gelu_cpp_source = (
+    "torch::Tensor gelu_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for GELU
+gelu = load_inline(
+    name="gelu",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.gemm = gemm
+        self.logsumexp = logsumexp
+        self.leakyrelu = leakyrelu
+        self.gelu = gelu
+
+    def forward(self, x):
+        # Gemm
+        x = self.gemm.gemm_cuda(x, self.linear.weight.t())
+        if self.linear.bias is not None:
+            x = x + self.linear.bias.view(1, -1).expand_as(x)
+        # LogSumExp
+        x = self.logsumexp.logsumexp_cuda(x)
+        # LeakyReLU
+        x = self.leakyrelu.leakyrelu_cuda(x, negative_slope=0.01)
+        # LeakyReLU
+        x = self.leakyrelu.leakyrelu_cuda(x, negative_slope=0.01)
+        # GELU
+        x = self.gelu.gelu_cuda(x)
+        # GELU
+        x = self.gelu.gelu_cuda(x)
+        return x
+
+
+def get_inputs():
+    batch_size = 1024
+    in_features = 8192
+    out_features = 8192
+    return [torch.rand(batch_size, in_features)]
+
+
+def get_init_inputs():
+    batch_size = 1024
+    in_features = 8192
+    out_features = 8192
+    return [in_features, out_features]

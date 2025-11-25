@@ -1,0 +1,48 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for gemm
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    // Implement GEMM here
+}
+
+torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b) {
+    // Implement GEMM here
+    return c;
+}
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for GEMM
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+        self.gemm = gemm
+
+    def forward(self, x):
+        x = self.gemm.gemm_cuda(x, x.t())
+        x = x * self.scale
+        x = self.bn(x)
+        return x

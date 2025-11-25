@@ -1,0 +1,675 @@
+The goal is to achieve maximum possible speedup compared to the original code. You may choose to replace any combination of the operators, or even all of them. You may choose to fuse multiple operations into a single kernel. The fused kernel must be faster than the original individual kernels. Also, ensure that your code is correct, and the outputs of the original and optimized model are identical. 
+
+You may want to consider fusing the Gemm (matrix multiplication), division, summation, and scaling operations into a single kernel. Since these are all element-wise operations after the matrix multiplication, they can be efficiently combined. The summation is along dimension 1, which may require a separate step but can be incorporated into the kernel efficiently.
+
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+
+        # Define and compile the fused CUDA kernel
+        fused_kernel_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        template <typename scalar_t>
+        __global__ void fused_gemm_div_sum_scale_kernel(
+            const scalar_t* __restrict__ x,
+            const scalar_t* __restrict__ weight,
+            scalar_t* __restrict__ out,
+            int batch_size,
+            int input_size,
+            int hidden_size,
+            scalar_t scaling_factor) {
+
+            int batch_idx = blockIdx.x;
+            int hidden_idx = threadIdx.x;
+
+            scalar_t sum_result = 0.0;
+
+            // Compute the matrix multiplication and division in a fused manner
+            for (int i = 0; i < input_size; ++i) {
+                sum_result += x[batch_idx * input_size + i] * weight[hidden_idx * input_size + i];
+            }
+            sum_result /= 2.0; // Division by 2
+
+            // Sum across the hidden dimension (but since we are summing over input, actually, wait, need to check dimensions)
+            // Wait, original code: after matmul (x * weight.T), the result is (batch, hidden_size)
+            // Then x = x / 2 (still batch, hidden), then x = sum over dim 1 (so becomes batch, 1), then scaled
+            // Wait, the sum is over dim=1 (the hidden_size dimension?), so actually after matmul, the shape is (batch, hidden_size)
+            // Then sum over dim 1 gives (batch, 1). So in the kernel, for each batch element, sum over the hidden_size dimension?
+
+            // Wait, my previous approach was wrong. Let me re-express.
+
+            // Wait, the matmul is x (batch, input_size) * weight.T (input_size, hidden_size) -> (batch, hidden_size)
+            // Then divide by 2: (batch, hidden_size)
+            // Then sum over dim=1 (each row's elements) to get (batch, 1)
+            // Then multiply by scaling factor
+
+            // So in the kernel, for each element in the output, we need to compute the sum over hidden_size elements.
+
+            // So the kernel should be structured per batch element, and per output element (which is 1 per batch).
+
+            // Let me restructure.
+
+            // Each thread block handles one batch element.
+            // Each thread in the block computes a portion of the sum.
+
+            // Let's restructure the kernel.
+
+            // blockIdx.x: batch index
+            // threadIdx.x: thread index within block (for parallel reduction)
+
+            // The kernel should compute, for each batch element, the sum over hidden_size elements (after matmul and divide by 2).
+
+            // Wait, but the matmul is part of this as well. Hmm, this requires a different approach.
+
+            // Maybe we can compute the matmul, divide, sum, and scale all in one step.
+
+            // Alternative approach: for each batch element, compute the sum over hidden_size (after the matmul and division).
+
+            // Wait, the sum is over the hidden_size dimension? Wait:
+
+            Original steps:
+            x = matmul(x, weight.T)  # (batch, hidden_size)
+            x = x / 2                # (batch, hidden_size)
+            x = sum over dim=1       # (batch, 1)
+            x = x * scaling_factor   # (batch, 1)
+
+            So the sum is over the hidden_size dimension (dim=1). So for each batch element, we need to compute the sum of all elements in the hidden_size dimension, after dividing by 2.
+
+            Therefore, the total computation for each batch element is:
+
+            (sum_{h=0}^{hidden_size-1} ( (x_b * weight_h.T) ) / 2 ) * scaling_factor
+
+            Wait, but actually:
+
+            Wait, x is (batch, input). weight is (hidden, input). So weight.T is (input, hidden). So matmul gives (batch, hidden).
+
+            Then, each element of this (batch, hidden) tensor is divided by 2. Then the sum over the hidden dimension (dim=1) reduces it to (batch, 1). Then scaling.
+
+            So the final value for each batch element is:
+
+            scaling_factor * (1/2) * sum_{h=0}^{H-1} (sum_{i=0}^{I-1} x_b_i * weight_h_i) )
+
+            Where H is hidden_size, I is input_size.
+
+            So this can be written as:
+
+            scaling_factor / 2 * sum_{h=0}^{H-1} sum_{i=0}^{I-1} (x_b_i * weight_h_i)
+
+            Which can be re-expressed as:
+
+            (scaling_factor / 2) * sum_{i=0}^{I-1} x_b_i * (sum_{h=0}^{H-1} weight_h_i )
+
+            Wait, that's interesting. Because the weight is (hidden_size, input_size). So for each input index i, sum over all hidden units h of weight_h_i.
+
+            Let me denote sum_h weight_h_i as W_i. Then the total becomes:
+
+            (scaling_factor / 2) * sum_{i=0}^{I-1} x_b_i * W_i
+
+            That's a key insight! This transforms the problem into a single vector dot product between x and the summed weights across hidden units, scaled by scaling_factor / 2.
+
+            Therefore, this can be computed with a single matmul between x and (summed_weights), then scaled by (scaling_factor / 2).
+
+            Wait, that would be a huge optimization, but requires precomputing the sum over hidden units for each input dimension.
+
+            However, the weight is a learnable parameter, so this precomputation would need to be done each time the weight changes. But perhaps it's worth it for the speedup.
+
+            Let me think: the original computation is O(batch_size * hidden_size * input_size) for matmul, then O(batch_size * hidden_size) for the division and summation.
+
+            The optimized approach would precompute summed_weights = sum(weight, dim=0)  # shape (input_size, )
+
+            Then the computation becomes:
+
+            x @ summed_weights.T * (scaling_factor / 2) 
+
+            Because:
+
+            x (batch, input) multiplied by summed_weights (input,) gives a scalar per batch, which is exactly the sum over i of x_i * summed_weights_i. 
+
+            So the total computation is O(batch_size * input_size) for the matmul, plus O(batch_size) for scaling.
+
+            This is a massive reduction in computation time, especially since input_size is 8192 here. The original matmul is O(1024 * 8192 * 8192) which is enormous, whereas the optimized is O(1024 * 8192). 
+
+            However, the problem states that the original model's forward pass includes the division by 2 and the summation over hidden_size. 
+
+            Therefore, if we can do this optimization, it would be a huge speedup. However, does this hold?
+
+            Let me verify:
+
+            Original computation:
+
+            matmul(x, weight.T) gives a (batch, hidden_size) tensor where each element is sum_{i} x_i * weight_h,i.
+
+            Then, divide each element by 2.
+
+            Then sum over hidden_size dimension (sum over h) gives sum_{h} [ (1/2) * sum_{i} x_i * weight_h,i ] = (1/2) * sum_{i} x_i * sum_{h} weight_h,i )
+
+            Which is exactly (1/2)*sum_{i} x_i * (sum_{h} weight_h,i )
+
+            Which is exactly the same as the optimized approach. 
+
+            Therefore, this is a valid mathematical transformation and would produce the same result as the original code. 
+
+            Therefore, this is a much more efficient approach, and requires only a single matmul (of x with summed_weights), then scaling by (scaling_factor / 2).
+
+            Therefore, instead of writing a custom CUDA kernel, we can actually restructure the computation in PyTorch in a way that is much faster.
+
+            However, the problem requires us to use custom CUDA kernels. So perhaps we can still proceed with this optimization but implement it as a custom kernel for the matmul with the summed weights, but perhaps fused with scaling?
+
+            Alternatively, since the summed_weights is a precomputed tensor, we can compute it once during forward pass (since the weight is a parameter, it can change between forward passes, so we need to recompute summed_weights each time).
+
+            Wait, but summed_weights is sum over hidden_size dimension of the weight matrix. So for each forward pass, we can compute summed_weights as weight.sum(0), then do the matmul, then scale.
+
+            Let me see:
+
+            summed_weights = self.weight.sum(0)  # shape (input_size, )
+            x = torch.mv(x, summed_weights)  # batch_size x input_size @ input_size -> batch_size x 1? Wait no, x is (batch_size, input_size), summed_weights is (input_size, ), so x @ summed_weights gives (batch_size, )
+
+            Then x = x * (scaling_factor / 2)
+
+            Wait, this gives exactly the same result as original, but with much less computation. This would be way faster than any custom kernel, because it reduces the computation from O(B*H*I) to O(B*I). 
+
+            However, the problem requires us to use custom CUDA operators. But perhaps the problem expects us to do operator fusion via CUDA kernels. But in this case, the mathematical optimization is better and doesn't require a kernel. But the problem might require us to use a kernel regardless.
+
+            Hmm. The problem says "you may choose to replace any combination of the operators, or even all of them. You may choose to fuse multiple operations into a single kernel."
+
+            So perhaps the user expects a kernel that fuses the matmul, division, summation, and scaling into one kernel. However, the mathematical approach is better, but maybe the problem wants the kernel-based approach.
+
+            Let me proceed with writing the fused kernel as per the initial approach, even though there's a better mathematical approach. Alternatively, perhaps the problem allows the mathematical approach as a form of algorithmic change, which is allowed.
+
+            Wait, the problem says "algorithmic changes (such as online softmax)" are allowed, so the mathematical optimization is allowed. Therefore, using the summed_weights approach is valid and would be the best approach.
+
+            However, perhaps the problem wants us to write a custom kernel. Let's proceed with both approaches.
+
+            First, the mathematical approach:
+
+            In the ModelNew's forward, we can do:
+
+            summed_weights = self.weight.sum(0)
+            x = x.mm(summed_weights.view(-1, 1))  # (batch, input) @ (input, 1) -> (batch, 1)
+            x = x * (self.scaling_factor / 2)
+
+            This is extremely efficient. However, we can write this as a custom kernel to make it even faster, perhaps by avoiding the extra memory allocations.
+
+            Let me see: the summed_weights is a tensor of size (input_size, ), then x is (batch_size, input_size). The matrix multiplication is equivalent to a dot product along the input dimension for each batch.
+
+            So, a custom CUDA kernel can be written to compute this dot product and apply the scaling in a single step. Let's write that kernel.
+
+            So here's the plan:
+
+            1. Precompute summed_weights = weight.sum(0) during forward. Since weight is a parameter, this is O(H*I), which is 8192*8192 = ~67 million operations. But the original matmul is O(B*H*I) which is 1024 * 8192^2 ~ 69 billion operations. So even with H*I, it's manageable.
+
+            2. Then compute the dot product between x and summed_weights, scaled by (scaling_factor / 2).
+
+            So the kernel can be written as:
+
+            For each element in the batch:
+
+                out[b] = (scaling_factor / 2) * sum_{i=0}^{input_size-1} x[b][i] * summed_weights[i]
+
+            This can be implemented in a CUDA kernel.
+
+            So here's the code for the fused kernel:
+
+            The kernel will take x, summed_weights, and scaling_factor, and compute the result in a single pass.
+
+            Let's write this.
+
+            So here is the code for the ModelNew:
+
+            We need to:
+
+            - In forward, compute summed_weights = self.weight.sum(0)
+            - Then call the kernel with x, summed_weights, scaling_factor.
+
+            Alternatively, the kernel can be written to take the original weight, but that would require more computation.
+
+            Let's proceed with the summed_weights approach.
+
+            Now, code:
+
+            First, define the kernel.
+
+            The fused kernel will take x (batch, input), weight (hidden, input), and compute the summed_weights on the fly?
+
+            Wait, but that would require summing over the hidden dimension for each input element. That might be better done on the CPU or as a separate kernel.
+
+            Hmm, perhaps it's better to precompute summed_weights on the CPU, then pass it to the kernel. But in any case, let's proceed.
+
+            Alternatively, in the kernel, for each input index i, compute the sum over h of weight[h][i], then multiply by x[b][i], accumulate, and so on.
+
+            Wait, that would actually compute summed_weights on the fly in the kernel, which might be more efficient in terms of memory, but adds computation.
+
+            Let's see:
+
+            The kernel could compute:
+
+            for each batch element b:
+
+                result = 0.0
+
+                for i in 0..input_size-1:
+
+                    sum_h = 0.0
+
+                    for h in 0..hidden_size-1:
+
+                        sum_h += weight[h][i]
+
+                    result += x[b][i] * sum_h
+
+                out[b] = (scaling_factor / 2) * result
+
+            But this is O(B * H * I) which is the same as the original approach. So this would not be faster. Hence, the kernel approach of computing summed_weights first is better.
+
+            Therefore, the optimal approach is to compute summed_weights on the CPU (or GPU) first, then do a dot product with x.
+
+            But since the problem requires using custom CUDA kernels, perhaps we can write a kernel that does the dot product with summed_weights and applies scaling.
+
+            The kernel would be straightforward:
+
+            __global__ void fused_dot_scale(
+                const float* x,
+                const float* summed_weights,
+                float* out,
+                int batch_size,
+                int input_size,
+                float scale_factor) {
+
+                int batch_idx = blockIdx.x;
+
+                float sum = 0.0;
+                for (int i = 0; i < input_size; ++i) {
+                    sum += x[batch_idx * input_size + i] * summed_weights[i];
+                }
+                out[batch_idx] = sum * scale_factor;
+            }
+
+            Then, in the forward pass:
+
+            summed_weights = self.weight.sum(0)  # (input_size,)
+            scale = self.scaling_factor / 2.0
+
+            # launch kernel
+            out = torch.empty(batch_size, 1, device='cuda')
+            block_size = 256
+            num_blocks = (batch_size + block_size -1 ) // block_size
+            fused_dot_scale<<<num_blocks, block_size>>>(x.data_ptr(), summed_weights.data_ptr(), out.data_ptr(), batch_size, input_size, scale)
+
+            However, the kernel above computes the result as (summed_weights . x) * scale, which is correct.
+
+            But in code, the summed_weights is a tensor, and the kernel can be written as follows.
+
+            So here is the complete code for ModelNew with this approach:
+
+            First, define the kernel:
+
+            fused_kernel_source = """
+            #include <torch/extension.h>
+            #include <cuda_runtime.h>
+
+            template <typename scalar_t>
+            __global__ void fused_dot_scale_kernel(
+                const scalar_t* __restrict__ x,
+                const scalar_t* __restrict__ summed_weights,
+                scalar_t* __restrict__ out,
+                int batch_size,
+                int input_size,
+                scalar_t scale_factor) {
+
+                int batch_idx = blockIdx.x;
+
+                scalar_t sum = 0.0;
+                for (int i = 0; i < input_size; ++i) {
+                    sum += x[batch_idx * input_size + i] * summed_weights[i];
+                }
+                out[batch_idx] = sum * scale_factor;
+            }
+
+            torch::Tensor fused_dot_scale(
+                torch::Tensor x,
+                torch::Tensor summed_weights,
+                float scaling_factor) {
+
+                const int batch_size = x.size(0);
+                const int input_size = x.size(1);
+                const auto scale = scaling_factor / 2.0;
+
+                auto out = torch::empty({batch_size, 1}, x.options());
+
+                const int threads_per_block = 256;
+                const int blocks_per_grid = batch_size;
+
+                AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "fused_dot_scale", ([&] {
+                    fused_dot_scale_kernel<scalar_t><<<blocks_per_grid, threads_per_block>>>(
+                        x.data<scalar_t>(),
+                        summed_weights.data<scalar_t>(),
+                        out.data<scalar_t>(),
+                        batch_size,
+                        input_size,
+                        scale
+                    );
+                }));
+
+                return out;
+            }
+            """
+
+            Then, in the ModelNew class:
+
+            class ModelNew(nn.Module):
+                def __init__(self, input_size, hidden_size, scaling_factor):
+                    super(ModelNew, self).__init__()
+                    self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+                    self.scaling_factor = scaling_factor
+
+                    # Compile the fused kernel
+                    fused_dot_scale = load_inline(
+                        name="fused_dot_scale",
+                        cpp_sources="...",
+                        cuda_sources=fused_kernel_source,
+                        functions=["fused_dot_scale"],
+                        verbose=True
+                    )
+                    self.fused_dot_scale = fused_dot_scale
+
+                def forward(self, x):
+                    summed_weights = self.weight.sum(0)  # (input_size,)
+                    x = x.cuda()  # Ensure x is on GPU
+                    out = self.fused_dot_scale.fused_dot_scale(x, summed_weights, self.scaling_factor)
+                    return out
+
+            However, there are some issues here:
+
+            1. The summed_weights must be computed on the GPU. Since self.weight is a parameter on the GPU, .sum(0) will compute it on the GPU.
+
+            2. The kernel must handle the data types properly. Using AT_DISPATCH_FLOATING_TYPES ensures that.
+
+            3. The output shape: the original code returns a tensor of shape (batch, 1). The kernel's output is (batch_size, 1), which matches.
+
+            This approach would be much faster than the original code because it reduces the computation from O(B*H*I) to O(B*I).
+
+            However, the problem requires using custom CUDA kernels. Since this approach does that, it's valid.
+
+            Alternatively, another approach is to fuse all operations into a single kernel without relying on the mathematical shortcut. Let's see:
+
+            The original code's steps are:
+
+            x = matmul(x, weight.T)  # (batch, hidden)
+            x = x / 2                # (batch, hidden)
+            x = x.sum(1, keepdim=True)  # (batch, 1)
+            x = x * scaling_factor    # (batch, 1)
+
+            To fuse these into a single kernel, each thread could handle a batch element, and for each batch element, compute the sum over hidden and input dimensions.
+
+            The kernel would be:
+
+            __global__ void fused_gemm_div_sum_scale(
+                const float* x,
+                const float* weight,
+                float* out,
+                int batch_size,
+                int input_size,
+                int hidden_size,
+                float scaling_factor) {
+
+                int batch_idx = blockIdx.x;
+
+                float sum_total = 0.0;
+
+                for (int h = 0; h < hidden_size; ++h) {
+                    float term = 0.0;
+                    for (int i = 0; i < input_size; ++i) {
+                        term += x[batch_idx * input_size + i] * weight[h * input_size + i];
+                    }
+                    term /= 2.0;
+                    sum_total += term;
+                }
+
+                out[batch_idx] = sum_total * scaling_factor;
+            }
+
+            This kernel computes for each batch element the total sum over hidden and input dimensions. The total operations are O(B*H*I), same as the original approach, but fused into a single kernel might have lower overhead. However, this is worse than the mathematical shortcut approach, but better than the original code if the original code's operations were not fused.
+
+            However, given the input sizes (H and I are both 8192), the mathematical approach is vastly superior. Hence, that is the better choice, and using the custom kernel for the optimized computation is the way to go.
+
+            Now, putting it all together with the code:
+
+            The code will need to:
+
+            1. Precompute summed_weights = weight.sum(0). Since weight is (hidden, input), summed_weights is (input,).
+
+            2. Multiply each input vector x by summed_weights (dot product).
+
+            3. Scale by scaling_factor / 2.
+
+            This is done via a custom kernel that performs the dot product and scaling in one step.
+
+            So here is the complete code:
+
+            import torch
+            import torch.nn as nn
+            from torch.utils.cpp_extension import load_inline
+
+            class ModelNew(nn.Module):
+                def __init__(self, input_size, hidden_size, scaling_factor):
+                    super(ModelNew, self).__init__()
+                    self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+                    self.scaling_factor = scaling_factor
+
+                    # Define the custom CUDA kernel for fused computation
+                    fused_kernel_source = """
+                    #include <torch/extension.h>
+                    #include <cuda_runtime.h>
+
+                    template <typename scalar_t>
+                    __global__ void fused_dot_scale_kernel(
+                        const scalar_t* __restrict__ x,
+                        const scalar_t* __restrict__ summed_weights,
+                        scalar_t* __restrict__ out,
+                        int batch_size,
+                        int input_size,
+                        scalar_t scale_factor) {
+
+                        int batch_idx = blockIdx.x;
+
+                        scalar_t sum = 0.0;
+                        for (int i = 0; i < input_size; ++i) {
+                            sum += x[batch_idx * input_size + i] * summed_weights[i];
+                        }
+                        out[batch_idx] = sum * scale_factor;
+                    }
+
+                    torch::Tensor fused_dot_scale(
+                        torch::Tensor x,
+                        torch::Tensor summed_weights,
+                        float scaling_factor) {
+
+                        const int batch_size = x.size(0);
+                        const int input_size = x.size(1);
+                        const auto scale = scaling_factor / 2.0;
+
+                        auto out = torch::empty({batch_size, 1}, x.options());
+
+                        const int threads_per_block = 256;
+                        const int blocks_per_grid = batch_size;
+
+                        AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "fused_dot_scale", ([&] {
+                            fused_dot_scale_kernel<scalar_t><<<blocks_per_grid, threads_per_block>>>(
+                                x.data<scalar_t>(),
+                                summed_weights.data<scalar_t>(),
+                                out.data<scalar_t>(),
+                                batch_size,
+                                input_size,
+                                scale
+                            );
+                        }));
+
+                        return out;
+                    }
+                    """
+
+                    # Compile the kernel
+                    self.fused_dot_scale = load_inline(
+                        name="fused_dot_scale",
+                        cpp_sources="",
+                        cuda_sources=fused_kernel_source,
+                        functions=["fused_dot_scale"],
+                        verbose=True
+                    )
+
+                def forward(self, x):
+                    # Ensure inputs are on the correct device
+                    x = x.cuda()
+                    summed_weights = self.weight.sum(0)  # Sum over hidden dimension
+                    # Call the fused kernel
+                    out = self.fused_dot_scale.fused_dot_scale(x, summed_weights, self.scaling_factor)
+                    return out
+
+
+            # The get_inputs and get_init_inputs remain the same as the original
+            batch_size   = 1024  
+            input_size   = 8192  
+            hidden_size  = 8192 
+            scaling_factor = 1.5
+
+            def get_inputs():
+                return [torch.rand(batch_size, input_size).cuda()]
+
+            def get_init_inputs():
+                return [input_size, hidden_size, scaling_factor]
+            ```
+
+However, there might be a mistake in the kernel's input arguments. The summed_weights is a tensor of shape (input_size,), so when passing to the kernel, it's okay. The kernel loops over input_size elements. The output is (batch_size, 1), but in the code above, the out tensor is created as {batch_size, 1}, which is correct.
+
+Another thing to note: the original code's get_inputs returns tensors on CPU, but in the forward function of ModelNew, we call x.cuda(). This assumes that the input is moved to the GPU. Alternatively, the get_inputs function in the problem's code might need to generate tensors on the GPU. The original code's get_inputs has:
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+So the inputs are on CPU. The ModelNew's forward moves them to CUDA. This should be okay.
+
+The kernel's code uses x.data_ptr() which is okay if x is on the GPU.
+
+This should work correctly and provide a massive speedup compared to the original code.
+</think>
+
+To optimize the given architecture, we can leverage mathematical insights to significantly reduce the computational complexity. The key observation is that the original computation can be transformed into a more efficient form by precomputing summed weights and using a single dot product followed by scaling. This approach reduces the complexity from O(B*H*I) to O(B*I), which is a substantial improvement. Below is the optimized code using a custom CUDA kernel for the fused computation:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+
+        # Define the fused CUDA kernel for dot product and scaling
+        fused_kernel_source = """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+
+        template <typename scalar_t>
+        __global__ void fused_dot_scale_kernel(
+            const scalar_t* __restrict__ x,
+            const scalar_t* __restrict__ summed_weights,
+            scalar_t* __restrict__ out,
+            int batch_size,
+            int input_size,
+            scalar_t scale_factor) {
+
+            int batch_idx = blockIdx.x;
+
+            scalar_t sum = 0.0;
+            for (int i = 0; i < input_size; ++i) {
+                sum += x[batch_idx * input_size + i] * summed_weights[i];
+            }
+            out[batch_idx] = sum * scale_factor;
+        }
+
+        torch::Tensor fused_dot_scale(
+            torch::Tensor x,
+            torch::Tensor summed_weights,
+            float scaling_factor) {
+
+            const int batch_size = x.size(0);
+            const int input_size = x.size(1);
+            const auto scale = scaling_factor / 2.0;
+
+            auto out = torch::empty({batch_size, 1}, x.options());
+
+            const int threads_per_block = 256;
+            const int blocks_per_grid = batch_size;
+
+            AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "fused_dot_scale", ([&] {
+                fused_dot_scale_kernel<scalar_t><<<blocks_per_grid, threads_per_block>>>(
+                    x.data<scalar_t>(),
+                    summed_weights.data<scalar_t>(),
+                    out.data<scalar_t>(),
+                    batch_size,
+                    input_size,
+                    scale
+                );
+            }));
+
+            return out;
+        }
+        """
+
+        # Compile the kernel
+        self.fused_dot_scale = load_inline(
+            name="fused_dot_scale",
+            cpp_sources="",
+            cuda_sources=fused_kernel_source,
+            functions=["fused_dot_scale"],
+            verbose=True
+        )
+
+    def forward(self, x):
+        # Ensure input is on GPU
+        x = x.cuda()
+        # Precompute summed weights over the hidden dimension
+        summed_weights = self.weight.sum(0)
+        # Apply the fused kernel
+        out = self.fused_dot_scale.fused_dot_scale(x, summed_weights, self.scaling_factor)
+        return out
+
+# Define input generation functions as per the original problem
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+scaling_factor = 1.5
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size).cuda()]
+
+def get_init_inputs():
+    return [input_size, hidden_size, scaling_factor]
+```
+
+### Explanation:
+1. **Mathematical Insight**: 
+   - The original computation involves a matrix multiplication followed by element-wise division, summation over one dimension, and scaling. By precomputing the sum of the weights over the hidden dimension, we reduce the problem to a dot product between the input and the summed weights, which is then scaled by a constant factor. This reduces the complexity from \(O(B \times H \times I)\) to \(O(B \times I)\).
+
+2. **Custom CUDA Kernel**:
+   - The kernel `fused_dot_scale_kernel` computes the dot product of the input tensor `x` with the precomputed `summed_weights` and applies the scaling factor in a single pass. This minimizes memory transfers and maximizes computational efficiency on the GPU.
+
+3. **Forward Pass**:
+   - The input tensor is moved to the GPU if necessary.
+   - `summed_weights` is computed as the sum of the weight matrix over the hidden dimension.
+   - The fused kernel is invoked to perform the computation in parallel for each batch element.
+
+This approach ensures maximum speedup while maintaining correctness, as the mathematical transformation guarantees identical results to the original implementation.

@@ -1,0 +1,433 @@
+        For the given architecture, analyze and suggest which operators to replace with custom CUDA kernels. You may decide to replace some or all of the operators. The example above only replaced the addition operator. You can also do operator fusion (combining multiple operators into a single kernel) or algorithmic optimizations.
+
+        Your answer should be the code of ModelNew in a single markdown code block. No text outside the code block. The code must be correct, with the correct parameters and function calls. It must run without errors when compared to the original model.
+
+        Please make sure that the ModelNew class works exactly the same as the original Model class but uses custom CUDA operators for at least one operator. 
+
+        Also, please make sure that the code is compatible with PyTorch 2.0.0 and CUDA 11.8.
+
+Alright, let's tackle optimizing this Model class with custom CUDA kernels. The original architecture has several operations: a linear layer (bmm), instance normalization, summation, and multiplication. The goal is to replace some of these with custom CUDA kernels to improve performance.
+
+First, I'll look at each part. The linear layer (nn.Linear) is a matrix multiplication followed by an addition (bias). Since PyTorch's Linear is already optimized, maybe we can combine it with subsequent operations if possible. However, combining with instance norm might be tricky. Alternatively, maybe the element-wise operations like addition and multiplication can be fused into a single kernel for efficiency.
+
+The instance normalization is a more complex operation involving mean and variance computation, which might be challenging to optimize. But maybe the subsequent element-wise operations can be fused with it. Alternatively, fusing the addition (x + y) and multiplication (x * y) into a single kernel could reduce memory access and kernel launch overhead.
+
+Looking at the forward pass steps:
+1. x = self.bmm(x) → matrix multiply + bias
+2. x = instance norm → which involves reshaping, computing mean/var, normalizing, scaling, shifting
+3. x = x + y → element-wise addition
+4. x = x * y → element-wise multiplication
+
+The most straightforward candidates for optimization here are steps 3 and 4 since they are simple element-wise operations. Fusing these into a single kernel would eliminate the need for separate kernel launches and temporary tensors, which should save time.
+
+Let's consider writing a fused add-then-multiply kernel. The operation is (x + y) * y. Wait, the original code is x = x + y, then x = x * y. So the result is (x_prev + y) * y. Wait, no: after the instance norm, the first operation is x = x + y (element-wise), then x = x * y (element-wise). So the combined operation is (x_in + y) * y = x_in*y + y^2. But perhaps the kernel can compute both steps in a single pass. The fused kernel would take x and y as inputs and output (x + y) * y. Wait, but the order is important: first add then multiply. So each element is (x[i] + y[i]) * y[i]. That can be written as x[i] * y[i] + y[i]^2. But in terms of computation steps, it's just two operations per element. So a single kernel can perform both additions and multiplications in sequence.
+
+Alternatively, maybe there's a way to combine the instance norm with the subsequent operations? But instance norm involves global operations (computing means and variances across the batch and channels), which might not be easy to fuse. So perhaps focusing on the element-wise steps is better.
+
+Another point: The instance norm is applied after reshaping x to (batch, 1, 1, out_features). The unsqueeze operations are just to fit the expected dimensions for InstanceNorm2d, which typically expects (batch, channels, height, width). Since the data is 1x1 in spatial dimensions, the instance norm is effectively channel-wise normalization. However, the PyTorch implementation might have some overhead here because it's designed for 2D data. Maybe we can optimize the instance norm itself by writing a custom kernel that avoids unnecessary steps. But that might be more complex.
+
+Given time constraints, focusing on fusing the addition and multiplication seems more manageable. Let's proceed with that.
+
+First, I need to define a CUDA kernel that takes x and y (element-wise), adds them, then multiplies by y again. Wait, no: the sequence is x = x_prev + y, then x = x * y. So the final result is (x_prev + y) * y. The kernel can compute this in one step per element.
+
+The kernel would look like:
+
+out[i] = (x[i] + y[i]) * y[i]
+
+Which simplifies to x[i]*y[i] + y[i]^2. But the sequence is important for correctness. Let's write the kernel as:
+
+__global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float temp = x[idx] + y[idx];
+        out[idx] = temp * y[idx];
+    }
+}
+
+This way, it's exactly the same as the two steps. This should maintain correctness.
+
+Now, we can replace the two operations (x += y; x *= y) with a single kernel call.
+
+Next, the instance norm might be a candidate for optimization. Let's think about that. The instance norm for 2D with channels= out_features, and spatial dimensions 1x1.
+
+The instance norm computes for each channel c:
+
+mean = mean over batch and spatial (which here is just the single value per channel)
+var = variance over the same dimensions
+then normalized = (x - mean) / sqrt(var + eps)
+then scaled by gamma and beta (if affine). Wait, the instance norm in the original model uses the default parameters (affine=True since it's nn.InstanceNorm2d with no parameters given except eps and momentum. Wait, looking at the code:
+
+self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+
+By default, InstanceNorm2d has learnable affine parameters (gamma and beta). But in the original code, the model's __init__ doesn't have any parameters for gamma and beta, so they are initialized as learnable parameters. However, in our optimized model, we need to maintain the same parameters. But when replacing the instance norm with a custom kernel, we need to ensure that the computation includes the learnable parameters.
+
+Alternatively, maybe we can keep the instance norm as is, but if it's a bottleneck, we might need to write a custom kernel. However, writing a custom instance norm kernel is more involved, especially since it requires computing per-channel means and variances across the batch and spatial dimensions. That might be more complex, but perhaps possible.
+
+Given that the original code uses a 2D instance norm but with 1x1 spatial dimensions, the computations for mean and variance per channel are straightforward. The mean for channel c would be the average of all batch samples at that channel (since spatial is 1x1). The variance would similarly be the variance across the batch for each channel.
+
+Alternatively, since the spatial dimensions are 1x1, the instance norm can be considered as equivalent to a per-channel normalization over the batch dimension. So perhaps we can write a custom kernel for this specific case, which might be more efficient than the generic implementation.
+
+Let's consider that approach. The instance norm computation steps for each channel c:
+
+1. Compute the mean of x[:, c, 0, 0] over the batch (since spatial is 1x1)
+2. Compute the variance (using unbiased estimator, but instance norm uses population variance, so it's variance divided by N, where N is the number of elements in each channel (batch_size * 1 * 1))
+Wait, the variance in PyTorch's instance norm is computed as the unbiased variance (divided by (N-1)), but according to the documentation, PyTorch's instance norm uses the population variance (divided by N) when track_running_stats is False (which it is here unless specified otherwise). Wait, the momentum here is given but that's for the running stats. Since the instance norm layer is used in the forward pass, when not in training, it uses the running stats, but in training mode, it uses the batch stats.
+
+Hmm, this might complicate things, but assuming that we want to replicate exactly the forward pass of the original code, we need to ensure that the custom implementation does the same as the PyTorch's instance norm, including the variance computation.
+
+Alternatively, perhaps the instance norm is not the primary bottleneck here, and the element-wise operations are easier to optimize. Let's focus on the element-wise operations first.
+
+So, let's proceed to implement the fused add and multiply kernel first. Let's also check if there are other candidates. The linear layer (matrix multiplication) is a big operation. The default PyTorch implementation is already highly optimized, but maybe we can combine it with the subsequent instance norm into a single kernel. However, that might be complex.
+
+Alternatively, the instance norm could be combined with the linear layer's output. Let's see:
+
+The linear layer's output is a matrix of shape (batch_size, out_features). The instance norm requires the input to be reshaped to (batch, channels, 1, 1), so when we apply the instance norm, we are normalizing each feature (channel) across the batch dimension. So for each channel (feature), compute mean and variance over the batch, then normalize, scale, shift.
+
+If we can write a custom kernel that performs the matrix multiplication (from the linear layer) followed by the instance norm, that could save some time. However, the linear layer has a weight matrix of size (out_features, in_features), and the computation is x = x @ W^T + b. So the matrix multiply is a big operation, but combining with instance norm's per-channel normalization might be possible but requires handling both computations.
+
+Alternatively, perhaps we can leave the linear layer as is (since it's already optimized) and focus on fusing the element-wise operations.
+
+So let's proceed with the fused add and multiply first.
+
+Now, let's outline the steps:
+
+1. The linear layer (bmm) is kept as is, since replacing it with a custom kernel might not give much gain, and it's already optimized.
+
+2. The instance norm is kept as is unless we find a way to optimize it.
+
+3. The element-wise addition and multiplication are fused into a single kernel.
+
+Thus, the ModelNew class will have:
+
+- The same nn.Linear layer (bmm)
+- The same instance_norm layer
+- The fused kernel for add and multiply.
+
+Wait, but the instance norm is applied after the linear layer. The code is:
+
+x = self.bmm(x) → shape (batch, out_features)
+x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1) → reshape to (batch, out_features, 1, 1), apply instance norm, then squeeze back to (batch, out_features)
+Then x = x + y → element-wise addition
+Then x = x * y → element-wise multiplication.
+
+Wait, but the input y is of shape (batch_size, out_features). So the addition and multiplication are element-wise between x (after instance norm) and y.
+
+Therefore, the fused kernel would take x (after instance norm) and y as inputs, compute (x + y) * y.
+
+Now, to implement this kernel, we need to make sure that the tensors are contiguous and on the same device.
+
+Now, writing the CUDA code for the fused kernel.
+
+First, define the fused kernel function:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = (x[idx] + y[idx]) * y[idx];
+    }
+}
+
+Then, the wrapper function:
+
+torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y) {
+    // Check if the tensors are on the same device and contiguous
+    auto size = x.numel();
+    assert(x.sizes() == y.sizes());
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_add_mul_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+
+Then, we need to compile this kernel inline using load_inline.
+
+Now, integrating this into the ModelNew class.
+
+The ModelNew class would have:
+
+- The same nn.Linear and nn.InstanceNorm2d as before.
+
+- The fused_add_mul_cuda function from the custom kernel.
+
+Thus, the forward would be:
+
+def forward(self, x, y):
+    x = self.bmm(x)
+    x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+    x = self.fused_add_mul(x, y)  # using the custom kernel
+    return x
+
+Wait, but the custom kernel is called via the loaded module. In the example provided, the custom function was accessed via self.elementwise_add.elementwise_add_cuda(...). So here, the fused_add_mul would be part of the loaded module.
+
+Putting it all together, the code would look like:
+
+First, define the fused_add_mul_source and then load it via load_inline.
+
+Now, the original code's instance norm is applied to the linear layer's output. We can leave that as is unless we find it's a bottleneck.
+
+Another consideration: The instance norm's computation might have overhead because it's designed for 4D tensors (with spatial dimensions). Since the spatial dimensions are 1x1, maybe we can write a more optimized kernel for instance norm in this specific case.
+
+Let me think about that. The instance norm's computation for each channel c:
+
+mean_c = mean over all batch samples for channel c (since spatial is 1x1, each element is x[b, c, 0, 0], so for each c, mean over batch_size elements)
+
+var_c = (sum (x^2) over batch) / batch_size - mean_c^2 (assuming variance is population variance)
+
+Then, normalized = (x - mean_c) / sqrt(var_c + eps)
+
+Then, scaled by gamma and beta.
+
+The problem is that computing the mean and variance requires a reduction across the batch for each channel. Since in the original code, the instance norm is applied to a tensor of shape (batch, 1, 1, out_features), the channels are the second dimension. So each channel corresponds to the out_features dimension.
+
+The reduction for mean and variance is across the batch dimension (since each channel's data is in the batch dimension). So for each channel c, we have batch_size elements (since spatial is 1x1). So the mean for channel c is (sum over b of x[b, c, 0, 0]) / batch_size.
+
+The variance is (sum (x^2) over b) / batch_size - (mean)^2.
+
+The computation of these means and variances requires a per-channel reduction over the batch. This can be parallelized, but PyTorch's implementation may already handle this efficiently.
+
+If we can write a custom kernel that does this more efficiently, perhaps we can save some time. Let's see.
+
+First, the input to the instance norm is a tensor of shape (batch_size, 1, 1, out_features). The output is the same shape, but after normalization.
+
+The steps for the instance norm:
+
+1. For each channel c (from 0 to out_features-1):
+   a. Compute the mean of the batch elements (x[:, c, 0, 0])
+   b. Compute the variance (sum of squares over batch, divided by batch_size, minus mean squared)
+2. Normalize each element by (x - mean) / sqrt(var + eps)
+3. Multiply by gamma and add beta (if affine)
+
+Since the spatial dimensions are 1, the computation is simplified. The key is to compute the means and variances efficiently for all channels in parallel.
+
+A possible approach is to have a kernel that, for each channel, computes the sum and sum of squares across the batch, then compute mean and var.
+
+The steps could be:
+
+- For each channel c:
+   - Iterate over all batch elements and accumulate sum and sum_sq.
+   - Then compute mean and var from those.
+
+But doing this in parallel for all channels.
+
+Alternatively, we can use a thread per channel and have each thread handle the computation for its channel.
+
+So, a kernel like:
+
+__global__ void instance_norm_kernel(
+    const float* input, float* output,
+    const float* gamma, const float* beta,
+    float eps,
+    int batch_size, int num_channels) {
+    // Each thread handles a channel
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= num_channels) return;
+
+    // Compute mean and variance for channel c
+    float sum = 0.0;
+    float sum_sq = 0.0;
+    for (int b = 0; b < batch_size; ++b) {
+        int idx = b * num_channels + c; // assuming contiguous storage
+        float val = input[idx];
+        sum += val;
+        sum_sq += val * val;
+    }
+    float mean = sum / batch_size;
+    float var = sum_sq / batch_size - mean*mean;
+    float inv_std = 1.0 / sqrt(var + eps);
+
+    // Normalize and apply gamma/beta
+    for (int b = 0; b < batch_size; ++b) {
+        int idx = b * num_channels + c;
+        output[idx] = (input[idx] - mean) * inv_std * gamma[c] + beta[c];
+    }
+}
+
+Wait, but the input tensor is of shape (batch, channels, 1, 1), so the stride might be different. We need to ensure that the indices are correctly calculated. Alternatively, we can assume that the input is contiguous and flattened appropriately.
+
+However, this requires that the input is contiguous and flattened to batch * channels.
+
+Alternatively, the input can be viewed as a 2D tensor of (batch_size, num_channels), since the spatial dimensions are 1.
+
+Thus, for the input tensor, after unsqueezing, it's (B, C, 1, 1), but when we view it as 2D, it's (B, C). The kernel can treat it as such.
+
+So, in the kernel:
+
+The input is a 2D array of B rows and C columns (each row is a batch sample, each column is a channel).
+
+Each thread is assigned a channel (c). For that channel, loop over all B samples to compute sum and sum_sq.
+
+Then compute mean and variance.
+
+Then, loop over all B samples again to compute the normalized value.
+
+This should be manageable.
+
+However, this requires handling the gamma and beta parameters, which are learnable. The instance norm layer in the original model has these parameters. So the custom kernel must take them as inputs.
+
+Therefore, the custom instance norm kernel would need to be passed the gamma and beta parameters.
+
+This complicates things because the Model class has the instance_norm module, which has the gamma and beta parameters. To replicate this, the custom kernel would need to access these parameters, so we have to pass them to the kernel function.
+
+Alternatively, we can encapsulate the parameters in the kernel's wrapper function, but that might require more code.
+
+Alternatively, perhaps it's better to keep the instance norm as is and focus on the element-wise operations.
+
+Given the time constraints and complexity, let's proceed with just fusing the addition and multiplication, as that's a manageable optimization.
+
+Thus, the final code would include the fused_add_mul kernel and replace the two element-wise steps with the kernel.
+
+Now, putting it all together:
+
+The code for ModelNew would have:
+
+- The same Linear and InstanceNorm2d layers as the original.
+
+- The custom fused_add_mul kernel.
+
+The code structure would be:
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused add-mul kernel
+fused_add_mul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = (x[idx] + y[idx]) * y[idx];
+    }
+}
+
+torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y) {
+    auto size = x.numel();
+    assert(x.sizes() == y.sizes());
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_add_mul_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+fused_add_mul_header = "torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y);"
+
+# Compile the kernel
+fused_add_mul = load_inline(
+    name="fused_add_mul",
+    cpp_sources=fused_add_mul_header,
+    cuda_sources=fused_add_mul_source,
+    functions=["fused_add_mul_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        self.fused_add_mul = fused_add_mul
+
+    def forward(self, x, y):
+        x = self.bmm(x)
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        x = self.fused_add_mul.fused_add_mul_cuda(x, y)
+        return x
+
+Wait, but the original code had x = x + y followed by x = x * y, which is exactly (x + y) * y. The kernel correctly captures this.
+
+Testing the correctness:
+
+Suppose x is a tensor of shape (1024, 8192), and y is (1024, 8192).
+
+The forward path:
+
+After instance norm, x is same shape. Then the kernel computes (x + y) * y, which is exactly the same as the original steps.
+
+Thus, this should produce the same result as the original model.
+
+Potential issues:
+
+- The instance norm is left as is. If the original instance norm has learnable parameters, they must be present. Since the new model uses the same instance norm layer, the parameters are preserved.
+
+- The fused kernel must handle contiguous memory. Since PyTorch tensors passed to CUDA kernels are expected to be contiguous, the code includes torch::empty_like which should be contiguous. The inputs x and y should be contiguous. If they are not, the kernel may fail. But in the forward pass, after the instance norm, x is contiguous (since the squeeze operations preserve contiguity?), and y is passed as input, which is generated by get_inputs() as a tensor from torch.rand, which is contiguous.
+
+Thus, the code should work correctly.
+
+Another possible optimization: The instance norm's unsqueeze and squeeze operations can be done on the CPU or as part of the kernel? Probably not necessary. The current code is correct.
+
+Now, compiling this should work with PyTorch 2.0 and CUDA 11.8.
+
+Thus, the final code is as above.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused add-multiply CUDA kernel
+fused_add_mul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_add_mul_kernel(const float* x, const float* y, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = (x[idx] + y[idx]) * y[idx];
+    }
+}
+
+torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y) {
+    auto size = x.numel();
+    assert(x.sizes() == y.sizes());
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_add_mul_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+fused_add_mul_header = "torch::Tensor fused_add_mul_cuda(torch::Tensor x, torch::Tensor y);"
+
+# Compile the fused add-multiply kernel
+fused_add_mul = load_inline(
+    name="fused_add_mul",
+    cpp_sources=fused_add_mul_header,
+    cuda_sources=fused_add_mul_source,
+    functions=["fused_add_mul_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        self.fused_add_mul = fused_add_mul
+
+    def forward(self, x, y):
+        x = self.bmm(x)
+        # Apply instance normalization on reshaped tensor
+        x = self.instance_norm(x.unsqueeze(1).unsqueeze(1)).squeeze(1).squeeze(1)
+        # Use fused kernel for element-wise operations
+        x = self.fused_add_mul.fused_add_mul_cuda(x, y)
+        return x
+```

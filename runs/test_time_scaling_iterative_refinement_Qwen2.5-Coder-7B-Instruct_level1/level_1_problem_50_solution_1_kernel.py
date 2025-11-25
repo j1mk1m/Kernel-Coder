@@ -1,0 +1,1 @@
+'ModelNew' object has no attribute 'weight'

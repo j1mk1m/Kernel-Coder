@@ -1,0 +1,98 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+max_pool_2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void max_pool_2d_kernel(const float* input, float* output, int batch_size, int channels, int height, int width, int kernel_size, int stride, int padding, int dilation) {
+    int n = blockIdx.x;
+    int c = blockIdx.y;
+    int h_out = blockIdx.z;
+    int w_out = blockIdx.w;
+
+    int h_in = h_out * stride - padding;
+    int w_in = w_out * stride - padding;
+
+    float max_val = -std::numeric_limits<float>::infinity();
+
+    for (int kh = 0; kh < kernel_size; ++kh) {
+        for (int kw = 0; kw < kernel_size; ++kw) {
+            int h_idx = h_in + kh * dilation;
+            int w_idx = w_in + kw * dilation;
+
+            if (h_idx >= 0 && h_idx < height && w_idx >= 0 && w_idx < width) {
+                int idx = n * channels * height * width + c * height * width + h_idx * width + w_idx;
+                max_val = std::max(max_val, input[idx]);
+            }
+        }
+    }
+
+    int output_idx = n * channels * height * width + c * height * width + h_out * width + w_out;
+    output[output_idx] = max_val;
+}
+
+torch::Tensor max_pool_2d_cuda(torch::Tensor input, int kernel_size, int stride, int padding, int dilation) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto pooled_height = (height + 2 * padding - kernel_size) / stride + 1;
+    auto pooled_width = (width + 2 * padding - kernel_size) / stride + 1;
+
+    auto output = torch::zeros({batch_size, channels, pooled_height, pooled_width}, input.options());
+
+    dim3 threads_per_block(16, 16, 1);
+    dim3 blocks_per_grid((pooled_width + threads_per_block.x - 1) / threads_per_block.x,
+                          (pooled_height + threads_per_block.y - 1) / threads_per_block.y,
+                          (channels + threads_per_block.z - 1) / threads_per_block.z);
+
+    max_pool_2d_kernel<<<blocks_per_grid, threads_per_block>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels, height, width, kernel_size, stride, padding, dilation);
+
+    return output;
+}
+"""
+
+max_pool_2d_cpp_source = (
+    "torch::Tensor max_pool_2d_cuda(torch::Tensor input, int kernel_size, int stride, int padding, int dilation);"
+)
+
+# Compile the inline CUDA code for max pool 2d
+max_pool_2d = load_inline(
+    name="max_pool_2d",
+    cpp_sources=max_pool_2d_cpp_source,
+    cuda_sources=max_pool_2d_source,
+    functions=["max_pool_2d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int, padding: int, dilation: int):
+        super(ModelNew, self).__init__()
+        self.max_pool_2d = max_pool_2d
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.max_pool_2d.max_pool_2d_cuda(x, self.kernel_size, self.stride, self.padding, self.dilation)
+
+
+model_new = ModelNew(kernel_size, stride, padding, dilation)
+
+# Get inputs
+inputs = get_inputs()
+
+# Forward pass through the original model
+with torch.no_grad():
+    output_ref = Model().forward(*inputs)
+
+# Forward pass through the new model
+with torch.no_grad():
+    output_new = model_new.forward(inputs[0])
+
+# Check if the outputs match
+print("Outputs match:", torch.allclose(output_ref, output_new))

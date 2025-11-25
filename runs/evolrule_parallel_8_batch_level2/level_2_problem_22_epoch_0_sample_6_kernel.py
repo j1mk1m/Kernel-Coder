@@ -1,0 +1,1 @@
+val = sum * (scale_factor * 2.0f); // since after scaling by scale_factor, then doubling it via x += x

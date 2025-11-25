@@ -1,0 +1,31 @@
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features, bias=bias)
+        self.subtract = nn.Parameter(torch.randn(out_features))
+        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.log_sum_exp = LogSumExpCustom()
+        self.gelu = nn.GELU()
+        self.residual_add = ResidualAddCustom()
+
+    def forward(self, x):
+        original_x = x.clone().detach()
+        # Gemm
+        x = self.gemm(x)
+
+        # Subtract
+        x = x - self.subtract
+
+        # GlobalAvgPool
+        x = self.global_avg_pool(x.unsqueeze(2)).squeeze(2)
+
+        # LogSumExp
+        x = self.log_sum_exp(x)
+
+        # GELU
+        x = self.gelu(x)
+
+        # ResidualAdd
+        x = self.residual_add(x, original_x)
+
+        return x

@@ -1,0 +1,197 @@
+You can make the following assumptions: 
+- All inputs are on the GPU.
+- You have access to a CUDA compiler and necessary libraries.
+
+When possible, fuse multiple operators into a single kernel. For example, combining matmul and bias addition into one kernel.
+
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define fused kernel for Conv3d + ReLU + LeakyReLU + GELU + Sigmoid + Bias
+fused_conv_activations_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+
+// Forward declarations
+__device__ __forceinline__ float fused_activations(float x) {
+    // Apply ReLU
+    x = fmaxf(x, 0.0f);
+    // Apply Leaky ReLU (negative slope 0.01)
+    x = (x > 0.0f) ? x : x * 0.01f;
+    // Apply GELU approximation (Tanh-based)
+    const float sqrt2 = 1.41421356237f;
+    const float inner = sqrt2 * (x + 0.044715f * powf(x, 3));
+    x = 0.5f * x * (1.0f + tanhf(inner));
+    // Apply Sigmoid
+    x = 1.0f / (1.0f + expf(-x));
+    return x;
+}
+
+template <typename scalar_t>
+__global__ void fused_conv3d_activations_kernel(
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    scalar_t* output,
+    const int batch_size,
+    const int in_channels,
+    const int in_depth,
+    const int in_height,
+    const int in_width,
+    const int out_channels,
+    const int kernel_size,
+    const int out_depth,
+    const int out_height,
+    const int out_width
+) {
+    const int output_size = out_channels * out_depth * out_height * out_width;
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (index >= output_size) return;
+    
+    const int w = index % out_width;
+    const int h = (index / out_width) % out_height;
+    const int d = (index / (out_width * out_height)) % out_depth;
+    const int c_out = (index / (out_width * out_height * out_depth));
+    const int n = (index / (out_channels * out_depth * out_height * out_width));
+    
+    float sum = 0.0;
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        for (int kd = 0; kd < kernel_size; ++kd) {
+            for (int kh = 0; kh < kernel_size; ++kh) {
+                for (int kw = 0; kw < kernel_size; ++kw) {
+                    int id = d + kd;
+                    int ih = h + kh;
+                    int iw = w + kw;
+                    if (id < in_depth && ih < in_height && iw < in_width) {
+                        const int input_offset = (
+                            n * in_channels + c_in) *
+                            in_depth * in_height * in_width +
+                            c_in * in_depth * in_height * in_width + 
+                            id * in_height * in_width + 
+                            ih * in_width + iw;
+                        const int weight_offset = 
+                            c_out * in_channels * kernel_size*kernel_size*kernel_size +
+                            c_in * kernel_size*kernel_size*kernel_size +
+                            kd * kernel_size*kernel_size + 
+                            kh * kernel_size + kw;
+                        sum += input[input_offset] * weight[weight_offset];
+                    }
+                }
+            }
+        }
+    }
+    
+    // Add bias and apply fused activations
+    sum += bias[c_out];
+    output[index] = fused_activations(sum);
+}
+
+torch::Tensor fused_conv3d_activations(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int kernel_size,
+    int out_depth,
+    int out_height,
+    int out_width
+) {
+    const int batch_size = input.size(0);
+    const int in_channels = input.size(1);
+    const int in_depth = input.size(2);
+    const int in_height = input.size(3);
+    const int in_width = input.size(4);
+    const int out_channels = weight.size(0); // Assuming weight is [out_channels, in_channels, kernel_size, kernel_size, kernel_size]
+    
+    auto output = torch::empty({batch_size, out_channels, out_depth, out_height, out_width}, input.options());
+    
+    const int threads = 256;
+    const int elements = batch_size * out_channels * out_depth * out_height * out_width;
+    const int blocks = (elements + threads - 1) / threads;
+    
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "fused_conv3d_activations_cuda", ([&] {
+        fused_conv3d_activations_kernel<scalar_t><<<blocks, threads>>>(
+            input.data<scalar_t>(),
+            weight.data<scalar_t>(),
+            bias.data<scalar_t>(),
+            output.data<scalar_t>(),
+            batch_size,
+            in_channels,
+            in_depth,
+            in_height,
+            in_width,
+            out_channels,
+            kernel_size,
+            out_depth,
+            out_height,
+            out_width
+        );
+    }));
+    
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+fused_conv_cpp_source = """
+torch::Tensor fused_conv3d_activations(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int kernel_size,
+    int out_depth,
+    int out_height,
+    int out_width
+);
+"""
+
+# Compile the fused kernel
+fused_conv = load_inline(
+    name="fused_conv",
+    cpp_sources=fused_conv_cpp_source,
+    cuda_sources=fused_conv_source,
+    functions=["fused_conv3d_activations"],
+    verbose=True,
+    extra_cflags=["-D_GLIBCXX_USE_CXX11_ABI=0"],
+    extra_cuda_cflags=["-arch=sm_86"]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.fused_conv = fused_conv  # Register the fused kernel
+
+        # Precompute output dimensions for kernel (assuming padding=0, stride=1)
+        self.out_depth = in_channels - kernel_size + 1
+        self.out_height = in_channels - kernel_size + 1
+        self.out_width = in_channels - kernel_size + 1
+
+    def forward(self, x):
+        # Extract dimensions dynamically
+        batch_size, _, in_depth, in_height, in_width = x.shape
+        out_channels = self.conv.out_channels
+        kernel_size = self.conv.kernel_size[0]
+        out_depth = in_depth - kernel_size + 1
+        out_height = in_height - kernel_size + 1
+        out_width = in_width - kernel_size + 1
+
+        return self.fused_conv.fused_conv3d_activations(
+            x,
+            self.conv.weight,
+            self.bias,
+            kernel_size,
+            out_depth,
+            out_height,
+            out_width
+        )
+```
+</think>

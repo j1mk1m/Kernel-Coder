@@ -1,0 +1,2 @@
+class ModelNew(nn.Module):
+    # Your implementation here

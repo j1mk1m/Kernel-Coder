@@ -1,0 +1,7 @@
+model_new = ModelNew().cuda()
+A = torch.rand(M, M).cuda()
+B = torch.rand(M, M).cuda()
+A = torch.tril(A)
+B = torch.tril(B)
+result = model_new(A, B)
+print(result)

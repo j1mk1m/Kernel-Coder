@@ -1,0 +1,47 @@
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA source code for the ReLU operation
+relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_kernel(float* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        data[idx] = max(data[idx], 0.0f);
+    }
+}
+
+torch::Tensor relu_cuda(torch::Tensor data) {
+    auto n = data.numel();
+    auto output = torch::empty_like(data);
+
+    const int block_size = 256;
+    const int num_blocks = (n + block_size - 1) / block_size;
+
+    relu_kernel<<<num_blocks, block_size>>>(data.data_ptr<float>(), n);
+
+    return output;
+}
+"""
+
+# Define the C++ source code that declares the function
+relu_cpp_source = "torch::Tensor relu_cuda(torch::Tensor data);"
+
+# Compile the inline CUDA code
+relu = load_inline(
+    name="relu",
+    cpp_sources=relu_cpp_source,
+    cuda_sources=relu_source,
+    functions=["relu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return relu.relu_cuda(x)

@@ -1,0 +1,177 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matrix_multiplication_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matrix_multiplication_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor matrix_multiplication_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 32;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    matrix_multiplication_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matrix_multiplication_cpp_source = (
+    "torch::Tensor matrix_multiplication_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matrix_multiplication = load_inline(
+    name="matrix_multiplication",
+    cpp_sources=matrix_multiplication_cpp_source,
+    cuda_sources=matrix_multiplication_source,
+    functions=["matrix_multiplication_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for GELU
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__device__ float gelu_device(float x) {
+    return 0.5f * x * (1.0f + tanh(sqrt(2.0f / M_PI) * (x + 0.044715f * x * x * x)));
+}
+
+__global__ void gelu_kernel(const float* x, float* y, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        y[idx] = gelu_device(x[idx]);
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    gelu_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+
+    return y;
+}
+"""
+
+gelu_cpp_source = (
+    "torch::Tensor gelu_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for GELU
+gelu = load_inline(
+    name="gelu",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void softmax_kernel(const float* x, float* y, int size) {
+    extern __shared__ float sdata[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < size) {
+        sdata[tid] = exp(x[i]);
+        __syncthreads();
+
+        float sum = 0.0f;
+        for (int j = 0; j < blockDim.x; ++j) {
+            sum += sdata[j];
+        }
+
+        __syncthreads();
+        y[i] = sdata[tid] / sum;
+    }
+}
+
+torch::Tensor softmax_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    softmax_kernel<<<num_blocks, block_size, block_size * sizeof(float)>>>(x.data_ptr<float>(), y.data_ptr<float>(), size);
+
+    return y;
+}
+"""
+
+softmax_cpp_source = (
+    "torch::Tensor softmax_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for Softmax
+softmax = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.matrix_multiplication = matrix_multiplication
+        self.gelu = gelu
+        self.softmax = softmax
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.gelu.gelu_cuda(x)
+        x = self.softmax.softmax_cuda(x)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]

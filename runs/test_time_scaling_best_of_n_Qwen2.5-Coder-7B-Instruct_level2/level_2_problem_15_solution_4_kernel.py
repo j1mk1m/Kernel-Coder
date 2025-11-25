@@ -1,0 +1,1 @@
+output = torch.ops.aten.relu(input)

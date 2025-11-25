@@ -1,0 +1,124 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 16;
+    const int num_blocks_x = (n + block_size - 1) / block_size;
+    const int num_blocks_y = (m + block_size - 1) / block_size;
+
+    dim3 grid(num_blocks_x, num_blocks_y);
+    dim3 block(block_size, block_size);
+
+    matmul_kernel<<<grid, block>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for batch normalization
+bn_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bn_forward_kernel(const float* x, const float* running_mean, const float* running_var, const float* weight, const float* bias, float* y, int N, int C, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * C) {
+        int c = idx % C;
+        float mean = running_mean[c];
+        float var = running_var[c];
+        float inv_std = rsqrt(var + eps);
+        float scale = weight ? weight[c] : 1.0f;
+        float shift = bias ? bias[c] : 0.0f;
+        y[idx] = scale * ((x[idx] - mean) * inv_std) + shift;
+    }
+}
+
+torch::Tensor bn_forward_cuda(torch::Tensor x, torch::Tensor running_mean, torch::Tensor running_var, torch::Tensor weight, torch::Tensor bias, float eps) {
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto y = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (N * C + block_size - 1) / block_size;
+
+    bn_forward_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), running_mean.data_ptr<float>(), running_var.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), y.data_ptr<float>(), N, C, eps);
+
+    return y;
+}
+"""
+
+bn_cpp_source = (
+    "torch::Tensor bn_forward_cuda(torch::Tensor x, torch::Tensor running_mean, torch::Tensor running_var, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for batch normalization
+bn = load_inline(
+    name="bn",
+    cpp_sources=bn_cpp_source,
+    cuda_sources=bn_source,
+    functions=["bn_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA kernels for matrix multiplication and batch normalization.
+    """
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.running_mean = nn.Parameter(torch.zeros(out_features), requires_grad=False)
+        self.running_var = nn.Parameter(torch.ones(out_features), requires_grad=False)
+        self.eps = eps
+        self.momentum = momentum
+
+    def forward(self, x):
+        x = matmul.matmul_cuda(x.view(-1, x.size(-1)), self.gemm.weight.t())
+        x = x * self.scale
+        x = bn.bn_forward_cuda(x, self.running_mean, self.running_var, self.scale, None, self.eps)
+        return x

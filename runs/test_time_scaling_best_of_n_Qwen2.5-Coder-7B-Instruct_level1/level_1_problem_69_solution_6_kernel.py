@@ -1,0 +1,93 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed 2D convolution
+transposed_conv2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Function to perform transposed 2D convolution using CUDA
+torch::Tensor transposed_conv2d_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::IntArrayRef stride, torch::IntArrayRef padding, torch::IntArrayRef output_padding, torch::IntArrayRef dilation, int groups) {
+    // Get input dimensions
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int height_in = input.size(2);
+    int width_in = input.size(3);
+
+    // Get weight dimensions
+    int out_channels = weight.size(0);
+    int kernel_height = weight.size(2);
+    int kernel_width = weight.size(3);
+
+    // Calculate output dimensions
+    int height_out = (height_in - 1) * stride[0] - 2 * padding[0] + dilation[0] * (kernel_height - 1) + output_padding[0] + 1;
+    int width_out = (width_in - 1) * stride[1] - 2 * padding[1] + dilation[1] * (kernel_width - 1) + output_padding[1] + 1;
+
+    // Allocate output tensor
+    auto output = torch::zeros({batch_size, out_channels, height_out, width_out}, input.options());
+
+    // Perform transposed 2D convolution
+    for (int n = 0; n < batch_size; ++n) {
+        for (int g = 0; g < groups; ++g) {
+            for (int oc = 0; oc < out_channels / groups; ++oc) {
+                for (int h = 0; h < height_out; ++h) {
+                    for (int w = 0; w < width_out; ++w) {
+                        int ih_start = h * stride[0] - padding[0];
+                        int iw_start = w * stride[1] - padding[1];
+                        for (int kh = 0; kh < kernel_height; ++kh) {
+                            for (int kw = 0; kw < kernel_width; ++kw) {
+                                int ih = ih_start + kh * dilation[0];
+                                int iw = iw_start + kw * dilation[1];
+                                if (ih >= 0 && ih < height_in && iw >= 0 && iw < width_in) {
+                                    int ic = g * out_channels / groups + oc * groups + kh * kernel_width + kw;
+                                    output[n][oc][h][w] += input[n][ic][ih][iw] * weight[g][oc][kh][kw];
+                                }
+                            }
+                        }
+                        if (bias != nullptr) {
+                            output[n][oc][h][w] += bias[oc];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return output;
+}
+"""
+
+transposed_conv2d_cpp_source = (
+    "torch::Tensor transposed_conv2d_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::IntArrayRef stride, torch::IntArrayRef padding, torch::IntArrayRef output_padding, torch::IntArrayRef dilation, int groups);"
+)
+
+# Compile the inline CUDA code for transposed 2D convolution
+transposed_conv2d = load_inline(
+    name="transposed_conv2d",
+    cpp_sources=transposed_conv2d_cpp_source,
+    cuda_sources=transposed_conv2d_source,
+    functions=["transposed_conv2d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1), padding: tuple = (0, 0), output_padding: tuple = (0, 0), dilation: tuple = (1, 1), groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.transposed_conv2d = transposed_conv2d
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the transposed 2D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height_in, width_in).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height_out, width_out).
+        """
+        return self.transposed_conv2d.transposed_conv2d_cuda(x, self.weight, self.bias, self.stride, self.padding, self.output_padding, self.dilation, self.groups)

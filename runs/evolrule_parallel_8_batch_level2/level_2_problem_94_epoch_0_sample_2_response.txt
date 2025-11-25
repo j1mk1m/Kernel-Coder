@@ -1,0 +1,772 @@
+In your optimization, you can combine multiple operators into a single kernel. For example, combine gemm, bias add, activation functions, and group norm into a single fused kernel to reduce memory access and kernel launch overhead.
+Okay, let's see. I need to optimize the given Model by replacing some or all of its operators with custom CUDA kernels. The architecture includes a Linear layer (GEMM), bias addition, two activation functions (Hardtanh and Mish), and a GroupNorm layer. The goal is to combine these operations into fewer kernels to reduce memory access and kernel launch overhead.
+
+First, I'll analyze each component:
+
+1. **Linear Layer (GEMM):** This is a matrix multiplication followed by adding the bias. The bias addition is already part of the Linear layer's computation, but here the model has a separate bias parameter added after the Linear layer. Wait, actually, the Linear layer already includes the bias term. Wait, checking the code: the Linear layer is self.gemm, which has its own bias? Wait no, in PyTorch's nn.Linear, the bias is an optional parameter. The user's code defines the Linear layer with in_features and out_features. The Linear layer by default includes a bias unless specified otherwise. Wait, the code says self.gemm = nn.Linear(in_features, out_features). So yes, that includes the bias. Then why is there a separate bias parameter added? Oh, looking at the forward method: after x = self.gemm(x), they add self.bias. Wait that can't be right. Wait the Linear layer already applies its own bias. So adding another bias here would be redundant. Hmm, maybe there's a mistake here, but since the code is given, I have to work with it as is.
+
+Wait, the code's forward method is:
+
+x = self.gemm(x) --> which is x @ weight + bias (from Linear's parameters)
+then x += self.bias --> another bias addition. So effectively, two biases are being added. That's a bit odd, but perhaps the user intended that. So the first step is to compute the GEMM (matrix multiply) of the input with the weight matrix, add the Linear layer's bias, then add another bias term (self.bias). Then apply activations and GroupNorm.
+
+Hmm. So the operations are:
+
+1. Matrix multiplication (x @ weight) + Linear's bias (from self.gemm.bias) --> then add the self.bias parameter. So total of two bias terms.
+
+2. Then apply Hardtanh and Mish activations. Wait, Hardtanh is applied first, then Mish? Or are they in sequence? The code shows x = self.hardtanh(x) followed by x = self.mish(x). So first Hardtanh then Mish.
+
+3. Then GroupNorm is applied.
+
+The problem is that each of these steps is a separate kernel, leading to multiple memory accesses and kernel launches. To optimize, we can fuse these operations into a single kernel.
+
+First, I need to figure out the order of operations. Let's see:
+
+Starting with input x (batch_size, in_features):
+
+After GEMM (with Linear layer's parameters), which is:
+
+y = x @ W + Linear.bias
+
+Then add self.bias: y += self.bias
+
+Then apply Hardtanh: y = hardtanh(y)
+
+Then apply Mish: y = mish(y)
+
+Then apply GroupNorm: which is a normalization over groups of channels.
+
+Wait, the GroupNorm expects the input to be (batch, channels, ...) but in this case, since the input is (batch_size, out_features), and num_channels is out_features, and num_groups is 256. So the input is treated as (batch_size, num_channels) where each channel is a single element (since out_features is 8192 and num_groups is 256, so each group has 32 channels? Wait, 8192 divided by 256 is 32. So each group has 32 features.
+
+GroupNorm computes, for each group, the mean and variance of that group, then normalizes each element within the group.
+
+The steps are: for each group:
+
+Compute mean and variance over the features in the group (across batch?)
+
+Wait GroupNorm computes the mean and variance across the entire batch and spatial dimensions for each group's channels. Since the input here is 2D (batch, features), the GroupNorm is applied over the features grouped into num_groups groups, each group has num_channels/num_groups features.
+
+So for each element in the tensor:
+
+First, split the features into groups. For each group, compute mean and variance over all elements in the batch and the features in the group.
+
+Then, normalize each element by the group's mean and variance, then scale and shift with learnable parameters.
+
+The GroupNorm parameters are gamma (scaling) and beta (shift), which are of size (out_features,). Wait, the standard GroupNorm has num_channels equal to the number of channels, and gamma and beta are of size (num_channels,).
+
+In the given code, the GroupNorm is initialized with num_channels=out_features, so the parameters (gamma and beta) are of size (out_features,).
+
+So, to fuse all these operations into a single kernel, we need to compute all steps in sequence within a CUDA kernel. Let's outline the steps:
+
+1. Compute the matrix multiplication (GEMM) of x and the weight matrix W. But since the weight matrix is stored in the Linear layer (self.gemm.weight), we need to include that in the kernel's parameters.
+
+Wait, but in a custom kernel, we can't directly access the model's parameters unless we pass them in. Hmm, this complicates things. Alternatively, perhaps we can separate the kernel into parts where the parameters are passed as inputs. So, the fused kernel would take the input tensor x, the weight matrix W, the two bias terms (Linear's bias and the self.bias), the parameters of the GroupNorm (gamma, beta, num_groups), and then compute all the steps in one go.
+
+But this requires a lot of parameters being passed into the kernel. Let's see.
+
+Alternatively, maybe the model's parameters (like W, Linear's bias, self.bias, gamma, beta) can be treated as inputs to the kernel. Since in PyTorch, the user would have to pass all these tensors when calling the kernel.
+
+So the fused kernel would be a function that takes:
+
+- input x (batch, in_features)
+- weight W (out_features, in_features)
+- bias1 (Linear's bias, shape (out_features,))
+- bias2 (self.bias, shape (out_features,))
+- gamma (GroupNorm's scale, shape (out_features,))
+- beta (GroupNorm's shift, shape (out_features,))
+- num_groups (scalar)
+
+And then compute the entire sequence: GEMM + both biases, then activations, then group norm.
+
+But how do we handle the GroupNorm computation? Let's think through the steps for GroupNorm:
+
+For each feature group (split into num_groups groups):
+
+For each element in the group (across batch and within group features):
+
+Wait, the GroupNorm's computation for each group is over the batch dimension and the features in the group. Since the input is (batch_size, out_features), each group is a slice of the features. Let's say the group size is group_size = out_features / num_groups. Each group is of size group_size.
+
+For each group g (from 0 to num_groups-1):
+
+The features in group g are the indices g*group_size to (g+1)*group_size.
+
+For each element in batch, the features in the group form a vector of length group_size. The mean and variance are computed over all elements in the batch for each feature in the group.
+
+Wait, actually, GroupNorm computes the mean and variance over the entire group's features across the batch. So for each group g, the mean is (sum over batch and group features) / (batch_size * group_size). The variance is similarly computed.
+
+So for each element in the group (for all batches), compute mean and variance, then normalize each element.
+
+This requires, for each group, to compute the sum of all elements in the group across the batch. To compute this, we might need to use atomic operations or block-level reductions, but this can be complex in a CUDA kernel.
+
+Alternatively, perhaps we can precompute the means and variances for each group before processing the elements. But this would require separate steps, which complicates the kernel.
+
+Hmm, maybe it's better to first compute all the activations and then handle the group norm.
+
+Wait, the GroupNorm is the last step. So the workflow would be:
+
+Compute GEMM (x @ W), add both biases, then apply Hardtanh and Mish, then apply GroupNorm.
+
+Alternatively, the order of activations might be important. The code applies Hardtanh followed by Mish. So the sequence is important.
+
+But for the fused kernel, all these steps can be combined.
+
+Now, considering the computational steps:
+
+1. GEMM: x is (batch, in_features), W is (out_features, in_features). The output of GEMM is (batch, out_features). This is a matrix multiplication. The formula is y = x * W^T + bias1 + bias2? Wait, no. The Linear layer's output is x @ W + bias1 (Linear's bias), then adding self.bias (bias2). So overall, the GEMM is x multiplied by the weight matrix, then add bias1 (from Linear) and bias2 (the separate parameter).
+
+2. Apply Hardtanh: clamp between min and max (Hardtanh's parameters, which default to 0 and 1, but since it's a standard nn.Hardtanh, maybe min_val=-1, max_val=1? Wait, according to the PyTorch documentation, the default for Hardtanh is min_val=-1 and max_val=1. So y_clamped = max(min_val, min(y, max_val)).
+
+3. Apply Mish activation: mish(x) = x * tanh(softplus(x)), but more accurately, mish(x) = x * tanh(softplus(x)) where softplus is log(1 + exp(x)). Alternatively, the implementation can be optimized, but in the kernel, we can compute it as x * tanh(log(1 + exp(x))) for each element.
+
+4. Apply GroupNorm:
+
+   For each group:
+
+   - Compute mean and variance over the batch and group features.
+
+   - Normalize each element using the group's mean and variance.
+
+   - Scale by gamma and add beta.
+
+So, the main challenge is to compute the GroupNorm efficiently within the kernel. The GEMM is a big computation, so perhaps the fused kernel can handle all steps except the GEMM? Hmm, but GEMM is O(N^3) in time, so it's the dominant term. Combining GEMM with the other steps might not be straightforward.
+
+Alternatively, perhaps splitting into two kernels: one that combines GEMM + biases + activations, and another for GroupNorm, but even better to combine all into one.
+
+Alternatively, since the GroupNorm requires per-group computations, perhaps it's manageable if the kernel is structured to handle groups.
+
+Let's think about the structure of the fused kernel.
+
+The plan is to write a CUDA kernel that takes:
+
+- Input tensor x (batch_size, in_features)
+
+- Weight matrix W (out_features, in_features)
+
+- bias1 (out_features,)
+
+- bias2 (out_features,)
+
+- gamma (out_features,)
+
+- beta (out_features,)
+
+- num_groups (int)
+
+Then, for each output element (b, f) where b is batch index and f is feature index:
+
+Compute:
+
+y = (x[b] @ W[f]) + bias1[f] + bias2[f]
+
+Then apply Hardtanh and Mish activations.
+
+Then, for GroupNorm:
+
+Group f into groups of size group_size = out_features / num_groups.
+
+For each group g, compute mean and var over the batch and the features in the group.
+
+Compute normalized value, then scale by gamma and add beta.
+
+But calculating mean and var for each group is a challenge. Since the group is a set of features, and each feature has a value for each batch element. The mean and variance for a group must be computed across all batch elements and all features in the group.
+
+Wait, the standard GroupNorm computes the mean and variance over the entire group, across all elements in the batch. So for a group of features (features from f_start to f_end), the mean is the average of all elements in those features across the batch. Similarly for variance.
+
+Therefore, for each group, the mean and var must be computed over (batch_size * group_size) elements. This requires a reduction over those elements.
+
+This complicates the kernel design because to compute the mean and var for a group, each thread would need to contribute to the group's sum and sum of squares.
+
+This suggests that the kernel must first compute all the activations up to before GroupNorm, then compute the group means and vars, then apply the normalization.
+
+But doing this in a single kernel may require multiple steps within the kernel.
+
+Alternatively, the kernel can be structured in two passes: one to compute the GEMM + biases + activations, and another to compute the group norms. But that would require storing intermediate results, which might be memory-intensive.
+
+Alternatively, the entire process can be done in a single kernel with shared memory for reductions. Let's consider the steps:
+
+1. Compute the pre-activations (GEMM + biases + activations):
+
+For each (b, f):
+
+   y[b][f] = (x[b] * W[f]) + bias1[f] + bias2[f]
+
+   then apply hardtanh and mish.
+
+Wait, actually, the GEMM part is the matrix multiplication, which is O(in_features) per output element. So for each output element (b, f), it's the dot product of x[b] with W[f], plus the biases.
+
+Wait, the Linear layer computes x * W^T + bias1. Wait, the weight matrix is of shape (out_features, in_features), so when you do x @ W, it would be (batch, in_features) @ (out, in) gives (batch, out). Wait, actually, the Linear layer in PyTorch is implemented as x @ W^T + bias, where W is stored as (out_features, in_features). So the correct computation is:
+
+y = x * W^T (transpose) + bias1.
+
+So the weight is of shape (out, in), so to get the dot product, the input is (batch, in), so x * W^T is (batch, out).
+
+Therefore, the GEMM part for each output element (b, f) is sum_{i=0}^{in_features} x[b][i] * W[f][i], plus bias1[f], then plus bias2[f].
+
+So the first step is to compute this for all (b, f).
+
+Then apply the activations.
+
+Then, compute the group norms.
+
+To compute the group norms, each group is a set of features. For each group g (0 to num_groups-1), the features are f from g*group_size to (g+1)*group_size -1.
+
+The mean for group g is (sum_{b, f in group} y[b][f]) / (batch_size * group_size).
+
+Similarly, variance is (sum_{b,f} (y[b][f] - mean)^2) / (batch_size * group_size).
+
+Then, for each element in group g, the normalized value is (y[b][f] - mean_g) / sqrt(var_g + eps) * gamma[f] + beta[f].
+
+Wait, but gamma and beta are per feature, not per group. Wait, according to PyTorch's GroupNorm documentation, gamma and beta are of shape (num_channels,), so each feature has its own gamma and beta. So for each feature f in group g, gamma[f] and beta[f] are used.
+
+Therefore, the steps for the group norm are:
+
+For each group g:
+
+   compute mean_g and var_g over all elements in the group across the batch.
+
+Then, for each element (b, f in group g):
+
+   normalized = (y[b][f] - mean_g) / sqrt(var_g + eps) 
+
+   output = normalized * gamma[f] + beta[f]
+
+The epsilon is a small value for numerical stability, which is typically set to 1e-5 or similar. Since the user didn't specify, we can assume it's 1e-5.
+
+Now, the problem is how to compute mean_g and var_g for each group.
+
+This requires a reduction over the batch and group features for each group. To do this efficiently, perhaps we can precompute these means and variances before processing each element.
+
+But how to structure this in CUDA:
+
+Option 1: Each thread processes one output element (b, f). For each thread, we can determine which group it belongs to (g = f / group_size). Then, we can use atomic operations to accumulate the sum and sum of squares for each group. However, atomic operations can be slow due to contention.
+
+Option 2: Use a separate kernel to compute the group means and variances first, then another kernel to compute the final output. But this would require multiple kernels and memory copies, which might negate some of the benefits.
+
+Option 3: Use shared memory for reductions within a block. For example, each block is responsible for computing the mean and variance for a particular group. Each block would process all the elements in that group across all batches. Then, the normalization can be done in a subsequent step.
+
+This might be more manageable.
+
+Let me think of the overall approach:
+
+The fused kernel can be divided into two parts:
+
+1. Compute the pre-activations (GEMM + biases + activations).
+
+2. Compute the group norms.
+
+But to do this in a single kernel, perhaps we can structure the kernel as follows:
+
+First, each thread computes the pre-activation for its element (b, f), then stores it in shared memory or a scratchpad, then participates in reductions to compute the group means and vars. But this requires synchronization and careful management.
+
+Alternatively, the kernel can be split into two stages within a single kernel call:
+
+Stage 1: Compute the pre-activations (GEMM, biases, activations), store them in an output array.
+
+Stage 2: Compute the group norms.
+
+But this would require the kernel to first compute all the pre-activations, then compute the means and variances, then apply the normalization. This would require shared memory or global memory storage for intermediate results.
+
+Alternatively, we can separate the computation into two separate CUDA kernels. The first kernel handles the GEMM, biases, activations, and writes the intermediate activations to a temporary tensor. The second kernel then handles the GroupNorm. But this might still be better than the original code's multiple steps, as it reduces the number of kernels from several to two.
+
+Alternatively, let's see what the original code's steps are:
+
+Original steps (for the forward):
+
+1. GEMM (x @ W + bias1) --> self.gemm(x)
+
+2. Add self.bias --> x += self.bias
+
+3. Hardtanh --> applies element-wise function
+
+4. Mish --> another element-wise function
+
+5. GroupNorm --> requires per-group computations.
+
+So the original code has at least five operations, each possibly a separate kernel. By combining into two kernels (GEMM + biases + activations, and GroupNorm), we can reduce kernel launches and memory copies.
+
+Therefore, perhaps it's feasible to create two fused kernels:
+
+First kernel: GEMM + biases + Hardtanh + Mish.
+
+Second kernel: GroupNorm.
+
+This would cut down the number of kernels from 5 to 2, which is an improvement.
+
+Alternatively, even combine all into a single kernel, but that might be complex.
+
+Let's first try to write the first kernel combining GEMM, biases, and activations.
+
+The GEMM part is the most computationally heavy. To implement the GEMM in CUDA, we can write a matrix multiplication kernel. However, doing this efficiently requires a good implementation. Alternatively, we can use cuBLAS for the GEMM part, then handle the rest in a kernel. But since the user wants custom kernels, perhaps we need to write everything from scratch.
+
+Alternatively, use cuBLAS for the matrix multiply, then handle the rest in a fused kernel. But the problem requires custom kernels replacing the operators, so perhaps we can use cuBLAS for the GEMM and then write a custom kernel for the remaining steps.
+
+Alternatively, for simplicity, maybe proceed step by step.
+
+Let me outline the steps:
+
+First, for the first kernel, combining GEMM + biases + activations:
+
+Inputs:
+
+- x: (batch_size, in_features)
+
+- W: (out_features, in_features)
+
+- bias1: (out_features,)
+
+- bias2: (out_features,)
+
+Output: pre_activation (batch_size, out_features), which is (x @ W) + bias1 + bias2, then Hardtanh and Mish applied.
+
+Wait, the order is: after GEMM (with bias1), add bias2, then apply activations.
+
+Wait, the code has:
+
+x = self.gemm(x) --> which is x @ W + bias1
+
+x += self.bias --> which is adding bias2.
+
+Then apply Hardtanh and Mish.
+
+So the pre-activation before activations is (x @ W + bias1) + bias2 = x @ W + (bias1 + bias2). But combining the biases into a single bias term would be better, but since the code requires both, we'll have to handle both.
+
+The activation steps are Hardtanh followed by Mish.
+
+So the first kernel can compute the following for each element (b, f):
+
+y = (x[b] * W[f]^T) + bias1[f] + bias2[f]
+
+Then apply Hardtanh: y = max(-1, min(1, y))
+
+Then apply Mish: y = y * tanh(softplus(y)) where softplus is log(1 + exp(y))
+
+But since Mish is more complex, we need to implement it efficiently.
+
+The problem with writing a kernel for GEMM is that the matrix multiplication is O(N^3), so it's better to use existing optimized libraries like cuBLAS. However, the user wants custom CUDA kernels, so perhaps they expect us to write the GEMM from scratch, but that's not efficient. Alternatively, perhaps they allow using cuBLAS for the GEMM part.
+
+Alternatively, proceed with a custom kernel for the entire sequence.
+
+But writing a custom GEMM kernel is non-trivial. To save time, perhaps use cuBLAS for the matrix multiply part, then handle the rest in a custom kernel.
+
+Alternatively, let's think of the first kernel as combining the GEMM, bias addition, and activations.
+
+Let me think of the steps:
+
+The kernel must compute for each output element (b,f):
+
+y = dot(x[b][:], W[f][:]) + bias1[f] + bias2[f]
+
+then apply Hardtanh and Mish.
+
+Assuming that we can use cuBLAS for the matrix multiply part, then the rest can be handled in a kernel. However, the user might want the entire sequence in a single kernel. Alternatively, maybe the GEMM can be handled with a custom kernel.
+
+Alternatively, perhaps the problem expects to combine the post-GEMM steps (the two biases and the activations) into a single kernel, leaving the GEMM to be handled by PyTorch's optimized implementation. But the user wants to replace operators with custom CUDA kernels, so maybe the GEMM is considered part of the Linear layer, so replacing the entire sequence of operations from GEMM to activations into a single fused kernel.
+
+Alternatively, the group norm can be combined with the previous steps.
+
+Alternatively, proceed step by step.
+
+Let me outline the plan:
+
+1. Create a custom kernel for the entire sequence except GroupNorm.
+
+   This kernel would take:
+
+   - input x (batch, in_features)
+
+   - weight W (out_features, in_features)
+
+   - bias1 (out_features,)
+
+   - bias2 (out_features,)
+
+   and compute the output after the GEMM, biases, and activations.
+
+   Then, another kernel for the GroupNorm.
+
+Alternatively, first tackle the first kernel.
+
+But to write a GEMM kernel in CUDA, it's better to use tiled matrix multiplication for efficiency, but that's time-consuming. Alternatively, use a naive kernel, but it won't be efficient. Since the problem says "to get speedups", the kernels must be efficient.
+
+Hmm. Maybe it's better to separate the steps:
+
+First, the GEMM is done with PyTorch's Linear layer, then the biases and activations are handled in a fused kernel, then the GroupNorm in another kernel.
+
+Alternatively, the user wants to replace as many operators as possible with custom kernels for speedup.
+
+Alternatively, let's see the code structure of the original ModelNew example, where they replaced the add operation with a custom kernel. The new code has a class that loads the CUDA code and calls it.
+
+So in the given problem, perhaps the fused kernel combines the GEMM, biases, and activations. But writing that requires handling the matrix multiplication, which is a large part of the computation.
+
+Alternatively, let's try to write a fused kernel for the post-GEMM steps, i.e., after the GEMM (assuming it's done with PyTorch's Linear layer), the bias addition, and the activations.
+
+Wait, but the problem says to replace operators with custom CUDA kernels. The operators here include the Linear (GEMM + its own bias), the separate bias addition, the Hardtanh, Mish, and GroupNorm. So replacing these with custom kernels.
+
+To combine these into a single kernel, perhaps the GEMM must be included as part of the kernel.
+
+But writing a GEMM kernel is complex. Let's think of an alternative approach.
+
+Alternatively, the fused kernel can take the input x, the weight matrix, and compute the GEMM, add both biases, then apply activations, all in one kernel.
+
+The kernel would have to compute for each output element (b,f):
+
+y = (x[b] * W[f]^T) + bias1[f] + bias2[f]
+
+then apply Hardtanh and Mish.
+
+This requires for each (b,f):
+
+   y = 0
+
+   for i in 0 to in_features-1:
+
+       y += x[b][i] * W[f][i]
+
+   y += bias1[f] + bias2[f]
+
+   then apply activations.
+
+But this would be O(in_features) per element, which is O(Batch * out_features * in_features), which is manageable if in_features is 8192, which is the case here. Wait, in the given parameters, in_features and out_features are both 8192, so this is 8192 * 8192 per batch element. That's 67 million operations per batch element, and with batch_size 1024, that's 68 billion operations. That's too much. So a naive approach won't be efficient. Thus, writing an optimized GEMM kernel is necessary, but that's beyond the scope of a simple example.
+
+Hmm, perhaps the user expects us to focus on the post-GEMM steps and the group norm, assuming that the GEMM is handled efficiently. But the problem states to replace operators with custom CUDA kernels. The GEMM is part of the Linear layer, so replacing that with a custom kernel is necessary for the optimization.
+
+Alternatively, maybe the problem allows using the existing Linear layer's GEMM, but then combining the subsequent steps (bias addition, activations) into a single kernel, and then group norm into another.
+
+So let's proceed step by step.
+
+First, the post-GEMM steps:
+
+After the GEMM (x @ W + bias1), then add bias2, then apply Hardtanh and Mish.
+
+This can be done in a single kernel that takes:
+
+- input after GEMM (call it intermediate tensor z) of shape (batch, out_features)
+
+- bias2 (out_features,)
+
+Then compute:
+
+z += bias2
+
+then apply Hardtanh and Mish.
+
+This would be an element-wise kernel, which is straightforward.
+
+Then the GroupNorm kernel.
+
+Alternatively, the GEMM plus the first bias (bias1) is handled by PyTorch's Linear layer, then the remaining steps (adding bias2, activations, and group norm) are handled by custom kernels.
+
+But the user wants to replace operators with custom kernels, so perhaps the entire sequence should be fused.
+
+Alternatively, let's outline the steps:
+
+The first kernel (fused_gemmbiasact) would combine the GEMM, both biases, and the two activations into a single kernel.
+
+The second kernel (fused_groupnorm) would handle the GroupNorm.
+
+So the first kernel's inputs are:
+
+- x (batch, in_features)
+
+- W (out_features, in_features)
+
+- bias1 (out_features,)
+
+- bias2 (out_features,)
+
+The output is the activations after Hardtanh and Mish.
+
+The second kernel takes this result and computes the GroupNorm.
+
+The problem is implementing the first kernel's GEMM part efficiently.
+
+Alternatively, use cuBLAS for the matrix multiply, then add the biases and apply the activations in the same kernel.
+
+Wait, but using cuBLAS requires calling a separate function, so perhaps the kernel would first perform the matrix multiply with cuBLAS, then do the rest. But that's mixing API calls.
+
+Alternatively, the GEMM is done in the CUDA kernel, using tiled matrix multiplication for efficiency.
+
+Alternatively, maybe proceed with an example, even if the GEMM isn't optimally implemented, but at least shows the structure.
+
+Let's try to draft the code.
+
+First, the fused kernel for GEMM + biases + activations.
+
+The kernel would need to compute for each output element (b, f):
+
+y = sum_{i} x[b][i] * W[f][i] + bias1[f] + bias2[f]
+
+Then apply Hardtanh and Mish.
+
+The code for this kernel:
+
+We can write a CUDA kernel that for each output element (b,f):
+
+- Iterate over all in_features elements to compute the dot product.
+
+But with in_features being 8192, this is not efficient. So this approach won't be performant, but for the sake of the example, let's proceed.
+
+Wait, but even so, in the context of a programming exercise, maybe it's acceptable.
+
+Alternatively, using shared memory and tiling for matrix multiplication.
+
+Alternatively, proceed with the code:
+
+The first step is to write the CUDA kernel.
+
+First, the GEMM part:
+
+Assuming the input x is stored in row-major order, so x[b][i] is accessed as x_data[b * in_features + i].
+
+The weight matrix W is stored as W[f][i], so for each f, the row is the weights for the f-th output feature.
+
+The kernel would need to loop over all in_features for each element.
+
+But this is O(N^3) which is too slow. Therefore, the kernel must be optimized with tiled matrix multiplication.
+
+But writing such a kernel requires significant code.
+
+Alternatively, let's consider that the problem expects us to focus on the element-wise operations and group norm, and perhaps the GEMM is left to be handled by the Linear layer, but then the subsequent steps are fused.
+
+Alternatively, perhaps the user expects that the GEMM is fused with the bias additions and activations, even if the GEMM part isn't optimized, just to demonstrate the approach.
+
+Alternatively, perhaps the problem is more about fusing the activations and the group norm with the biases.
+
+Alternatively, the GEMM can be handled with PyTorch's implementation, and the rest (biases, activations, group norm) can be fused into two kernels.
+
+Let me try that approach.
+
+First kernel: combines adding the biases and applying activations.
+
+Second kernel: applies group norm.
+
+So first kernel:
+
+Inputs:
+
+- intermediate tensor z (batch, out_features) which is the output of the Linear layer plus the first bias.
+
+Wait, the Linear layer's output is already x @ W + bias1. Then adding self.bias (bias2) gives z = (x @ W + bias1) + bias2. So that's an element-wise addition.
+
+Then applying Hardtanh and Mish.
+
+This can be done in a single element-wise kernel.
+
+The second kernel applies GroupNorm.
+
+So let's write the code for the first kernel.
+
+The first kernel would take the intermediate tensor z (the output of Linear + bias1), then add bias2, then apply Hardtanh and Mish.
+
+Wait, the code's current forward is:
+
+x = self.gemm(x) --> which is (x @ W) + bias1
+
+x += self.bias --> adds bias2.
+
+So the intermediate after GEMM is z = x @ W + bias1, then adding bias2 gives z + bias2.
+
+Wait, no, the self.bias is a parameter added to the result of the Linear layer, so the total is (x@W + bias1) + bias2.
+
+Thus, the first kernel can take:
+
+- input: z (output of Linear layer, shape (batch, out_features))
+
+- bias2 (out_features,)
+
+Then compute:
+
+result = z + bias2 --> then apply Hardtanh and Mish.
+
+Alternatively, the kernel can directly compute z + bias2, then apply the activations.
+
+Thus, the first kernel is an element-wise kernel that does:
+
+for each element (b, f):
+
+   val = z[b][f] + bias2[f]
+
+   val = Hardtanh(val)
+
+   val = Mish(val)
+
+   out[b][f] = val
+
+This is straightforward.
+
+Then the second kernel handles the GroupNorm.
+
+The second kernel takes the output of the first kernel, and applies GroupNorm.
+
+The group norm kernel needs to compute, for each group:
+
+mean and var over all elements in the group across the batch.
+
+Then normalize each element.
+
+To compute the mean and variance, we can do this in the kernel using atomic operations, but this might be slow.
+
+Alternatively, use shared memory for reductions.
+
+Let me think of the group norm kernel.
+
+The group norm kernel inputs are:
+
+- input tensor (batch_size, out_features)
+
+- gamma (out_features,)
+
+- beta (out_features,)
+
+- num_groups (int)
+
+- eps (float, default 1e-5)
+
+Output: normalized tensor.
+
+The steps are:
+
+1. For each group g:
+
+   group_size = out_features / num_groups
+
+   features in group g are from f_start = g * group_size to f_end = (g+1)*group_size -1
+
+   compute mean and variance over all (batch, f in group g)
+
+2. For each element (b,f):
+
+   g = f // group_size
+
+   mean = means[g]
+
+   var = vars[g]
+
+   normalized = (input[b][f] - mean) / sqrt(var + eps)
+
+   output[b][f] = normalized * gamma[f] + beta[f]
+
+The challenge is to compute the means and vars for each group efficiently.
+
+To compute the means and vars, each thread can process a block of elements and accumulate the sums.
+
+Perhaps the kernel can be structured as follows:
+
+First, compute the means and variances for all groups.
+
+This can be done using a separate kernel or as part of the same kernel.
+
+Alternatively, the kernel can be divided into two parts:
+
+- A part where all threads contribute to computing the sums for each group.
+
+- Then, normalize the elements using the computed means and variances.
+
+But in a single kernel, perhaps:
+
+The kernel is launched with a grid of blocks, each block responsible for a group.
+
+Within a block, each thread processes some elements in the group across the batches.
+
+For example:
+
+For a group g:
+
+   group_size = out_features / num_groups
+
+   f_start = g * group_size
+
+   f_end = (g+1)*group_size -1
+
+   For each thread in the block, process a batch element and feature in the group.
+
+   Compute sum and sum_squares for the group.
+
+Then, store the mean and var for each group.
+
+This requires each block to compute the sum for its group.
+
+But how to handle this:
+
+Let's outline the steps in code:
+
+First, compute the mean and variance for each group:
+
+We can use a separate kernel to compute these, then use the results in the normalization.
+
+The first kernel (for computing means and vars):
+
+Input:
+
+- input tensor (batch, out_features)
+
+- num_groups
+
+- eps
+
+Output:
+
+- means (num_groups, )
+
+- vars (num_groups, )
+
+This kernel can be structured as follows:
+
+Each thread is responsible for a group.
+
+Wait, but with 256 groups, and if using a grid of blocks equal to the number of groups, each block can handle one group.
+
+Within a block, each thread can process a portion of the elements in the group.
+
+For a given group g:
+
+   group_size = G
+
+   The total elements in the group across all batches is batch_size * G.
+
+   Each thread in the block can process a chunk of these elements.
+
+   Accumulate the sum and sum_squares for the group.
+
+   Use shared memory to store partial sums.
+
+   Then compute the final sum and variance.
+
+This requires:
+
+1. Each block (per group) computes the sum and sum_squares.
+
+2. The means and vars are stored in arrays.
+
+Then, a second kernel can compute the normalized values using the means and vars.
+
+However, this requires two separate kernels and intermediate memory storage for the means and vars.
+
+Alternatively, combine the two steps into a single kernel.
+
+Alternatively, proceed with the code.
+
+Now, let's try to write the code for the first kernel (post-GEMM and biases and activations):
+
+First, the kernel for the element-wise operations (adding bias2, then applying Hardtanh and Mish):
+
+The code would look like this:
+
+```cpp
+__global__ void fused_biases_activations(
+    const float* z, const float* bias2, float* out,
+    int batch_size, int out_features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_features) return;
+    
+    int b = idx / out_features;
+    int f = idx % out_features;
+    
+    float val = z[idx] + bias2[f];
+    
+    // Apply Hardtanh: clamp between -1 and 1
+    val = val < -1.0f ? -1.0f : (val > 1.0f ? 1.0f : val);
+    
+    // Apply Mish: x * tanh(softplus(x))
+    // Softplus(x) = log(1 + exp(x))
+    float softplus_x = logf

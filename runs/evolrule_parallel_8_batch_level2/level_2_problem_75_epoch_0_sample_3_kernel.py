@@ -1,0 +1,181 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom fused kernel for Gemm + GroupNorm + Min + BiasAdd
+fused_kernel_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#define THREADS_PER_BLOCK 256
+
+template <typename scalar_t>
+__global__ void fused_gemm_groupnorm_min_biasadd(
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    scalar_t* __restrict__ output,
+    int batch_size,
+    int in_features,
+    int out_features,
+    int num_groups,
+    int bias_dim) {
+
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * blockDim.x + tid;
+
+    // Gemm computation (matrix multiplication)
+    if (gid < batch_size * out_features) {
+        int row = gid / out_features;
+        int col = gid % out_features;
+        scalar_t sum = 0;
+        for (int k = 0; k < in_features; ++k) {
+            sum += input[row * in_features + k] * weight[col * in_features + k];
+        }
+        sum += bias[col];  // Add bias from linear layer
+        output[gid] = sum;
+    }
+
+    // GroupNorm computation
+    extern __shared__ float shared[];
+    float* mean = shared;
+    float* var = shared + num_groups;
+
+    for (int g = blockIdx.y; g < num_groups; g += gridDim.y) {
+        int group_size = out_features / num_groups;
+        int start = g * group_size;
+        int end = start + group_size;
+
+        float sum = 0, sq_sum = 0;
+        for (int i = start; i < end; i += blockDim.x) {
+            float val = output[blockIdx.x * out_features + i];
+            sum += val;
+            sq_sum += val * val;
+        }
+
+        __shared__ float local_sum[THREADS_PER_BLOCK];
+        __shared__ float local_sq_sum[THREADS_PER_BLOCK];
+        local_sum[tid] = sum;
+        local_sq_sum[tid] = sq_sum;
+        __syncthreads();
+
+        for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+            if (tid < offset) {
+                local_sum[tid] += local_sum[tid + offset];
+                local_sq_sum[tid] += local_sq_sum[tid + offset];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            mean[g] = local_sum[0] / (end - start);
+            var[g] = (local_sq_sum[0] - mean[g] * local_sum[0]) / (end - start);
+            var[g] = rsqrtf(var[g] + 1e-5f);
+        }
+        __syncthreads();
+    }
+
+    if (tid < out_features) {
+        int group_id = tid / (out_features / num_groups);
+        float mn = mean[group_id];
+        float vr = var[group_id];
+        output[blockIdx.x * out_features + tid] = (output[blockIdx.x * out_features + tid] - mn) * (gamma[group_id] * vr) + beta[group_id];
+    }
+    __syncthreads();
+
+    // Compute min along dimension 1 and apply bias
+    if (blockIdx.x < batch_size) {
+        int offset = blockIdx.x * out_features;
+        float min_val = INFINITY;
+        for (int i = tid; i < out_features; i += blockDim.x) {
+            if (output[offset + i] < min_val) min_val = output[offset + i];
+        }
+        __shared__ float block_min;
+        if (tid == 0) block_min = min_val;
+        __syncthreads();
+
+        if (tid < out_features) {
+            output[offset + tid] = block_min + bias[bias_dim * tid];
+        }
+    }
+}
+
+torch::Tensor fused_forward(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int num_groups) {
+
+    const int batch_size = input.size(0);
+    const int in_features = input.size(1);
+    const int out_features = weight.size(0);
+    const int bias_dim = bias.size(0); // Assuming bias_shape is (out_features, 1, 1) but adjusted as per actual parameter dimensions
+
+    auto output = torch::empty({batch_size, out_features}, device=input.device(), dtype=input.dtype());
+
+    dim3 blocks_per_grid(batch_size, num_groups);
+    dim3 threads_per_block(THREADS_PER_BLOCK);
+
+    size_t shared_size = 2 * num_groups * sizeof(float) + 2 * THREADS_PER_BLOCK * sizeof(float);
+
+    fused_gemm_groupnorm_min_biasadd<<<
+        blocks_per_grid,
+        threads_per_block,
+        shared_size,
+        at::cuda::getCurrentCUDAStream()>>>(
+            input.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            bias.data_ptr<scalar_t>(),
+            gamma.data_ptr<float>(),
+            beta.data_ptr<float>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            in_features,
+            out_features,
+            num_groups,
+            bias_dim);
+
+    return output;
+}
+"""
+
+# Compile the fused kernel
+fused_cuda = load_inline(
+    name="fused_cuda",
+    cpp_sources="",
+    cuda_sources=fused_kernel_source,
+    functions=["fused_forward"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super().__init__()
+        # Retain original parameters but use them in fused kernel
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))  # Adjust based on actual bias_shape
+        self.gamma = nn.Parameter(torch.ones(num_groups))
+        self.beta = nn.Parameter(torch.zeros(num_groups))
+        self.fused_op = fused_cuda
+
+    def forward(self, x):
+        # Cast to float32 to match kernel
+        x = x.to(dtype=torch.float32)
+        return self.fused_op.fused_forward(
+            x, self.weight, self.bias, self.gamma, self.beta, num_groups
+        )
+
+# Ensure get_inputs and get_init_inputs remain compatible
+# Note: Adjustments may be needed based on parameter shapes
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, bias_shape]

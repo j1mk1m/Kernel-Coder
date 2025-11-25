@@ -1,0 +1,874 @@
+Additionally, for each operator you replace with a CUDA kernel, explain in 1-2 sentences why you think it could be beneficial. Your explanation must include a **specific** reason why a custom kernel would outperform the PyTorch default implementation (e.g., "Avoids memory copies by fusing operations X and Y", "Reduces kernel launch overhead by combining Z with W", etc.). 
+
+When you write CUDA kernels, you can take advantage of PyTorch's CUDA utilities (e.g., ATen, THC, etc.), and you must follow PyTorch's memory management best practices (e.g., using data_ptr(), .numel(), etc.). 
+
+Remember to compile all the CUDA kernels with load_inline. You can only use the functions from the PyTorch C++ API that are exposed to the Python API. 
+
+When you define the kernel in the source strings, use the correct syntax for including headers and defining functions. 
+
+The generated code must be able to be run in a standard PyTorch environment without any additional dependencies beyond PyTorch itself.
+
+Okay, I need to optimize the given PyTorch model by replacing some operators with custom CUDA kernels. Let me look at the architecture again.
+
+The model steps are: ConvTranspose3d, mean pooling over depth, addition, softmax over channels, tanh, and scaling. Hmm, which of these can be optimized with a custom kernel?
+
+First, the mean pooling over depth. PyTorch's mean uses a kernel, but maybe we can fuse it with the subsequent addition? Wait, the addition is adding a bias. The mean reduces dimension 2 (depth), so after that, the tensor becomes (B, C, 1, H, W). The bias is of shape (1, C, 1, 1, 1), so adding it is straightforward. But maybe combining the mean and bias addition into one kernel could save a step. That's a possible fusion.
+
+Then the softmax over channels. Softmax is a common operation, but PyTorch's implementation might have overhead. If we can combine softmax with tanh and scaling into a single kernel, that could reduce memory copies and kernel launches. Since after softmax, tanh is applied, and then scaling, doing all in one kernel might be better. Let's see: softmax(x) then tanh(x) then multiply by scaling. Since these are element-wise operations, they can be done in a single kernel pass.
+
+The convolution transpose is a big operation, but writing a custom CUDA kernel for that would be complex. Probably not worth it unless there's a specific optimization. Maybe not the first step.
+
+The addition is just adding a bias. Since after mean pooling, the tensor is (B, C, 1, H, W), adding a 1x1x1 bias is element-wise. Maybe this can be combined with the mean into one kernel. Let's see.
+
+So possible fusions:
+
+1. Combine mean pooling over depth, addition of bias, into a single kernel. Let's see:
+
+Original steps after ConvTranspose3d:
+
+x = x.mean(dim=2, keepdim=True)  # (B, C, 1, H, W)
+x = x + self.bias  # (B, C, 1, 1, 1) added
+
+The mean over depth can be computed by summing over depth and dividing by depth. Since the bias is added after, the fused kernel could compute the mean and add the bias in the same step, avoiding storing intermediate mean and then adding. So that's a possible fusion.
+
+2. Then, the softmax over channels, tanh, and scaling can be fused into a single kernel. Since all are element-wise operations, a single kernel can do all three steps, thus saving kernel launches and memory copies.
+
+So I'll target these two fusions.
+
+First, the mean and bias addition:
+
+The mean is summing over depth dimension (axis 2) and dividing by depth. So for each element in the output (after mean), it's sum over depth of the input's depth dimension divided by depth. Then adding the bias.
+
+Wait, the output after mean is (B, C, 1, H, W). The bias is (1, C, 1, 1, 1), so when adding, it's added per channel. So in the kernel, after computing the mean for each (B,C,H,W) position, adding the bias's corresponding channel value.
+
+So the fused kernel can process each spatial position (H,W) for each channel and batch. The kernel would loop over the depth dimension to compute the sum, then divide by depth, add the bias, and output to the result.
+
+Wait, but how to handle the depth dimension? Let's think about the input tensor shape: (B, C, D, H, W). The output after mean is (B, C, 1, H, W). So for each element in the output, it's the mean over the D dimension.
+
+So for each output element (b, c, 0, h, w), it's the average of all elements (b, c, d, h, w) for d from 0 to D-1.
+
+The bias is (1, C, 1, 1, 1), so for each channel c, the bias value is added to all (b, c, 0, h, w) elements.
+
+So the fused kernel can loop over all elements in B, C, H, W, and for each, compute the sum over D, then divide by D, add bias[c], and write to output.
+
+The kernel could be structured as follows:
+
+for each output element (b, c, 0, h, w):
+
+sum = 0.0
+for d in 0 to D-1:
+    sum += input[b][c][d][h][w]
+mean = sum / D
+out[b][c][0][h][w] = mean + bias[c]
+
+This requires accessing all D elements along the depth for each output element. The problem is that for large D, this could have memory access issues, but since the input is 3D convolution, maybe D isn't too big. Alternatively, we can process the depth dimension in parallel. Wait, but the depth is the dimension being summed over, so each thread could handle one output element (B, C, H, W) and loop over D.
+
+Hmm, but for a kernel, perhaps we can parallelize over the output elements. Each thread handles one (b,c,h,w) position, and loops over D to accumulate the sum. That's feasible.
+
+The input tensor has dimensions: B, C, D, H, W. Let's compute the strides to access the input's elements. Alternatively, since the input is a tensor, the CUDA kernel can use the data pointers and compute the indices correctly.
+
+Now, writing this as a CUDA kernel. The input is a 5D tensor. Let's see:
+
+The kernel would have to loop over B, C, H, W. Each thread can process a single (b,c,h,w) element. For each, iterate over D elements (d from 0 to D-1) to compute the sum.
+
+The output tensor is (B, C, 1, H, W), so each output element is at (b,c,0,h,w). The bias is (1, C, 1, 1, 1), so the bias value for channel c is at (0,c,0,0,0).
+
+So in the kernel code, the kernel would need to:
+
+- For each thread, compute the indices b, c, h, w based on the thread and block indices.
+
+- Iterate over d from 0 to depth-1 (depth is the size of the D dimension).
+
+- Accumulate the sum of input[b][c][d][h][w].
+
+- Divide by depth to get the mean.
+
+- Add the bias[c].
+
+Then store in the output[b][c][0][h][w].
+
+The kernel would need to know the dimensions B, C, D, H, W, and the bias tensor's data.
+
+Wait, the bias is a tensor, so we can pass its data pointer. The dimensions can be passed as arguments to the kernel.
+
+Now, the next part is the softmax over channels, tanh, and scaling. Let's see:
+
+After the mean and bias addition, the tensor is (B, C, 1, H, W). The next steps are:
+
+x = torch.softmax(x, dim=1) → softmax over channels (dimension 1, which is C).
+
+Then x = tanh(x), then x *= scaling_factor.
+
+These are all element-wise operations. So for each element (b,c,0,h,w):
+
+softmax: compute the exponentials, normalize across channels.
+
+Wait, the softmax over channels would require for each (b, 0, h, w), compute the sum over all C channels, then compute e^x_i / sum. Then apply tanh and scaling.
+
+But fusing all three steps into a single kernel would save the intermediate steps.
+
+Alternatively, the tanh(softmax(...)) might have some optimizations, but not sure. Let's think: the softmax is over channels, so for each spatial position (b, 0, h, w), the elements across C channels must be processed together to compute the softmax.
+
+So the softmax requires a reduction over the C dimension for each (b, h, w) position. Then tanh and scaling can be applied element-wise.
+
+Hmm, this complicates things because the softmax requires a per-(b, h, w) computation over all C channels. So perhaps it's better to first compute the softmax, then tanh and scaling in a single kernel.
+
+Wait, maybe:
+
+First, compute the softmax over channels, which involves:
+
+For each spatial position (b, h, w):
+
+- Compute max value over C channels to prevent overflow.
+
+- Compute numerator: exp(x_c - max_val) for each c.
+
+- Compute denominator: sum of numerators over C.
+
+- Normalize: numerator / denominator.
+
+Then apply tanh and scaling.
+
+But combining all into a single kernel would require handling the softmax's dependencies (since the denominator depends on all C elements). So the kernel would have to first compute the denominator for each (b, h, w), which requires a reduction over C for each group. Then, compute the normalized values, then apply tanh and scaling.
+
+This could be done in a single kernel with some synchronization, but it might be complex. Alternatively, perhaps it's better to implement the softmax, tanh, and scaling in one kernel, but the reduction step complicates things.
+
+Alternatively, let's see if the tanh and scaling can be applied immediately after the softmax. Since the scaling is a scalar multiplication, and tanh is a function, perhaps these can be combined with the softmax's normalization step.
+
+Wait, the steps are:
+
+After the softmax, each element is e^(x_c)/sum. Then tanh is applied to each element, then multiplied by scaling.
+
+So for each element in the output, the value is scaling * tanh( e^(x_c) / sum )
+
+Alternatively, perhaps there's a way to combine these steps in the computation.
+
+But the problem is that the softmax requires a reduction over the channel dimension for each spatial position. This means that for each (b, h, w), we have to compute the sum over C channels of e^(x_c). This is a per-(b,h,w) computation. So to do this in a kernel, we can have each thread process a (b, c, h, w) element, but the reduction over C would require atomic operations or some synchronization.
+
+Hmm, maybe the best approach is to first compute the softmax in a kernel, then combine the tanh and scaling into another kernel. However, that would be two kernel launches instead of three (softmax, tanh, scaling). Alternatively, combining the last two (tanh and scaling) into one kernel.
+
+Alternatively, let's see if PyTorch's softmax implementation is already optimized. Maybe writing a custom kernel for softmax with fused tanh and scaling could be beneficial by avoiding intermediate memory copies. For example, the PyTorch softmax might store intermediate results that we can skip by combining steps.
+
+Assuming that fusing these steps would save memory and time, let's proceed to write a kernel that does all three steps (softmax, tanh, scaling) in a single kernel.
+
+But the challenge is handling the reduction for softmax. Let's think of the steps again:
+
+For each spatial position (b, h, w):
+
+1. Compute the maximum value over channels (C elements) → max_val.
+
+2. Compute numerator for each channel c: exp(x[b][c][h,w] - max_val)
+
+3. Sum all numerators to get denominator.
+
+4. For each c, compute softmax_val = numerator[c]/denominator.
+
+5. Compute tanh(softmax_val) * scaling_factor.
+
+All of these steps must be done for each spatial position (b, h, w).
+
+To implement this in a CUDA kernel, we can use shared memory for the reduction step (for the denominator). Let's structure it this way:
+
+Each block processes a (b, h, w) position. The block has as many threads as there are channels (C). Each thread is responsible for one channel.
+
+Wait, but if C is large (like 64 in the given example), that could be okay. Let me think:
+
+The block would be for a spatial position (b, h, w). The number of threads per block is C (number of channels). Each thread corresponds to a channel index c.
+
+The steps would be:
+
+Each thread loads x[b][c][h][w], then:
+
+- Compute max_val across all threads in the block (since each thread has a value for their c).
+
+- Each thread calculates numerator = exp(x[c] - max_val)
+
+- Sum all numerators to get the denominator (using a reduction in shared memory).
+
+- Each thread computes softmax_val = numerator / denominator.
+
+- Compute tanh(softmax_val) * scaling.
+
+- Write the result to the output.
+
+This approach uses a block per spatial position (b, h, w), with threads per channel. The reduction over channels can be done using shared memory within the block.
+
+This requires:
+
+- The block size must be at least the number of channels (C). Since in the example C is 64, and typical block sizes can be 256, so maybe 64 threads per block would be okay. Wait, but if the block size is exactly C (64), then each thread can handle a channel. But for variable C, need to handle that.
+
+Alternatively, we can use a block size of 256 and have threads process multiple channels if C exceeds the block size, but that complicates things. Since in the given example C is 64, perhaps it's manageable.
+
+Wait, the example's out_channels is 64, so C=64. So using a block size of 64, with one thread per channel.
+
+The steps in code would be:
+
+In the kernel:
+
+- Each thread is assigned a channel index c (0 to C-1).
+
+- Each thread reads the input value for their channel (b, c, 0, h, w). Wait, the input after the first step is (B, C, 1, H, W), so the position is (b, c, 0, h, w). So the input tensor has a depth dimension of 1, so the 3rd dimension is 1, so the indices are (b, c, 0, h, w).
+
+Wait, actually, the input to this kernel would be the result after the first fused kernel (mean + bias), which is (B, C, 1, H, W). So the spatial position is (b, c, 0, h, w). But in this case, the depth dimension is fixed at 1, so the third index is always 0. So for the second kernel, the input is 5D but with the third dimension size 1, so effectively a 4D tensor (B,C,H,W).
+
+Hmm, perhaps in the code, it's better to treat the input as a 4D tensor (B, C, H, W) for simplicity, but in the actual kernel, the indices would be adjusted.
+
+Alternatively, the input can be reshaped in PyTorch to 4D before passing to the kernel. But for the kernel code, it's easier to handle as 4D.
+
+Wait, but when passing tensors to the kernel, the CUDA code has to access the elements properly. Let me see:
+
+Suppose the input is a tensor of shape (B, C, 1, H, W). To make it easier, perhaps in the kernel, the input is treated as (B, C, H, W), ignoring the depth dimension (since it's 1). So the kernel can read the data as a 4D tensor.
+
+Alternatively, in the kernel code, the indexing can ignore the third dimension (since it's fixed to 0). Let's proceed.
+
+So in the kernel:
+
+Each block handles a spatial position (b, h, w). The block has threads for each channel (C threads).
+
+Each thread in the block is assigned a channel c (0 to C-1). The thread index (threadIdx.x) is c.
+
+The input tensor's element for this (b, c, h, w) is stored at:
+
+input[b][c][0][h][w], but when treating as 4D, it would be input[b][c][h][w].
+
+So for the kernel, we can have:
+
+For the given block (b, h, w):
+
+Loop over each channel c (each thread handles one c):
+
+Compute x = input[b][c][h][w]
+
+Compute max_val by finding the maximum across all threads in the block.
+
+Then, compute numerator = exp(x - max_val)
+
+Sum all numerators to get denominator.
+
+Then, compute softmax_val = numerator / denominator
+
+Then, compute tanh(softmax_val) * scaling_factor
+
+Write the result to the output[b][c][h][w].
+
+Wait, but how to compute the max and sum across all threads in the block?
+
+This requires a reduction within the block. Let's use shared memory for that.
+
+Here's the plan for the kernel:
+
+1. Each thread loads its x value and stores it in shared memory.
+
+2. Compute the max using a reduction in shared memory.
+
+3. Compute the numerator for each thread.
+
+4. Compute the sum of numerators using a reduction.
+
+5. Compute the softmax value, then apply tanh and scaling.
+
+Let's outline this step-by-step.
+
+First, the kernel signature would need to process the input tensor and output tensor.
+
+Parameters would include the input tensor, output tensor, the scaling factor, and the dimensions B, C, H, W.
+
+In the kernel:
+
+Shared memory for the intermediate values (max and sum).
+
+Each thread:
+
+- Compute global indices: for the block, the spatial position is (b, h, w). The block index can be computed as blockIdx.x, and split into b, h, w based on the grid dimensions. Hmm, need to structure the grid and blocks properly.
+
+The grid needs to cover all B, H, W positions. Let's say:
+
+The number of blocks is B * H * W. Each block processes one (b, h, w) position.
+
+Each block has C threads (number of channels). So the block dimension is (C, 1, 1). But if C exceeds the maximum block size (like 1024), this won't work. Since in the example C is 64, it's okay.
+
+Wait, the maximum number of threads per block in CUDA is 1024 (for compute capability >= 2.0). Since 64 is way under that, it's safe.
+
+So:
+
+gridDim.x = B * H * W
+
+blockDim.x = C
+
+The block index blockIdx.x corresponds to a linear index over B, H, W.
+
+So for a given blockIdx.x:
+
+b = blockIdx.x / (H * W)
+
+hw_idx = blockIdx.x % (H * W)
+
+h = hw_idx / W
+
+w = hw_idx % W
+
+Within the block, each thread's threadIdx.x is c (0 to C-1).
+
+Now, the steps:
+
+1. Each thread loads its input value.
+
+thread.x = c.
+
+x_val = input[b][c][h][w] → need to compute the correct index in the tensor.
+
+Wait, the input is a 5D tensor (B, C, 1, H, W). To get the value at (b, c, 0, h, w), we can compute the linear index, but in CUDA code, using the data pointers.
+
+Alternatively, using PyTorch's data pointers and strides. Let's assume that the input tensor is contiguous. The kernel would have to use the data pointer and compute the offset.
+
+Alternatively, in the kernel code, the input is a Tensor, and the data is accessed via pointers. The code would need to use the stride information to compute the indices.
+
+Alternatively, to simplify, we can treat the input as a 4D tensor (since depth is 1), so the stride for depth is 1, so the third index doesn't affect the offset. So the offset for (b, c, 0, h, w) is the same as (b, c, h, w) in a 4D tensor.
+
+Assuming the input is a contiguous 5D tensor, the offset can be computed as:
+
+offset = b * (C * 1 * H * W) + c * (1 * H * W) + 0 * (H * W) + h * W + w
+
+But this is tedious. Alternatively, in the kernel code, perhaps using the .data_ptr<float>() and computing the indices properly.
+
+Alternatively, perhaps the easiest way is to reshape the input tensor to 4D before passing to the kernel. Since in the forward pass, after the first kernel, the tensor is (B, C, 1, H, W), we can call .squeeze(2) to make it (B, C, H, W), so the kernel can treat it as 4D.
+
+So the code in the model's forward would:
+
+After the first kernel, x is (B,C,H,W).
+
+Thus, in the second kernel, we can treat it as 4D.
+
+So in the kernel:
+
+The input is a 4D tensor (B, C, H, W).
+
+The output is also 4D (B, C, H, W).
+
+So the code in the kernel can compute the linear index as:
+
+index = b * C * H * W + c * H * W + h * W + w
+
+Wait, but with the block and thread indices:
+
+Each block processes (b, h, w):
+
+Wait, the block is for (b, h, w). So the block index is blockIdx.x which is mapped to b, h, w.
+
+Inside the block, each thread is for a channel c.
+
+So for a given block (b, h, w):
+
+Each thread c in 0..C-1:
+
+The input element is at (b, c, h, w).
+
+The output element is (b, c, h, w).
+
+So in code:
+
+float x = input[b][c][h][w]; // but need to use data pointers.
+
+Wait, the input is a Tensor passed to the kernel function. The data is accessed via:
+
+float* input_data = input.data_ptr<float>();
+
+Similarly for the output.
+
+The linear index for (b, c, h, w) is:
+
+int idx_in = b * (C * H * W) + c * (H * W) + h * W + w;
+
+But how to compute b, h, w from the block index?
+
+Given:
+
+blockIdx.x = blockIdx.x = linear index over B * H * W.
+
+Compute b = blockIdx.x / (H * W)
+
+hw_idx = blockIdx.x % (H * W)
+
+h = hw_idx / W
+
+w = hw_idx % W
+
+Then, for each thread in the block (threadIdx.x = c):
+
+x_val = input_data[ idx_in ];
+
+Similarly for output.
+
+Now, steps in the kernel:
+
+First, each thread loads x_val into shared memory.
+
+Wait, to compute the maximum and sum, we need all the x_val's of the channels for this (b, h, w).
+
+So, first, each thread loads its x_val into shared memory.
+
+Then, perform a reduction to compute the max.
+
+Then, each thread computes numerator = exp(x_val - max_val).
+
+Then, sum all numerators to get denominator.
+
+Then compute softmax_val = numerator / denominator.
+
+Then apply tanh and scaling.
+
+But how to do this in CUDA:
+
+First, declare shared memory:
+
+__shared__ float s_data[THREADS_PER_BLOCK]; // THREADS_PER_BLOCK is C (64)
+
+Wait, but the number of threads per block is C (THREADS_PER_BLOCK = C).
+
+Wait, the block has C threads, each with a different c. So for the first step:
+
+Each thread loads its x_val into s_data[threadIdx.x].
+
+Then, compute the maximum.
+
+To compute the maximum across all threads in the block, we can use a reduction in shared memory.
+
+The reduction can be done in log2(C) steps. For C=64, that's 6 steps.
+
+Similarly, for the sum of numerators.
+
+This requires writing code for reduction.
+
+Alternatively, since the number of channels is small (64), a straightforward approach may be faster.
+
+Alternatively, let's proceed step by step.
+
+First, load into shared memory:
+
+float x_val = input_data[idx_in];
+
+s_data[threadIdx.x] = x_val;
+
+__syncthreads();
+
+Then, compute the max_val.
+
+Initialize max_val to -inf, then each thread can compare and update.
+
+But how to do this with a reduction. Let me think:
+
+We can use a parallel reduction.
+
+Alternatively, let's have each thread compare and find the max.
+
+Wait, but the max could be found by each thread's value.
+
+Alternatively, use a loop.
+
+Wait, perhaps the easiest way for a small C is to have each thread read all values from shared memory and compute the max, but that would be O(C^2) time which is bad.
+
+Hmm, better to do a reduction.
+
+The parallel reduction steps:
+
+Initialize max_val to -infinity for each thread, then combine.
+
+Alternatively, here's a way:
+
+Set max_val to -infinity.
+
+for (int i = 0; i < C; ++i) {
+
+    if (s_data[i] > max_val) {
+
+        max_val = s_data[i];
+
+    }
+
+}
+
+But this is a loop over all elements, done by each thread, which is O(C) time. For C=64, that's manageable.
+
+Wait, but this requires that each thread can read all elements in s_data. Since all threads can read s_data, they can do this. However, this is done in each thread, which is redundant. Only one thread needs to compute the max. So perhaps have one thread (thread 0) compute it, then broadcast to others via shared memory.
+
+Hmm, let's see:
+
+After __syncthreads() after loading into shared memory.
+
+float max_val = -FLT_MAX;
+
+if (threadIdx.x == 0) {
+
+    for (int i = 0; i < C; ++i) {
+
+        if (s_data[i] > max_val) {
+
+            max_val = s_data[i];
+
+        }
+
+    }
+
+    s_data[0] = max_val; // store in shared memory
+
+}
+
+__syncthreads();
+
+max_val = s_data[0]; // all threads read the max_val
+
+Then compute numerator = exp(x_val - max_val).
+
+Each thread has their own x_val (stored in s_data[threadIdx.x]), so:
+
+float numerator = expf(s_data[threadIdx.x] - max_val);
+
+Now, need to compute the sum of all numerators.
+
+Similarly, we can do a parallel reduction for the sum.
+
+Initialize sum = 0.
+
+If threadIdx.x == 0 {
+
+    sum = 0;
+
+    for (int i=0; i < C; i++) {
+
+        sum += expf(s_data[i] - max_val);
+
+    }
+
+    s_data[0] = sum;
+
+}
+
+Wait, but this is again a loop, but for the sum. Alternatively, use a parallel reduction.
+
+But for C=64, perhaps the loop is acceptable.
+
+Alternatively, let's proceed with the loop approach for simplicity.
+
+So:
+
+// Compute denominator (sum of numerators)
+
+float sum = 0;
+
+if (threadIdx.x == 0) {
+
+    for (int i=0; i < C; ++i) {
+
+        sum += expf(s_data[i] - max_val);
+
+    }
+
+    s_data[0] = sum;
+
+}
+
+__syncthreads();
+
+float denominator = s_data[0];
+
+Then each thread can compute its own numerator:
+
+float numerator = expf(s_data[threadIdx.x] - max_val);
+
+float softmax_val = numerator / denominator;
+
+float result = tanhf(softmax_val) * scaling_factor;
+
+Then write to the output:
+
+output_data[idx_out] = result;
+
+where idx_out is same as idx_in.
+
+This approach requires thread 0 to perform the loops over all C elements, but for small C (like 64), it's manageable.
+
+The problem is that only thread 0 does the loops, but in a CUDA block, all threads must execute the same path, so the other threads would be idle during those loops, but since the loops are small (64 iterations), it might be okay.
+
+Alternatively, distribute the computation among threads, but that complicates.
+
+Another point: the expf function in the loop would be called 64 times, but for thread 0.
+
+Alternatively, precompute all the numerators first.
+
+Wait, here's another approach:
+
+After computing max_val, each thread can compute its own numerator, store in shared memory.
+
+Wait, but for the sum, all numerators are needed.
+
+So first, each thread computes its numerator, store in s_data[threadIdx.x].
+
+Then thread 0 sums them all.
+
+Wait:
+
+// compute numerators and store in shared memory
+
+float my_x = s_data[threadIdx.x];
+
+float numerator = expf(my_x - max_val);
+
+s_data[threadIdx.x] = numerator;
+
+__syncthreads();
+
+// compute sum:
+
+float sum = 0;
+
+if (threadIdx.x == 0) {
+
+    for (int i=0; i < C; i++) {
+
+        sum += s_data[i];
+
+    }
+
+    s_data[0] = sum;
+
+}
+
+__syncthreads();
+
+float denominator = s_data[0];
+
+Then, each thread can compute softmax_val = s_data[threadIdx.x] / denominator.
+
+Then compute result.
+
+This way, the numerators are stored in shared memory, then the sum is done by thread 0.
+
+This reduces the loop for thread 0 to sum the numerators, which are already computed.
+
+This might be better.
+
+So the steps in code would be:
+
+1. Load x_val into shared memory.
+
+2. Compute max_val via thread 0's loop over s_data.
+
+3. Compute numerator per thread, store back in shared.
+
+4. Thread 0 computes sum of shared.
+
+5. Compute denominator, then each thread's softmax_val is their numerator divided by denominator.
+
+6. Compute tanh and scaling, write to output.
+
+This approach reduces the computational steps.
+
+Now, coding this in CUDA.
+
+Now, putting this all together.
+
+First, the first fused kernel for mean over depth and bias addition.
+
+The first kernel:
+
+Input: the output of the conv_transpose (shape (B,C,D,H,W)), bias (1,C,1,1,1).
+
+Output: (B,C,1,H,W) after mean over D and adding bias.
+
+The kernel must compute for each (b,c,h,w):
+
+sum_{d=0}^{D-1} input[b][c][d][h][w] / D + bias[0][c][0][0][0]
+
+The kernel would need to loop over the D dimension for each output element.
+
+The kernel can be structured as follows:
+
+Each thread handles a (b,c,h,w) position. The grid is B*C*H*W.
+
+Wait, but that could be too many threads. Alternatively, we can have each block handle a (c, h, w) for all b. Hmm, but it's better to use a grid of B*H*W and threads per block for (C, ...).
+
+Wait, let me think of the dimensions:
+
+The output has shape (B, C, 1, H, W). So total elements are B*C*H*W.
+
+Each element requires processing over D elements.
+
+So per output element:
+
+sum over D elements.
+
+Thus, the kernel must have each thread process one output element (b,c,h,w).
+
+The kernel's grid can be B * C * H * W, but that's a huge grid (for B=16, C=64, H=128, W=128, that's 16*64*128*128 = 16,777,216 threads), which is way too many.
+
+That's not feasible. So need a better approach.
+
+Alternative approach: structure the grid so that each block handles a (h,w) position for all (b,c). Or something else.
+
+Wait, let's structure it so that each block handles a (b, h, w) position. Then for each block, process all C channels.
+
+So the block index is blockIdx.x = b * H * W + h * W + w.
+
+Then, each block has C threads (one per channel c).
+
+Each thread in the block loops over D elements to compute the sum.
+
+Thus:
+
+gridDim.x = B * H * W
+
+blockDim.x = C
+
+This way, the total grid size is B*H*W (for B=16, H=128, W=128 → 16*128*128 = 262,144 blocks). Each block has C=64 threads.
+
+This is manageable.
+
+Inside each block:
+
+Each thread is assigned a channel c (threadIdx.x).
+
+The spatial position is (b, h, w) determined from the block index.
+
+For each thread:
+
+sum = 0.0
+
+for d in 0..D-1:
+
+    sum += input[b][c][d][h][w]
+
+mean = sum / D
+
+bias_val = bias[0][c][0][0][0]
+
+output[b][c][0][h][w] = mean + bias_val
+
+So the kernel code would need to:
+
+- Compute b, h, w from block index.
+
+- For each thread (c):
+
+   loop over d from 0 to D-1, accumulate input[b][c][d][h][w].
+
+   divide by D.
+
+   add bias.
+
+   store in output.
+
+But how to access the input tensor's data.
+
+The input is a 5D tensor (B,C,D,H,W). The output is (B,C,1,H,W).
+
+The bias is a 5D tensor (1,C,1,1,1), so can be accessed as bias[0][c][0][0][0].
+
+In CUDA:
+
+input_data is a pointer to the input's data.
+
+output_data is the output's data.
+
+The indices for input are:
+
+input_offset = b * (C * D * H * W) + c * (D * H * W) + d * (H * W) + h * W + w
+
+Wait, but this is getting complicated. Alternatively, using strides:
+
+The input's stride for each dimension can be accessed via PyTorch's Tensor.stride() method.
+
+Alternatively, since in the kernel, we can't directly use PyTorch's stride in C++, perhaps we can precompute the strides or pass them as parameters.
+
+Alternatively, assuming the input is contiguous, which it should be if the conv_transpose is followed by mean, etc. So let's assume contiguous.
+
+Thus:
+
+The input tensor is contiguous, so the offset for (b,c,d,h,w) is:
+
+offset = b * (C * D * H * W) + c * (D * H * W) + d * (H * W) + h * W + w
+
+Similarly, the output's offset for (b,c,0,h,w) is:
+
+output_offset = b * (C * 1 * H * W) + c * (1 * H * W) + 0 * (H * W) + h * W + w = b*C*H*W + c*H*W + h*W + w.
+
+The bias's offset for (0,c,0,0,0) is:
+
+bias_offset = 0 * (C * 1 * 1 * 1) + c * (1 * 1 * 1) + 0 * (1 * 1) + 0 * 1 + 0 = c.
+
+Thus, the kernel code can be written as:
+
+extern "C" __global__ void fused_mean_add_bias_kernel(
+
+    const float* input, float* output,
+
+    const float* bias,
+
+    int B, int C, int D, int H, int W,
+
+    int input_B_stride, int input_C_stride,
+
+    int input_D_stride, int input_H_stride, int input_W_stride,
+
+    int output_B_stride, int output_C_stride,
+
+    int output_H_stride, int output_W_stride,
+
+    int bias_C_stride
+
+) {
+
+    // Compute block's spatial position (b, h, w)
+
+    int idx_block = blockIdx.x;
+
+    int b = idx_block / (H * W);
+
+    int hw_idx = idx_block % (H * W);
+
+    int h = hw_idx / W;
+
+    int w = hw_idx % W;
+
+    int c = threadIdx.x; // 0 <= c < C
+
+    if (c >= C) return;
+
+    // Compute the sum over d for input[b][c][d][h][w]
+
+    float sum = 0.0f;
+
+    for (int d = 0; d < D; ++d) {
+
+        int input_offset = b * input_B_stride +
+
+                          c * input_C_stride +
+
+                          d * input_D_stride +
+
+                          h * input_H_stride +
+
+                          w * input_W_stride;
+
+        float val = input[input_offset];
+
+        sum += val;
+
+    }
+
+    float mean = sum / D;
+
+    // Get bias value
+
+    int bias_offset = c * bias_C_stride;
+
+    float bias_val = bias[bias_offset];
+
+    // Write to output
+
+    int output_offset = b * output_B_stride +
+
+                        c * output_C_stride +
+
+                        0 * output_H_stride * output_W_stride + // depth is 0
+
+                        h * output_H_stride

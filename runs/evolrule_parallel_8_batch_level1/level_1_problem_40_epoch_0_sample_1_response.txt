@@ -1,0 +1,1367 @@
+The problem is to replace the nn.LayerNorm with a custom CUDA kernel. 
+
+Additionally, the solution must have a speedup of at least 1.2x over the original implementation. 
+
+The input tensors should be in float32.
+
+
+
+Okay, let's see. The user wants me to replace the PyTorch's nn.LayerNorm with a custom CUDA kernel to get at least 1.2x speedup. Hmm, I need to think about how LayerNorm works and how to implement it efficiently in CUDA.
+
+First, I remember that Layer Normalization computes the mean and variance over the last certain dimensions. The given normalized_shape is (features, dim1, dim2), which probably means the last three dimensions. Wait, in the input example, the input x is (batch_size, features, dim1, dim2). So the normalized_shape is (features, dim1, dim2), meaning the normalization is done over the features, dim1, and dim2 dimensions for each element in the batch. Wait, actually, the normalized_shape in PyTorch's LayerNorm refers to the last dimensions. So for an input of shape (batch, features, dim1, dim2), the normalized_shape is (features, dim1, dim2), so the mean and variance are computed across those dimensions for each position in the batch.
+
+So the steps for LayerNorm are: for each sample in the batch, compute the mean and variance over the normalized_shape dimensions, then subtract the mean and divide by the standard deviation, then apply gamma and beta if they exist. But since the user's model uses nn.LayerNorm without specifying elementwise_affine, but the default is True, so probably there are gamma and beta parameters. Wait, in the given Model, the LayerNorm is initialized with normalized_shape, but the code doesn't set elementwise_affine, so by default, it's True. Wait, checking the PyTorch docs: the default for elementwise_affine is True. So the LayerNorm has learnable parameters.
+
+So, my custom kernel must compute the mean and variance, then normalize, then multiply by gamma and add beta. But since the user's model is a simple one, maybe they are not using affine parameters? Wait, in their code, the Model uses self.ln = nn.LayerNorm(normalized_shape). So the model includes the affine parameters. Therefore, the custom kernel must include those steps.
+
+Now, implementing this in CUDA. The main challenge is efficiently computing the mean and variance across the specified dimensions. Let's think of the input as a tensor of shape (N, *normalized_shape), where N is the batch size (here, batch_size * other dimensions not part of the normalized_shape? Wait, the input here is (batch_size, features, dim1, dim2), and normalized_shape is (features, dim1, dim2), so each element of the batch is a tensor of shape (features, dim1, dim2), so the normalization is over all elements in each of these dimensions. So for each sample in the batch, compute the mean and variance over all elements in features, dim1, dim2. Wait no: the normalized_shape is the last dimensions. For example, if normalized_shape is (features, dim1, dim2), then the mean and variance are computed over all elements in those dimensions for each position in the batch. Wait, actually, the mean is over the elements in the specified dimensions. So for each element in the batch (i.e., for each sample in the batch), compute the mean of all elements in features, dim1, dim2. So the mean and variance are scalars per sample, not per channel or anything else.
+
+Wait, no. Wait, the LayerNorm computes the mean and variance over the last D dimensions, where D is the length of normalized_shape. So in this case, normalized_shape is (features, dim1, dim2), so D=3. Therefore, the mean is computed over all elements in those 3 dimensions for each sample in the batch. So each sample's tensor is (features, dim1, dim2), so the total elements per sample are features * dim1 * dim2, and the mean is over all those elements. Same with variance.
+
+Therefore, for each sample (each position along the batch dimension), we need to compute the mean and variance over all elements in the sample's data. Then, subtract the mean, divide by sqrt(variance + eps), then multiply by gamma and add beta.
+
+So the problem is, for each batch element, compute the mean and variance of the entire tensor of that element, then apply the normalization.
+
+The first step is to compute the mean and variance for each sample. The challenge here is to do this efficiently in parallel. Since each sample is independent, we can process each sample's data in parallel.
+
+The plan is:
+
+1. For each sample in the batch, compute the sum and sum of squares over all elements in the normalized dimensions. This can be done using a kernel that, for each sample, accumulates the sum and sum_sq.
+
+2. Compute the mean as sum / count, variance as (sum_sq / count) - mean^2, then compute the inverse of sqrt(variance + eps).
+
+3. Then, apply the normalization: (x - mean) * inv_std * gamma + beta. Wait, but the gamma and beta are parameters of the LayerNorm layer. However, in the original code, the user's Model uses the default parameters (so they are learnable). But in the replacement, do I need to handle gamma and beta?
+
+Wait, in the problem statement, the user wants to replace the nn.LayerNorm with a custom CUDA kernel. The original model has the LayerNorm with parameters, so the new model must also include those parameters. Therefore, the custom kernel must take gamma and beta as inputs. Wait, but in PyTorch, the LayerNorm module holds the gamma and beta as parameters. Therefore, in the ModelNew, I need to create those parameters as part of the model, and pass them to the kernel.
+
+Wait, looking at the original code:
+
+The original Model has self.ln = nn.LayerNorm(normalized_shape=normalized_shape). The forward is just self.ln(x). The parameters of the LayerNorm are gamma (weight) and beta (bias), which are part of the module. So in the new model, when replacing with a custom kernel, we need to replicate the parameters. Therefore, in the ModelNew class, we need to have parameters for weight and bias, similar to the original LayerNorm.
+
+Therefore, the custom CUDA kernel must take as inputs the input tensor, the weight (gamma), the bias (beta), the epsilon (which is a hyperparameter of LayerNorm, default 1e-5), and compute the normalized output.
+
+But how do I handle the parameters? In the original code, the LayerNorm's parameters are part of the model, so the new model must have the same parameters. Therefore, the ModelNew must include the parameters. So the ModelNew's __init__ should initialize the weight and bias, perhaps by copying them from the original LayerNorm? Wait, but the user's code doesn't show training, so maybe we can just create new parameters with the same shape. Alternatively, maybe the kernel will need to take the weight and bias tensors as inputs. So in the forward, when we call the CUDA kernel, we pass in the weight and bias tensors.
+
+Alternatively, perhaps the kernel can accept the weight and bias as parameters. So in the CUDA kernel, we have to read those tensors.
+
+Now, let's think about the steps in the kernel:
+
+First, compute for each sample the mean and variance:
+
+Each sample's data is a contiguous block? Well, the input is a 4D tensor. Let me consider the input as a 4D tensor (batch_size, features, dim1, dim2). The normalized_shape is (features, dim1, dim2), so the dimensions over which to normalize are the last three. Therefore, for each sample (along batch_size), the elements are all the features, dim1, dim2 elements. So each sample has (features * dim1 * dim2) elements.
+
+Therefore, for each sample, we need to compute the sum and sum of squares over all elements in those dimensions.
+
+The approach would be to launch one thread per sample, and have each thread process all elements of that sample. Wait, but that might not be efficient. Alternatively, we can have a thread block per sample, and have threads in the block compute partial sums, then reduce them.
+
+Wait, but for a sample with 64 * 256 * 256 elements (since features is 64, dim1 and dim2 are 256 each), that's 64*256*256 = 4,194,304 elements per sample. Wait, no: features is 64, dim1 and dim2 are each 256. So the product is 64*256*256 = 4,194,304 elements per sample. But batch_size is 16, so total elements are 16 * 4 million = ~66 million. But processing this per sample may be okay with CUDA.
+
+Wait, but for each sample, the elements are contiguous in memory? Let me see the storage. The input is a 4D tensor. The layout would be batch, features, dim1, dim2. So for a given batch index, the data for that sample is stored as features x dim1 x dim2. Therefore, for each sample, the elements are contiguous in memory? Wait, the strides depend on the tensor's storage. Assuming that the tensor is stored in row-major order, the first dimension is batch, so each sample's data is indeed a contiguous block of features * dim1 * dim2 elements. So for each sample, the data is contiguous, so we can process it as a 1D array.
+
+Therefore, for each sample, the elements are contiguous. So for each sample, we can process all elements in parallel. Wait, but how to structure the kernel?
+
+Alternative approach: for each sample, launch a kernel that computes the sum and sum of squares. Since each sample is independent, we can process them in parallel. For each sample, we can have a block of threads, each thread processes a chunk of the sample's elements.
+
+Alternatively, use a reduction kernel. For each sample, compute the sum and sum_sq using a parallel reduction. Since each sample's elements are contiguous, we can process each sample's data in a separate block.
+
+So here's a possible plan:
+
+1. Compute for each sample the sum and sum of squares:
+
+   - Launch a kernel where each block handles one sample. Each block processes the sample's elements (features*dim1*dim2 elements). The block can have, say, 256 threads, and each thread handles a portion of the elements.
+
+   - Each thread in the block processes a chunk of elements, accumulating their sum and sum_sq into shared memory. Then, perform a reduction in shared memory to get the total sum and sum_sq for the sample.
+
+2. Compute the mean and variance for each sample:
+
+   - Mean = sum / count, where count is features*dim1*dim2.
+
+   - Variance = (sum_sq/count) - mean^2.
+
+   - Then compute inv_std = 1 / sqrt(variance + eps). The epsilon is a small value to prevent division by zero (default 1e-5).
+
+3. Normalize each element of the sample:
+
+   - For each element x in the sample's data: (x - mean) * inv_std * gamma + beta.
+
+   - Here, gamma and beta are the learnable parameters of the LayerNorm, which are of the same shape as the normalized_shape (or maybe 1D tensors of the same size as the normalized dimensions?), but actually, in PyTorch's LayerNorm, the gamma and beta are of the same shape as the normalized_shape. Wait, no. Wait, the gamma (weight) and beta (bias) in LayerNorm are tensors of the same shape as the normalized_shape. Wait, no. Let me check the PyTorch documentation.
+
+Wait, PyTorch's LayerNorm has the weight and bias parameters with the same shape as the normalized_shape. Because the normalization is applied to each element in the last dimensions, but the affine transformation is applied element-wise. So for example, if the normalized_shape is (D1, D2), the weight and bias are also of shape (D1, D2). Wait, no, actually, according to PyTorch's documentation, the weight and bias are of the same shape as the normalized_shape. Wait, looking here: 
+
+In the PyTorch documentation for nn.LayerNorm, it says:
+
+"Normalized_shape: input shape from an expected input of size (..., *normalized_shape). The last dimension is the channel dimension which will have the normalization applied."
+
+The weight and bias are of size equal to the normalized_shape. Wait, actually, no, the weight and bias are 1-dimensional tensors of length equal to the product of the elements in normalized_shape? Or is it the same shape as normalized_shape?
+
+Wait, looking at the source code, the LayerNorm creates weight and bias as:
+
+self.weight = Parameter(torch.ones(*normalized_shape))
+
+self.bias = Parameter(torch.zeros(*normalized_shape))
+
+Ah, so the weight and bias are of the same shape as the normalized_shape. Therefore, in the case where normalized_shape is (features, dim1, dim2), the weight and bias are tensors of shape (features, dim1, dim2). Therefore, each element in the normalized dimensions has its own gamma and beta. That complicates things because the normalization is per-element in the affine transformation. Wait, but that can't be right, because if you have a tensor of shape (features, dim1, dim2), then each position in those dimensions would have their own gamma and beta. That would mean the affine transformation is applied element-wise. But that would mean that the affine parameters are per-element in the normalized dimensions. So the gamma and beta tensors must be broadcastable to the input shape. Wait, actually, the affine parameters are of the same shape as the normalized_shape, so when applied to the input, they are broadcasted to the input's shape. For example, if the input is (batch, features, dim1, dim2), and the normalized_shape is (features, dim1, dim2), then the weight and bias are of shape (features, dim1, dim2), so when you multiply the normalized tensor (which has shape (batch, features, dim1, dim2)), the weight is broadcasted along the batch dimension.
+
+Therefore, the affine parameters are not scalar per sample, but per each element in the normalized dimensions. Wait, but that would require a lot of parameters. For example, with features=64, dim1=256, dim2=256, the weight and bias would be 64*256*256 each, which is 4 million parameters each. That's a lot. But that's what PyTorch does.
+
+Hmm, this complicates the kernel because the affine transformation can't be done with a simple multiplication by a scalar gamma and addition of beta, but rather each element is scaled by its corresponding gamma element and shifted by beta. Therefore, in the kernel, when applying the affine transformation, for each element, we need to get the corresponding gamma and beta values based on their position in the normalized dimensions.
+
+This complicates the kernel, but it's manageable.
+
+So, the plan is:
+
+The custom kernel must take:
+
+- The input tensor x.
+
+- The weight (gamma) and bias (beta) tensors.
+
+- The epsilon value (default 1e-5).
+
+The steps in the kernel:
+
+1. Compute for each sample the mean and variance over the normalized dimensions.
+
+   This requires a per-sample computation.
+
+2. Compute the inverse of the standard deviation (using variance + epsilon).
+
+3. For each element in the normalized dimensions, compute (x - mean) * inv_std * gamma + beta.
+
+Wait, but the gamma and beta are of the same shape as the normalized_shape, so for each element in the normalized dimensions (i.e., for each position in features, dim1, dim2), there is a corresponding gamma and beta.
+
+Therefore, the normalization step would be:
+
+for each sample in batch:
+
+   compute mean and variance.
+
+   compute inv_std = 1 / sqrt(variance + eps)
+
+   for each element in the normalized dimensions (i.e., for each position in features, dim1, dim2):
+
+       x[i] = (x[i] - mean) * inv_std * gamma[features_pos, dim1_pos, dim2_pos] + beta[...]
+
+So each element's gamma and beta are determined by their position in the normalized dimensions. Therefore, in the kernel, when processing an element, we need to compute its position in the normalized dimensions and fetch the corresponding gamma and beta values.
+
+This complicates the addressing in the kernel. Let's think about how to structure the threads.
+
+Approach for the kernel:
+
+The kernel can be split into two main parts: the reduction to compute mean and variance, and the normalization step.
+
+First, the reduction for each sample.
+
+For the reduction:
+
+The input is a 4D tensor (batch, features, dim1, dim2). We can treat each sample as a 3D tensor (features, dim1, dim2). The total elements per sample is F*D1*D2, where F=features, D1=dim1, D2=dim2.
+
+So for each sample, we need to compute the sum and sum_sq over all elements. The steps for this could be:
+
+Launch a kernel where each block handles one sample. Each block has enough threads to process all elements of the sample. But that might be too many threads. Alternatively, use a reduction approach with a block per sample, and within the block, perform a parallel reduction.
+
+Each block processes one sample. The block's threads process chunks of the sample's elements, compute partial sums and partial sum_squares, then reduce them within the block to get the total sum and sum_sq for that sample. The result is stored in a per-sample buffer.
+
+Once all blocks have computed their sums and sum_sqs, the next step is to compute mean and variance for each sample.
+
+Then, the normalization step: for each element in the input tensor, compute the normalized value using the mean, variance, gamma, beta, and epsilon.
+
+So, the normalization step can be done in a separate kernel, since the mean and variance are per sample, so each element in the sample uses the same mean and variance for that sample.
+
+Wait, but the mean and variance are scalars per sample, right? Because they are the mean of all elements in the normalized dimensions. So for each element in the sample, the mean and variance are the same. But gamma and beta are per-element in the normalized dimensions.
+
+Therefore, for the normalization step, each thread can process an element. The element's position in the sample (features, dim1, dim2) determines which gamma and beta to use.
+
+Therefore, the normalization kernel can process the entire tensor with each thread handling one element. The thread must compute:
+
+- The sample index (along batch dimension).
+
+- The position within the normalized dimensions (features, dim1, dim2).
+
+- Fetch the corresponding gamma and beta elements based on those positions.
+
+The main challenges are:
+
+1. Efficiently calculating the mean and variance for each sample using parallel reduction.
+
+2. Handling the gamma and beta lookups efficiently in the normalization step.
+
+Now, let's think about how to implement this in CUDA.
+
+First, the reduction kernel:
+
+The reduction will be per sample, so the grid is of size batch_size. Each block is responsible for one sample.
+
+Each block will process the sample's data (features * dim1 * dim2 elements). To perform a parallel reduction, we can use a thread block with, say, 256 threads. Each thread processes a chunk of elements, accumulating sum and sum_sq. Then, perform a reduction within the block.
+
+The steps for the reduction:
+
+- Each thread reads a portion of the sample's elements.
+
+- Each thread accumulates their local sum and sum_sq.
+
+- Use shared memory to accumulate the partial sums.
+
+- After reduction, store the total sum and sum_sq in an array for each sample.
+
+Once all samples have their sums, the mean and variance can be computed per sample, and stored in arrays.
+
+Then, the normalization kernel can proceed by iterating over all elements in the tensor, and for each element:
+
+- Determine the sample index (batch index).
+
+- Determine the position within the normalized dimensions (features, dim1, dim2).
+
+- Use that position to index into gamma and beta tensors.
+
+- Compute the normalized value using the stored mean and variance for the sample, and the gamma and beta.
+
+Now, let's think about the code structure.
+
+First, in the Python code:
+
+The ModelNew will need to have parameters for weight and bias, just like the original LayerNorm. So in __init__, we need to initialize these parameters.
+
+Wait, but in the original code, the Model's __init__ takes normalized_shape as a parameter, which is (features, dim1, dim2). So in the new ModelNew, we can replicate that:
+
+class ModelNew(nn.Module):
+    def __init__(self, normalized_shape: tuple):
+        super().__init__()
+        # Create parameters similar to LayerNorm
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        # Also, the epsilon is a parameter? Or hard-coded?
+        self.eps = 1e-5  # same as default PyTorch LayerNorm
+        # Load the CUDA kernels here.
+
+    def forward(self, x):
+        # call the CUDA kernel with x, self.weight, self.bias, self.eps
+        return custom_layernorm_cuda(x, self.weight, self.bias, self.eps)
+
+Wait, but in the code example given, the CUDA kernel is loaded inline. So the approach would be to have the CUDA kernel code written inline in the Python code, using load_inline.
+
+The CUDA kernel will need to handle the reduction and normalization steps.
+
+Now, the CUDA code:
+
+First, the reduction kernel:
+
+The reduction kernel will take the input tensor, and output arrays for sums and sum_squares per sample.
+
+But how to pass these intermediate arrays? Since CUDA kernels can't return multiple outputs, perhaps we need to pass pointers to arrays that store the sums and sum_squares.
+
+Alternatively, the first kernel computes the sums and sum_squares, stores them in global memory arrays, and then the normalization kernel reads from those arrays.
+
+So, the plan is:
+
+- Allocate device arrays for sum, sum_sq (each of size batch_size).
+
+- Run the reduction kernel to compute these arrays.
+
+- Compute mean and variance arrays (also of size batch_size).
+
+- Run the normalization kernel, passing the mean, variance, and gamma/beta.
+
+But this requires managing temporary arrays and synchronizing the kernels. Alternatively, we can have the entire computation done in a single kernel, but that might be more complex.
+
+Alternatively, the entire process can be done in two kernels: reduction and normalization.
+
+But in the example given, the custom kernel is a single function that encapsulates all steps. Let me see the example again:
+
+In the example, the elementwise_add_cuda function launches the kernel and returns the output tensor. So for LayerNorm, the function would need to:
+
+- Compute the intermediate sums, etc.
+
+- Allocate and manage the temporary arrays.
+
+Alternatively, the kernel can be written in a way that does all steps in a single kernel launch, but that might be complicated.
+
+Alternatively, the reduction can be done in a separate kernel, then the normalization in another.
+
+But for simplicity, perhaps the CUDA code can be written as a single function that does all steps, using shared memory and atomic operations where necessary.
+
+Alternatively, here's a possible approach for the CUDA code:
+
+The CUDA kernel function will take the input tensor, weight, bias, epsilon, and output the normalized tensor.
+
+Inside the kernel:
+
+Each thread processes an element of the input. For each element:
+
+- Determine the sample index (batch index).
+
+- Compute the mean and variance for that sample. Wait, but this would require each thread to access the same mean/var for their sample, so we need to have a way to compute and store these per sample.
+
+Hmm, this suggests that the mean and variance must be precomputed before the normalization step. Therefore, the kernel must first compute the per-sample statistics, then do the normalization. This requires two separate kernel launches.
+
+Therefore, the steps in Python would be:
+
+def custom_layernorm_cuda(x, weight, bias, eps):
+
+    # Get the batch size and the number of elements per sample
+    batch_size = x.size(0)
+    normalized_size = x.size(1)*x.size(2)*x.size(3)
+
+    # Allocate device arrays for sum and sum_sq
+    sum_d = torch.zeros(batch_size, dtype=x.dtype, device=x.device)
+    sum_sq_d = torch.zeros_like(sum_d)
+
+    # Launch the reduction kernel
+    reduction_kernel(x, sum_d, sum_sq_d, batch_size, normalized_size)
+
+    # Compute mean and variance
+    mean_d = sum_d / normalized_size
+    variance_d = (sum_sq_d / normalized_size) - (mean_d ** 2)
+    inv_std_d = 1.0 / torch.sqrt(variance_d + eps)
+
+    # Now launch the normalization kernel
+    out = torch.empty_like(x)
+    normalization_kernel(x, weight, bias, mean_d, inv_std_d, out)
+
+    return out
+
+Wait, but this is in Python, which would involve multiple kernel launches and memory transfers, which might not be efficient. However, since we're writing CUDA kernels, perhaps the entire computation can be done in CUDA.
+
+Alternatively, the reduction and normalization can be done in a single kernel, but that requires each sample's threads to first compute the sum and sum_sq, then compute the mean and inv_std, and then do the normalization. But this would require synchronization within the block.
+
+So here's the plan for a single kernel:
+
+Each block processes a single sample. The block has multiple threads. The threads first compute the sum and sum_sq for their sample using a reduction. Then, compute the mean and inv_std. Then, each thread processes their portion of the sample's elements to normalize them.
+
+This way, all steps are done within a single kernel per sample.
+
+So the steps for each block (sample):
+
+1. Each thread reads a chunk of the sample's elements and accumulates sum and sum_sq into shared memory.
+
+2. Perform a reduction in shared memory to get the total sum and sum_sq.
+
+3. Compute mean and inv_std (using variance = (sum_sq/count) - mean^2).
+
+4. Each thread then processes their chunk of elements, applying the normalization and affine transformation.
+
+This approach keeps everything within the same kernel, avoiding multiple kernel launches and Python overhead.
+
+The CUDA code would look something like this (simplified):
+
+__global__ void layernorm_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float eps,
+    float* __restrict__ out,
+    int batch_size,
+    int normalized_size,
+    int features,
+    int dim1,
+    int dim2) {
+
+    // Each block handles one sample (batch index)
+    int sample_idx = blockIdx.x;
+
+    // Compute the starting index for this sample
+    int sample_offset = sample_idx * features * dim1 * dim2;
+
+    // Shared memory for per-block reduction
+    __shared__ float s_sum[256];  // Need enough space, maybe 256 threads per block
+    __shared__ float s_sum_sq[256];
+
+    int tid = threadIdx.x;
+
+    // Initialize shared memory
+    s_sum[tid] = 0.0f;
+    s_sum_sq[tid] = 0.0f;
+    __syncthreads();
+
+    // Each thread processes a chunk of elements
+    for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+        int global_idx = sample_offset + idx;
+        float val = x[global_idx];
+        s_sum[tid] += val;
+        s_sum_sq[tid] += val * val;
+    }
+
+    // Perform reduction in shared memory
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+        __syncthreads();
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+    }
+
+    // After reduction, only thread 0 has the total sum and sum_sq
+    if (tid == 0) {
+        float sum = s_sum[0];
+        float sum_sq = s_sum_sq[0];
+        float mean = sum / normalized_size;
+        float var = (sum_sq / normalized_size) - mean*mean;
+        float inv_std = 1.0f / sqrtf(var + eps);
+
+        // Now, each thread in the block processes their chunk again for normalization
+        for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+            int global_idx = sample_offset + idx;
+            int pos_in_normalized = idx; // Need to compute the position in features, dim1, dim2 to index weight and bias
+
+            // Compute the feature, dim1, dim2 indices based on idx (0..normalized_size-1)
+            int f = (idx / (dim2 * dim1));
+            int d1 = (idx / dim2) % dim1;
+            int d2 = idx % dim2;
+
+            // Compute the weight and bias indices: (f, d1, d2)
+            // Since weight is of shape (features, dim1, dim2), the index is f*dim1*dim2 + d1*dim2 + d2
+            int wb_idx = f * dim1 * dim2 + d1 * dim2 + d2;
+            float gamma = weight[wb_idx];
+            float beta = bias[wb_idx];
+
+            float val = x[global_idx];
+            out[global_idx] = (val - mean) * inv_std * gamma + beta;
+        }
+    }
+    __syncthreads();
+}
+
+Wait, but in the above code, after computing the mean and inv_std, only thread 0 processes all the elements? No, because in the second loop, each thread (tid) is processing their own chunk again. Wait, the code after tid == 0 would only execute for thread 0, but the loop over idx would need to be done by all threads. Hmm, there's a problem here.
+
+Wait, after the reduction phase, only thread 0 has the mean and inv_std. The other threads in the block can't access these values unless they are broadcast to all threads. So perhaps after computing mean and inv_std, thread 0 writes them to shared memory, and then all threads can read them.
+
+So the corrected approach would be:
+
+After computing mean and inv_std in thread 0, write them to shared memory variables accessible to all threads:
+
+    if (tid ==0) {
+        ... compute mean and inv_std ...
+        s_mean[0] = mean;
+        s_inv_std[0] = inv_std;
+    }
+    __syncthreads();
+
+Then, all threads can read s_mean[0] and s_inv_std[0], and process their chunks.
+
+So the code would be adjusted as follows:
+
+__shared__ float s_mean[1];
+__shared__ float s_inv_std[1];
+
+Then, in thread 0:
+
+s_mean[0] = mean;
+s_inv_std[0] = inv_std;
+
+Then, after __syncthreads(), all threads can use s_mean[0] and s_inv_std[0].
+
+Then, the normalization loop can be done by all threads:
+
+for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+    ... compute the position indices ...
+    ... fetch gamma and beta ...
+    out[global_idx] = (x[global_idx] - s_mean[0]) * s_inv_std[0] * gamma + beta;
+}
+
+This way, all threads in the block can process their chunks in parallel.
+
+Now, the problem of computing the indices (f, d1, d2) from the idx (which is the flattened index within the sample's data).
+
+The sample's data is stored in row-major order, so for idx in 0 to (features*dim1*dim2 -1):
+
+The order is:
+
+for f in 0..features-1:
+    for d1 in 0..dim1-1:
+        for d2 in 0..dim2-1:
+            index = f * dim1*dim2 + d1 * dim2 + d2
+
+Therefore, given an idx, we can compute:
+
+f = idx / (dim1 * dim2);
+d1 = (idx % (dim1 * dim2)) / dim2;
+d2 = idx % dim2;
+
+Alternatively, using integer division:
+
+int f = idx / (dim1 * dim2);
+int rem = idx % (dim1 * dim2);
+int d1 = rem / dim2;
+int d2 = rem % dim2;
+
+This way, the indices can be computed.
+
+But in CUDA, division and modulo can be expensive. Since dim1 and dim2 are known at compile time (or passed as kernel parameters), we can compute this efficiently.
+
+Alternatively, if the dimensions are known, we can use precomputed values, but in this case, they are passed as parameters.
+
+Therefore, the code in the kernel must compute f, d1, d2 from idx.
+
+Another optimization: precompute the dimensions as constants if possible, but since they are parameters, they have to be passed as arguments.
+
+Now, the kernel's parameters include:
+
+- x: input tensor (ptr)
+
+- weight: pointer to weight tensor (gamma)
+
+- bias: pointer to bias tensor (beta)
+
+- eps: epsilon value (float)
+
+- out: output tensor
+
+- batch_size (int)
+
+- normalized_size: features * dim1 * dim2 (int)
+
+- features, dim1, dim2: the dimensions of the normalized_shape.
+
+Wait, but in the kernel, how are these passed? The kernel's arguments must include all necessary parameters. So in the CUDA code, the kernel function would have parameters like:
+
+__global__ void layernorm_kernel(
+    const float* x,
+    const float* weight,
+    const float* bias,
+    float eps,
+    float* out,
+    int batch_size,
+    int features,
+    int dim1,
+    int dim2) {
+
+    // compute normalized_size as features * dim1 * dim2
+    int normalized_size = features * dim1 * dim2;
+
+    // ... rest of code ...
+}
+
+So the kernel must have all these parameters passed in.
+
+Now, in the Python code, when calling the kernel, we need to pass these parameters.
+
+Now, the weight and bias are tensors of shape (features, dim1, dim2). So their size is features*dim1*dim2 elements. So the pointers to weight and bias are just passed as is.
+
+Now, the challenge is to handle the weight and bias tensors correctly in the kernel.
+
+The weight and bias are stored in row-major order as well, so the same index calculation as above applies to them. So for a given (f, d1, d2), the index into weight or bias is f * dim1 * dim2 + d1 * dim2 + d2.
+
+Therefore, the code in the normalization loop can compute wb_idx as f * dim1 * dim2 + d1 * dim2 + d2.
+
+Now, in terms of kernel launch configuration.
+
+The grid size is batch_size (each block handles one sample).
+
+The block size should be chosen to cover the normalized_size elements with enough threads. For example, using 256 threads per block.
+
+The number of threads per block can be 256, which is a common value. The kernel's block size must be at least the number of threads needed to cover the normalized_size.
+
+Wait, but if normalized_size is 64*256*256 = 4,194,304 per sample, then 256 threads per block would require each thread to handle 16,384 elements in the reduction phase. That's manageable, but may be slow. Alternatively, use a larger block size? But CUDA has limits on block sizes (max 1024 threads per block). Alternatively, perhaps use a block size of 512 or 1024.
+
+Alternatively, for the reduction phase, the number of threads can be a power of two, and the block size can be 1024 for large normalized sizes. But need to find a balance between occupancy and the number of threads.
+
+Alternatively, the reduction can be done with a block size of 256, and each thread processes a chunk of elements. The reduction within the block can be done with a binary reduction.
+
+The key is that the reduction must be efficient, so that the per-sample computations are done quickly.
+
+Now, handling the weight and bias:
+
+The weight and bias are of shape (features, dim1, dim2). So their pointers are passed to the kernel. The code computes wb_idx as f * dim1*dim2 + d1*dim2 + d2, and then accesses weight[wb_idx] and bias[wb_idx].
+
+Now, the CUDA code for the kernel is getting quite complex, but let's proceed.
+
+Now, in the Python code, the function that calls the kernel would be:
+
+def custom_layernorm_cuda(x, weight, bias, eps):
+
+    # Get the tensor dimensions
+    batch_size = x.size(0)
+    features = x.size(1)
+    dim1 = x.size(2)
+    dim2 = x.size(3)
+    normalized_size = features * dim1 * dim2
+
+    # Output tensor
+    out = torch.empty_like(x)
+
+    # Launch the kernel
+    block_size = 256
+    grid_size = batch_size
+
+    layernorm_kernel[grid_size, block_size](
+        x.data_ptr(),
+        weight.data_ptr(),
+        bias.data_ptr(),
+        eps,
+        out.data_ptr(),
+        batch_size,
+        features,
+        dim1,
+        dim2
+    )
+
+    return out
+
+But the kernel must be defined in the CUDA code.
+
+Now, putting all together into the Python code with inline CUDA.
+
+First, the CUDA source code for the kernel.
+
+Let me try writing the CUDA code step by step.
+
+The kernel needs to:
+
+- For each block (sample):
+
+   - Compute the sum and sum_sq over all elements in the sample.
+
+   - Compute mean and inv_std.
+
+   - Normalize each element using the computed stats and weight/bias.
+
+The CUDA kernel code:
+
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+__global__ void layernorm_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float eps,
+    float* __restrict__ out,
+    int batch_size,
+    int features,
+    int dim1,
+    int dim2) {
+
+    int sample_idx = blockIdx.x;
+    int normalized_size = features * dim1 * dim2;
+    int sample_offset = sample_idx * normalized_size;
+
+    // Shared memory for per-block reduction
+    extern __shared__ float shared_mem[];
+    float* s_sum = shared_mem;
+    float* s_sum_sq = shared_mem + blockDim.x;
+
+    // Thread index
+    int tid = threadIdx.x;
+
+    // Initialize shared memory
+    s_sum[tid] = 0.0f;
+    s_sum_sq[tid] = 0.0f;
+    __syncthreads();
+
+    // Load data into shared memory for reduction
+    for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+        int global_idx = sample_offset + idx;
+        float val = x[global_idx];
+        s_sum[tid] += val;
+        s_sum_sq[tid] += val * val;
+    }
+    __syncthreads();
+
+    // Perform reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Compute mean and inv_std
+    float mean, inv_std;
+    if (tid == 0) {
+        float sum = s_sum[0];
+        float sum_sq = s_sum_sq[0];
+        mean = sum / normalized_size;
+        float var = (sum_sq / normalized_size) - mean * mean;
+        inv_std = 1.0f / sqrtf(var + eps);
+
+        // Store mean and inv_std in shared memory for all threads
+        s_sum[0] = mean;
+        s_sum_sq[0] = inv_std;
+    }
+    __syncthreads();
+
+    mean = s_sum[0];
+    inv_std = s_sum_sq[0];
+
+    // Now process each element for normalization
+    for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+        int global_idx = sample_offset + idx;
+        // Compute indices f, d1, d2
+        int f = idx / (dim1 * dim2);
+        int rem = idx % (dim1 * dim2);
+        int d1_idx = rem / dim2;
+        int d2_idx = rem % dim2;
+
+        // Compute weight/bias index
+        int wb_idx = f * dim1 * dim2 + d1_idx * dim2 + d2_idx;
+
+        float gamma = weight[wb_idx];
+        float beta = bias[wb_idx];
+        float val = x[global_idx];
+        out[global_idx] = (val - mean) * inv_std * gamma + beta;
+    }
+}
+
+// Wrapper function for PyTorch
+torch::Tensor custom_layernorm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {
+    // Check input types and devices
+    CHECK_INPUT(x);
+    CHECK_INPUT(weight);
+    CHECK_INPUT(bias);
+
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    int dim1 = x.size(2);
+    int dim2 = x.size(3);
+    int normalized_size = features * dim1 * dim2;
+
+    // Output tensor
+    auto out = torch::empty_like(x);
+
+    // Calculate block size and shared memory size
+    int block_size = 256;
+    int shared_size = 2 * block_size * sizeof(float);
+
+    // Launch kernel
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+    layernorm_kernel<<<grid, block, shared_size>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        eps,
+        out.data_ptr<float>(),
+        batch_size,
+        features,
+        dim1,
+        dim2
+    );
+
+    // Check for errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA error: %s\n", cudaGetErrorString(err));
+    }
+
+    return out;
+}
+
+Wait, but in the code above, the shared memory is allocated with extern __shared__ float shared_mem[];. The size is determined by the kernel launch's dynamic shared memory allocation. The shared memory needed is 2 * blockDim.x (since s_sum and s_sum_sq each take blockDim.x floats).
+
+In the kernel launch, the shared memory size is set to shared_size = 2 * block_size * sizeof(float).
+
+Yes, that's correct.
+
+Now, in the Python code, we need to define this CUDA code inline and load it.
+
+Also, in the Python code, the parameters must be passed correctly. The weight and bias tensors are passed as parameters to the kernel function.
+
+Now, the Python code:
+
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA source code
+layernorm_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define CHECK_CUDA(x) AT_ASSERTM(x.type().is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) AT_ASSERTM(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+
+__global__ void layernorm_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float eps,
+    float* __restrict__ out,
+    int batch_size,
+    int features,
+    int dim1,
+    int dim2) {
+
+    int sample_idx = blockIdx.x;
+    int normalized_size = features * dim1 * dim2;
+    int sample_offset = sample_idx * normalized_size;
+
+    // Shared memory for per-block reduction
+    extern __shared__ float shared_mem[];
+    float* s_sum = shared_mem;
+    float* s_sum_sq = shared_mem + blockDim.x;
+
+    int tid = threadIdx.x;
+
+    // Initialize shared memory
+    s_sum[tid] = 0.0f;
+    s_sum_sq[tid] = 0.0f;
+    __syncthreads();
+
+    // Load data into shared memory for reduction
+    for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+        int global_idx = sample_offset + idx;
+        float val = x[global_idx];
+        s_sum[tid] += val;
+        s_sum_sq[tid] += val * val;
+    }
+    __syncthreads();
+
+    // Perform reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Compute mean and inv_std
+    float mean, inv_std;
+    if (tid == 0) {
+        float sum = s_sum[0];
+        float sum_sq = s_sum_sq[0];
+        mean = sum / normalized_size;
+        float var = (sum_sq / normalized_size) - mean * mean;
+        inv_std = 1.0f / sqrtf(var + eps);
+
+        // Store mean and inv_std in shared memory for all threads
+        s_sum[0] = mean;
+        s_sum_sq[0] = inv_std;
+    }
+    __syncthreads();
+
+    mean = s_sum[0];
+    inv_std = s_sum_sq[0];
+
+    // Now process each element for normalization
+    for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+        int global_idx = sample_offset + idx;
+        // Compute indices f, d1, d2
+        int f = idx / (dim1 * dim2);
+        int rem = idx % (dim1 * dim2);
+        int d1_idx = rem / dim2;
+        int d2_idx = rem % dim2;
+
+        // Compute weight/bias index
+        int wb_idx = f * dim1 * dim2 + d1_idx * dim2 + d2_idx;
+
+        float gamma = weight[wb_idx];
+        float beta = bias[wb_idx];
+        float val = x[global_idx];
+        out[global_idx] = (val - mean) * inv_std * gamma + beta;
+    }
+}
+
+torch::Tensor custom_layernorm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(weight);
+    CHECK_INPUT(bias);
+
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    int dim1 = x.size(2);
+    int dim2 = x.size(3);
+    int normalized_size = features * dim1 * dim2;
+
+    auto out = torch::empty_like(x);
+
+    int block_size = 256;
+    int shared_size = 2 * block_size * sizeof(float);
+
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+    layernorm_kernel<<<grid, block, shared_size>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        eps,
+        out.data_ptr<float>(),
+        batch_size,
+        features,
+        dim1,
+        dim2
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
+    }
+
+    return out;
+}
+"""
+
+# Define the headers and functions
+cuda_include = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+"""
+
+cuda_functions = ["custom_layernorm_cuda"]
+
+# Load the CUDA extension
+custom_layernorm = load_inline(
+    name="custom_layernorm",
+    cpp_sources=[cuda_include],
+    cuda_sources=layernorm_source,
+    functions=cuda_functions,
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, normalized_shape: tuple):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = 1e-5  # default value same as PyTorch's LayerNorm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_layernorm.custom_layernorm_cuda(x, self.weight, self.bias, self.eps)
+
+Wait, but in the code above, the 'cuda_include' part may not be necessary. The layernorm_source already includes the necessary headers. Perhaps the cpp_sources should be empty, or the headers are included in the source code.
+
+Wait, in the load_inline function, the cuda_sources is the source code for the CUDA kernel, which already includes the necessary headers. So the cpp_sources can be an empty string.
+
+Wait, the example given in the problem's example uses:
+
+elementwise_add_cpp_source = "torch::Tensor elementwise_add_cuda(torch::Tensor a, torch::Tensor b);"
+
+and then:
+
+elementwise_add = load_inline(
+    name="elementwise_add",
+    cpp_sources=elementwise_add_cpp_source,
+    cuda_sources=elementwise_add_source,
+    functions=["elementwise_add_cuda"],
+    ...
+)
+
+Therefore, in our case, the cpp_sources should contain the declaration of the custom_layernorm_cuda function, and the cuda_sources contains the implementation.
+
+Therefore, the code should be adjusted to have separate cpp and cuda sources.
+
+Let me restructure the code:
+
+First, the CUDA source (kernel and function definitions):
+
+layernorm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// The kernel code as above ...
+"""
+
+The cpp header declarations:
+
+layernorm_cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor custom_layernorm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps);
+"""
+
+Wait, but the actual code for the custom_layernorm_cuda function is in the CUDA source, so the cpp source only needs the declaration.
+
+Therefore, the code would be structured as:
+
+layernorm_cpp_source = """
+#include <torch/extension.h>
+torch::Tensor custom_layernorm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps);
+"""
+
+layernorm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// The kernel code and the implementation of custom_layernorm_cuda function.
+"""
+
+Wait, but in the previous code, the implementation of custom_layernorm_cuda is in the CUDA source. So the CUDA code includes all the necessary code, including the function definitions.
+
+Wait, in the previous layernorm_source code, the function custom_layernorm_cuda is implemented in the CUDA source. But in PyTorch, CUDA functions must be declared in the .cu file and their declarations must be present in the C++ headers.
+
+Hmm, perhaps the function must be declared in the cpp_sources. Let me reorganize.
+
+The correct approach is:
+
+The CUDA source (layernorm_cuda_source) contains the __global__ kernel and the implementation of the custom_layernorm_cuda function.
+
+The C++ headers (cpp_sources) contain the declaration of the custom_layernorm_cuda function.
+
+Therefore, the code should be:
+
+layernorm_cpp_source = """
+#include <torch/extension.h>
+torch::Tensor custom_layernorm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps);
+"""
+
+layernorm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// The kernel and function definitions as before...
+"""
+
+Therefore, in the code above, the CUDA code's custom_layernorm_cuda is implemented in the CUDA source, and the declaration is in the C++ source.
+
+Now, putting it all together:
+
+The full Python code would be:
+
+import torch
+import torch.nn as nn
+
+from torch.utils.cpp_extension import load_inline
+
+# Define the C++ declarations
+layernorm_cpp_source = """
+#include <torch/extension.h>
+
+// Declaration of the custom CUDA function
+torch::Tensor custom_layernorm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps);
+"""
+
+# Define the CUDA kernel and implementation
+layernorm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define CHECK_CUDA(x) AT_ASSERTM(x.type().is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) AT_ASSERTM(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+
+__global__ void layernorm_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float eps,
+    float* __restrict__ out,
+    int batch_size,
+    int features,
+    int dim1,
+    int dim2) {
+
+    int sample_idx = blockIdx.x;
+    int normalized_size = features * dim1 * dim2;
+    int sample_offset = sample_idx * normalized_size;
+
+    extern __shared__ float shared_mem[];
+    float* s_sum = shared_mem;
+    float* s_sum_sq = shared_mem + blockDim.x;
+
+    int tid = threadIdx.x;
+
+    // Initialize shared memory
+    s_sum[tid] = 0.0f;
+    s_sum_sq[tid] = 0.0f;
+    __syncthreads();
+
+    // Load data into shared memory for reduction
+    for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+        int global_idx = sample_offset + idx;
+        float val = x[global_idx];
+        s_sum[tid] += val;
+        s_sum_sq[tid] += val * val;
+    }
+    __syncthreads();
+
+    // Perform reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Compute mean and inv_std
+    float mean, inv_std;
+    if (tid == 0) {
+        float sum = s_sum[0];
+        float sum_sq = s_sum_sq[0];
+        mean = sum / normalized_size;
+        float var = (sum_sq / normalized_size) - mean * mean;
+        inv_std = 1.0f / sqrtf(var + eps);
+
+        // Store in shared memory
+        s_sum[0] = mean;
+        s_sum_sq[0] = inv_std;
+    }
+    __syncthreads();
+
+    mean = s_sum[0];
+    inv_std = s_sum_sq[0];
+
+    // Normalize each element
+    for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+        int global_idx = sample_offset + idx;
+        // Compute indices
+        int f = idx / (dim1 * dim2);
+        int rem = idx % (dim1 * dim2);
+        int d1_idx = rem / dim2;
+        int d2_idx = rem % dim2;
+
+        // Compute weight/bias index
+        int wb_idx = f * dim1 * dim2 + d1_idx * dim2 + d2_idx;
+        float gamma = weight[wb_idx];
+        float beta = bias[wb_idx];
+
+        float val = x[global_idx];
+        out[global_idx] = (val - mean) * inv_std * gamma + beta;
+    }
+}
+
+torch::Tensor custom_layernorm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(weight);
+    CHECK_INPUT(bias);
+
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    int dim1 = x.size(2);
+    int dim2 = x.size(3);
+    int normalized_size = features * dim1 * dim2;
+
+    auto out = torch::empty_like(x);
+
+    int block_size = 256;
+    int shared_size = 2 * block_size * sizeof(float);
+
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+    layernorm_kernel<<<grid, block, shared_size>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        eps,
+        out.data_ptr<float>(),
+        batch_size,
+        features,
+        dim1,
+        dim2
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
+    }
+
+    return out;
+}
+"""
+
+# Load the CUDA extension
+custom_layernorm = load_inline(
+    name="custom_layernorm",
+    cpp_sources=[layernorm_cpp_source],
+    cuda_sources=[layernorm_cuda_source],
+    functions=["custom_layernorm_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, normalized_shape: tuple):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = 1e-5  # default value same as PyTorch's LayerNorm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_layernorm.custom_layernorm_cuda(x, self.weight, self.bias, self.eps)
+
+Wait, but in the original problem's example, the parameters are initialized in the __init__ of the model. The original code's Model has a LayerNorm layer with normalized_shape. The new ModelNew must have the same parameters. So when creating an instance of ModelNew, the normalized_shape is passed, and the weight and bias are initialized accordingly.
+
+Testing this code:
+
+Assuming the input is a tensor of shape (batch_size, features, dim1, dim2), which in the problem's example is (16, 64, 256, 256).
+
+The custom kernel should handle this.
+
+Now, potential issues:
+
+1. The weight and bias tensors must be of the same shape as normalized_shape (features, dim1, dim2). In the __init__ of ModelNew, they are initialized as torch.ones(normalized_shape), which is correct.
+
+2. The kernel must correctly compute the indices for gamma and beta. The calculation of f, d1_idx, d2_idx from idx must be correct.
+
+3. The shared memory allocation must be sufficient. With block_size 256, shared_size is 2 * 256 * 4 bytes = 2KB, which is acceptable.
+
+4. The kernel must be launched with the correct grid and block dimensions.
+
+Now, to ensure that the speedup is at least 1.2x, we need to test. However, since I can't run it here, I'll proceed with the code as written.
+
+Another possible optimization is to unroll loops or use vectorized operations, but that might complicate the code.
+
+Another point: the current code assumes that the input tensor is contiguous. The CHECK_CONTIGUOUS ensures this, and the function will throw an error otherwise. Since the input is generated by the get_inputs function which uses torch.rand, which returns contiguous tensors, this should be okay.
+
+Now, the final code is as above. I think this should work.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+
+from torch.utils.cpp_extension import load_inline
+
+# C++ declarations for the custom CUDA function
+layernorm_cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor custom_layernorm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps);
+"""
+
+# CUDA kernel and implementation
+layernorm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define CHECK_CUDA(x) AT_ASSERTM(x.type().is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CONTIGUOUS(x) AT_ASSERTM(x.is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
+
+__global__ void layernorm_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float eps,
+    float* __restrict__ out,
+    int batch_size,
+    int features,
+    int dim1,
+    int dim2) {
+
+    int sample_idx = blockIdx.x;
+    int normalized_size = features * dim1 * dim2;
+    int sample_offset = sample_idx * normalized_size;
+
+    extern __shared__ float shared_mem[];
+    float* s_sum = shared_mem;
+    float* s_sum_sq = shared_mem + blockDim.x;
+
+    int tid = threadIdx.x;
+
+    // Initialize shared memory
+    s_sum[tid] = 0.0f;
+    s_sum_sq[tid] = 0.0f;
+    __syncthreads();
+
+    // Load data into shared memory for reduction
+    for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+        int global_idx = sample_offset + idx;
+        float val = x[global_idx];
+        s_sum[tid] += val;
+        s_sum_sq[tid] += val * val;
+    }
+    __syncthreads();
+
+    // Perform reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Compute mean and inv_std
+    float mean, inv_std;
+    if (tid == 0) {
+        float sum = s_sum[0];
+        float sum_sq = s_sum_sq[0];
+        mean = sum / normalized_size;
+        float var = (sum_sq / normalized_size) - mean * mean;
+        inv_std = 1.0f / sqrtf(var + eps);
+
+        // Store in shared memory
+        s_sum[0] = mean;
+        s_sum_sq[0] = inv_std;
+    }
+    __syncthreads();
+
+    mean = s_sum[0];
+    inv_std = s_sum_sq[0];
+
+    // Normalize each element
+    for (int idx = tid; idx < normalized_size; idx += blockDim.x) {
+        int global_idx = sample_offset + idx;
+        int f = idx / (dim1 * dim2);
+        int rem = idx % (dim1 * dim2);
+        int d1_idx = rem / dim2;
+        int d2_idx = rem % dim2;
+        int wb_idx = f * dim1 * dim2 + d1_idx * dim2 + d2_idx;
+
+        float gamma = weight[wb_idx];
+        float beta = bias[wb_idx];
+        float val = x[global_idx];
+        out[global_idx] = (val - mean) * inv_std * gamma + beta;
+    }
+}
+
+torch::Tensor custom_layernorm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float eps) {
+    CHECK_INPUT(x);
+    CHECK_INPUT(weight);
+    CHECK_INPUT(bias);
+
+    int batch_size = x.size(0);
+    int features = x.size(1);
+    int dim1 = x.size(2);
+    int dim2 = x.size(3);
+    int normalized_size = features * dim1 * dim2;
+
+    auto out = torch::empty_like(x);
+
+    int block_size = 256;
+    int shared_size = 2 * block_size * sizeof(float);
+
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+    layernorm_kernel<<<grid, block, shared_size>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        eps,
+        out.data_ptr<float>(),
+        batch_size,
+        features,
+        dim1,
+        dim2
+    );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA error: " + std::string(cudaGetErrorString(err)));
+    }
+
+    return out;
+}
+"""
+
+# Load the custom CUDA extension
+custom_layernorm = load_inline(
+    name="custom_layernorm",
+    cpp_sources=[layernorm_cpp_source],
+    cuda_sources=[layernorm_cuda_source],
+    functions=["custom_layernorm_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, normalized_shape: tuple):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = 1e-5  # Default epsilon as in PyTorch's LayerNorm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return custom_layernorm.custom_layernorm_cuda(x, self.weight, self.bias, self.eps)
+```

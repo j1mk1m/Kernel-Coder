@@ -1,0 +1,143 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+transposed_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the transposed convolution kernel here
+"""
+
+transposed_conv_cpp_source = (
+    "torch::Tensor transposed_conv_cuda(torch::Tensor input, torch::Tensor weight, torch::optional<torch::Tensor> bias, int stride, int padding, int output_padding, int groups);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+transposed_conv = load_inline(
+    name="transposed_conv",
+    cpp_sources=transposed_conv_cpp_source,
+    cuda_sources=transposed_conv_source,
+    functions=["transposed_conv_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for global average pooling
+global_avg_pooling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the global average pooling kernel here
+"""
+
+global_avg_pooling_cpp_source = (
+    "torch::Tensor global_avg_pooling_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for global average pooling
+global_avg_pooling = load_inline(
+    name="global_avg_pooling",
+    cpp_sources=global_avg_pooling_cpp_source,
+    cuda_sources=global_avg_pooling_source,
+    functions=["global_avg_pooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for log-sum-exp
+log_sum_exp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the log-sum-exp kernel here
+"""
+
+log_sum_exp_cpp_source = (
+    "torch::Tensor log_sum_exp_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for log-sum-exp
+log_sum_exp = load_inline(
+    name="log_sum_exp",
+    cpp_sources=log_sum_exp_cpp_source,
+    cuda_sources=log_sum_exp_source,
+    functions=["log_sum_exp_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for sum
+sum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the sum kernel here
+"""
+
+sum_cpp_source = (
+    "torch::Tensor sum_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for sum
+sum_op = load_inline(
+    name="sum_op",
+    cpp_sources=sum_cpp_source,
+    cuda_sources=sum_source,
+    functions=["sum_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for multiplication
+multiplication_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Implement the multiplication kernel here
+"""
+
+multiplication_cpp_source = (
+    "torch::Tensor multiplication_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for multiplication
+multiplication = load_inline(
+    name="multiplication",
+    cpp_sources=multiplication_cpp_source,
+    cuda_sources=multiplication_source,
+    functions=["multiplication_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.transposed_conv = transposed_conv
+        self.global_avg_pooling = global_avg_pooling
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.log_sum_exp = log_sum_exp
+        self.sum_op = sum_op
+        self.multiplication = multiplication
+
+    def forward(self, x):
+        x = self.transposed_conv.transposed_conv_cuda(x, self.weight, self.bias, stride=1, padding=1, output_padding=0, groups=1)
+        x = self.global_avg_pooling.global_avg_pooling_cuda(x)
+        x = x + self.bias
+        x = self.log_sum_exp.log_sum_exp_cuda(x)
+        x = self.sum_op.sum_cuda(x)
+        x = self.multiplication.multiplication_cuda(x)
+        return x

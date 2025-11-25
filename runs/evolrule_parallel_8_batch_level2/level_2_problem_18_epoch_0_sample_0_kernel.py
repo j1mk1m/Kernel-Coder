@@ -1,0 +1,134 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for fused linear layer + sum + max + mean + logsumexp operations
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void fused_operations_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* output,
+    int batch_size,
+    int in_features,
+    int out_features
+) {
+    extern __shared__ float shared[];
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+
+    // Compute linear layer (matrix multiplication) in shared memory
+    float sum = 0.0;
+    for (int i = 0; i < in_features; ++i) {
+        sum += input[bid * in_features + i] * weight[i * out_features + tid];
+    }
+    sum += bias[tid]; // Add bias
+
+    // Reduce across features for sum, max, mean
+    __syncthreads();
+    shared[tid] = sum;
+    __syncthreads();
+
+    // Compute sum over all features (out_features dimension)
+    float total_sum = 0.0;
+    for (int i = 0; i < out_features; ++i) {
+        total_sum += shared[i];
+    }
+
+    // Compute max value across features
+    float max_val = -INFINITY;
+    for (int i = 0; i < out_features; ++i) {
+        if (shared[i] > max_val) {
+            max_val = shared[i];
+        }
+    }
+
+    // Compute mean (average)
+    float mean_val = total_sum / out_features;
+
+    // Compute log-sum-exp twice
+    float lse1 = -INFINITY;
+    for (int i = 0; i < out_features; ++i) {
+        lse1 = log(exp(max_val) + exp(lse1 - max_val)) + max_val;
+    }
+    float lse2 = -INFINITY;
+    for (int i = 0; i < out_features; ++i) {
+        lse2 = log(exp(mean_val) + exp(lse2 - mean_val)) + mean_val;
+    }
+
+    // Final output is lse2 (after two logsumexp operations)
+    output[bid] = lse2;
+}
+
+torch::Tensor fused_operations(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int batch_size,
+    int in_features,
+    int out_features
+) {
+    auto output = torch::empty({batch_size, 1}, input.options());
+    const int threads = out_features; // Each thread handles one output feature
+    const int blocks = batch_size;
+    size_t shared_mem = threads * sizeof(float); // Shared memory for intermediate storage
+
+    fused_operations_kernel<<<blocks, threads, shared_mem>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features
+    );
+
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+cpp_header = """
+torch::Tensor fused_operations(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int batch_size,
+    int in_features,
+    int out_features
+);
+"""
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=cpp_header,
+    cuda_sources=fused_ops_source,
+    functions=["fused_operations"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        self.fused_ops = fused_ops
+        # Initialize weights and bias similar to original Linear layer
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return self.fused_ops.fused_operations(
+            x,
+            self.weight.t().contiguous(),  # Transpose to match kernel expectations
+            self.bias,
+            x.size(0),
+            x.size(1),
+            self.bias.size(0)
+        ).view(-1, 1)

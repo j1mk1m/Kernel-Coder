@@ -1,0 +1,10 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Insert your code here
+
+class ModelNew(nn.Module):
+    # Your implementation here
+    pass

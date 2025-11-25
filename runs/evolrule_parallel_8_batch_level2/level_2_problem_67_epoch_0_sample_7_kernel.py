@@ -1,0 +1,1 @@
+# The use of dynamic shared memory allocation allows flexibility in block size selection for different input configurations.

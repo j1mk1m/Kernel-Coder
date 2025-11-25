@@ -1,0 +1,662 @@
+You can use the following example syntax for defining and compiling custom CUDA operators:
+
+elementwise_add = load_inline(name="elementwise_add", cuda_sources=... , functions=["elementwise_add_cuda"], ...)
+The code I will provide will include all necessary imports and define a ModelNew class with custom CUDA kernels for the operations in the original Model. The kernels will be fused where possible (e.g., combining matmul + subtraction + multiplication + ReLU into a single kernel) to minimize memory transfers and maximize parallelism. 
+
+First, I'll analyze the operations in the Model's forward pass:
+
+1. **Linear Layer (matmul + bias addition)**: The linear layer's output is x = weight @ input + bias. Wait, but the original code shows `x = self.linear(x)`, which includes the bias. However, in the subsequent steps, the model subtracts a value and multiplies by another. 
+
+Wait, looking at the original model's forward function:
+
+    def forward(self, x):
+        x = self.linear(x)  # computes matmul + bias
+        x = x - self.subtract_value
+        x = x * self.multiply_value
+        x = torch.relu(x)
+        return x
+
+So the sequence is: matmul with bias (from the linear layer), then element-wise subtract a scalar, then multiply by a scalar, then ReLU.
+
+To optimize, we can fuse these operations into a single CUDA kernel. Let's see:
+
+The steps after the linear layer:
+
+x = ( (linear(x) ) - subtract_value ) * multiply_value 
+
+Wait, actually:
+
+The sequence is:
+
+1. linear(x) = Wx + b
+
+2. subtract subtract_value: (Wx + b) - s
+
+3. multiply multiply_value: ( (Wx + b) - s ) * m
+
+4. apply ReLU: max(0, ( (Wx + b) - s ) * m )
+
+This entire sequence can be expressed as:
+
+output[i,j] = max( 0, ( (W[i,k] * x[k] + b[i]) - s ) * m )
+
+We can compute this in a single kernel, which will save time by avoiding intermediate memory writes and reads. 
+
+Therefore, the plan is to replace the entire sequence (linear + subtraction + multiplication + ReLU) with a custom fused CUDA kernel.
+
+Additionally, the linear layer's computation (matrix multiplication plus bias addition) is already part of the kernel. Since PyTorch's linear layer is already optimized, but fusing with the subsequent element-wise operations can still provide benefits.
+
+First, let's outline the fused kernel.
+
+The kernel will take:
+
+- Input tensor x (shape batch_size x in_features)
+- Weight matrix (out_features x in_features) [since linear layer in PyTorch is (in, out) or (out, in)? Wait, actually in PyTorch's Linear layer, the weight is of shape (out_features, in_features). Because the formula is y = x * weight^T + bias. Wait no: PyTorch's Linear layer is defined as:
+
+The formula is: out = input * weight^T + bias, where weight has shape (out_features, in_features). Therefore, for a batch input of size (batch, in_features), the matmul is:
+
+output = (input) @ (weight.T) + bias 
+
+Wait, let me confirm:
+
+PyTorch's Linear layer has the formula:
+
+y = x @ W^T + b, where W has shape (out_features, in_features). 
+
+Therefore, the matrix multiplication is between the input (batch, in_features) and the weight matrix's transpose (in_features, out_features), resulting in (batch, out_features). Then add the bias (size (out_features,)).
+
+Therefore, in the fused kernel, the steps would be:
+
+For each element in the output (each batch element, and each output feature):
+
+output[b][i] = max(0, ( (sum_{k} W[i][k] * x[b][k]) + b[i] - s ) * m )
+
+Therefore, the kernel can be structured as follows:
+
+Loop over all output elements (each batch and each output feature) in parallel.
+
+Each thread can handle one output element (i.e., for a given batch and output feature index). 
+
+The steps for each thread (for a particular b, i):
+
+1. Compute the dot product of weight[i] (row i of the weight matrix) and input[b].
+
+2. Add the bias[i].
+
+3. Subtract the subtract_value (a scalar).
+
+4. Multiply by multiply_value (a scalar).
+
+5. Apply ReLU (set to 0 if negative).
+
+6. Store the result in the output tensor.
+
+But this approach may have high memory access costs, because for each output element (i), we need to read all in_features elements of the input and the corresponding weight row. 
+
+However, since in_features is 8192, which is a large number, this would be computationally intensive. 
+
+Alternatively, perhaps it's better to structure the kernel in a way that processes input rows and weight columns in a tiled manner, but this might complicate things. Alternatively, given that the original linear layer's matmul is already a big operation, fusing with the subsequent operations may still be beneficial even if the matmul is done in a straightforward way.
+
+But given the problem statement, the user wants us to replace the operators. The original code has a linear layer, then element-wise sub, then element-wise mul, then ReLU. 
+
+Therefore, to optimize, we can replace the entire sequence (linear + subtract + multiply + ReLU) with a single custom CUDA kernel. 
+
+This way, we eliminate multiple memory copies and element-wise operations. 
+
+The custom kernel will take as input:
+
+- Input tensor (batch_size x in_features)
+
+- Weight tensor (out_features x in_features)
+
+- Bias tensor (out_features)
+
+- Subtract value (scalar)
+
+- Multiply value (scalar)
+
+And output the result after all operations.
+
+The kernel will compute for each element in the output:
+
+out[b][i] = max(0, ( (weight[i] · input[b] + bias[i]) - subtract_value ) * multiply_value )
+
+Now, to implement this in CUDA:
+
+First, note that the weight matrix has shape (out_features, in_features). Each output element (for a given i) is the dot product of the i-th row of the weight and the input vector, plus bias[i], then the operations. 
+
+Therefore, the kernel can be structured with threads and blocks as follows:
+
+We can have a grid of blocks, where each block processes a batch element. Alternatively, since the batch size is 1024, which is manageable, but perhaps better to process all batch elements in parallel.
+
+Alternatively, structure the grid to process each output element in parallel. Since the total number of output elements is batch_size * out_features = 1024 * 8192 = ~8 million, which is manageable on a GPU. 
+
+Each thread can handle one output element (i.e., for a particular batch index and output feature index). 
+
+The kernel will have:
+
+For a given thread index, compute the batch index and output feature index:
+
+Let total_output_elements = batch_size * out_features
+
+thread_id = blockIdx.x * blockDim.x + threadIdx.x
+
+if thread_id < total_output_elements:
+
+    b = thread_id // out_features
+
+    i = thread_id % out_features
+
+Then compute the value for output[b][i].
+
+The steps for each thread:
+
+1. Compute the dot product of weight[i] (the i-th row) and input[b].
+
+The dot product requires iterating over all in_features elements (8192 elements). This loop is over k in 0..in_features-1:
+
+sum = 0.0
+
+for k in 0..in_features-1:
+
+    sum += weight[i][k] * input[b][k]
+
+2. Add the bias[i].
+
+sum += bias[i]
+
+3. Subtract the subtract_value: sum -= s
+
+4. Multiply by multiply_value: sum *= m
+
+5. Apply ReLU: sum = max(0, sum)
+
+6. Store the result in output[b][i]
+
+However, this approach requires each thread to loop over all in_features elements (8192), which could be slow because of the loop. For 8 million threads each doing 8192 iterations, that's 66 billion operations. However, matrix multiplication is O(N^3), so maybe this is too slow. 
+
+Wait, perhaps the original approach (using the built-in matmul) is better optimized for the matrix multiplication part. 
+
+Alternatively, maybe it's better to first compute the linear layer's output using the standard method (e.g., using cuBLAS) and then perform the element-wise operations in a fused kernel. However, the problem allows replacing any operators, so perhaps fusing all steps except the matmul might also be an option, but the user wants to get speedups, so we need to see what is faster.
+
+Alternatively, perhaps the element-wise operations (subtract, multiply, ReLU) can be fused into a single kernel, while leaving the linear layer as is. 
+
+Wait, let's think about the computational costs:
+
+The linear layer (matmul + bias) is O(batch_size * out_features * in_features) = 1024 * 8192 * 8192 = huge number, but matrix multiplication is done efficiently via BLAS. 
+
+The element-wise operations (subtract, multiply, ReLU) are O(batch_size * out_features) each, which is 1024 * 8192 = ~8 million operations. These are very fast on a GPU. 
+
+Therefore, the majority of computation is in the matrix multiplication. Thus, the element-wise operations are relatively cheap. 
+
+Hence, maybe the best optimization is to leave the linear layer as is, but fuse the element-wise operations (subtract, multiply, ReLU) into a single kernel. 
+
+This would reduce the number of memory copies between operations (since each element-wise operation is a separate kernel launch, and fusing them would save kernel launch overhead). 
+
+So, let's consider two options:
+
+Option 1: Fusing all four operations (linear + subtract + multiply + ReLU) into a single kernel. 
+
+However, this would require implementing a custom matrix multiplication with bias addition, which may not be as efficient as cuBLAS. 
+
+Option 2: Keep the linear layer (using PyTorch's optimized implementation) and fuse the subsequent element-wise operations (subtract, multiply, ReLU) into a single kernel. 
+
+This is likely better because the element-wise operations are small compared to the matmul, but fusing them can save kernel launches and memory copies. 
+
+Let's proceed with Option 2.
+
+So the plan is to replace the three element-wise operations (subtract, multiply, ReLU) with a single custom CUDA kernel. 
+
+The kernel would take as input:
+
+- The output of the linear layer (a tensor of shape batch_size x out_features)
+
+- The subtract_value (a scalar)
+
+- The multiply_value (a scalar)
+
+And return the result after applying (x - s) * m and then ReLU.
+
+The kernel can be written as:
+
+for each element in the input tensor:
+
+output[i] = max(0.0, (input[i] - s) * m)
+
+This is an element-wise operation, so it's straightforward to parallelize.
+
+The CUDA kernel would:
+
+- Iterate over each element (in parallel)
+
+- Perform the computation
+
+This is very efficient. 
+
+Therefore, the steps would be:
+
+In the forward pass of ModelNew:
+
+1. Compute the linear layer using PyTorch's optimized Linear layer (since we can't replace it unless we implement a custom matmul + bias kernel, which may not be better than PyTorch's).
+
+2. Then, apply the fused element-wise operations (subtract, multiply, ReLU) via a custom CUDA kernel.
+
+Thus, the custom kernel can be implemented as follows.
+
+Now, the code structure:
+
+First, define the fused kernel for (x - s) * m and ReLU.
+
+Let me write the CUDA code for this.
+
+The kernel would be something like:
+
+__global__ void fused_elementwise_kernel(
+    const float* input,
+    float subtract_val,
+    float multiply_val,
+    float* output,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = input[idx];
+        val -= subtract_val;
+        val *= multiply_value;
+        output[idx] = max(val, 0.0f);
+    }
+}
+
+Then, the host function would set up the kernel launch.
+
+Wait, but in the ModelNew class, the subtract_value and multiply_value are parameters (as in the original model). However, in the original code, they are passed during initialization. 
+
+Wait, looking at the original Model's __init__:
+
+def __init__(self, in_features, out_features, subtract_value, multiply_value):
+    super().__init__()
+    self.linear = nn.Linear(in_features, out_features)
+    self.subtract_value = subtract_value
+    self.multiply_value = multiply_value
+
+So in the new model, we can keep these as attributes and pass them to the kernel.
+
+Therefore, the kernel can take the subtract_value and multiply_value as parameters.
+
+Now, in the code:
+
+We can write the kernel as follows.
+
+First, the CUDA source code:
+
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* input,
+    const float subtract_val,
+    const float multiply_val,
+    float* output,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = input[idx];
+        val -= subtract_val;
+        val *= multiply_val;
+        output[idx] = max(val, 0.0f);
+    }
+}
+
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    float subtract_val,
+    float multiply_val
+) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_elementwise_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        subtract_val,
+        multiply_val,
+        output.data_ptr<float>(),
+        size
+    );
+
+    return output;
+}
+"""
+
+Then, the corresponding header and loading:
+
+fused_elementwise_cpp_source = """
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    float subtract_val,
+    float multiply_val
+);
+"""
+
+Then, compile it:
+
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, subtract_value, multiply_value):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.subtract_value = subtract_value
+        self.multiply_value = multiply_value
+        self.fused_elementwise = fused_elementwise  # the loaded module
+
+    def forward(self, x):
+        x = self.linear(x)  # standard linear layer
+        # apply fused element-wise operations
+        x = self.fused_elementwise.fused_elementwise_cuda(
+            x,
+            self.subtract_value,
+            self.multiply_value
+        )
+        return x
+
+Wait, but in PyTorch, the parameters (subtract_value and multiply_value) are scalars, not tensors, so they can be passed as float arguments to the CUDA kernel.
+
+This approach should work, and the fused_elementwise_cuda function takes the subtract and multiply values as floats.
+
+However, we need to make sure that the kernel is correctly passing these values. 
+
+Testing this code:
+
+The input to the kernel is a tensor, and the subtract and multiply values are scalars.
+
+The kernel's code should correctly read them.
+
+This should be correct.
+
+However, in the original Model, the subtract and multiply values are stored as attributes in the model. Therefore, in the new model, they are also stored as attributes, and passed to the kernel each time.
+
+Now, this approach fuses the three element-wise operations into a single kernel, which is better than three separate operations (each requiring a kernel launch and possibly some overhead). 
+
+This should provide a speedup. 
+
+Alternatively, we could also consider fusing the ReLU with the previous operations. However, ReLU is already part of the fused kernel above.
+
+Therefore, this seems like a good optimization.
+
+Additionally, we can check if the linear layer's bias addition can be fused with the subsequent operations. However, the linear layer's computation (weight * input + bias) is part of the Linear module, which is already optimized. Unless we can write a custom kernel that combines the linear layer's computation with the element-wise operations, but that might be more involved.
+
+Given the problem constraints, perhaps this is sufficient.
+
+Now, to write the full code:
+
+The original Model's parameters are in_features, out_features, subtract_value, multiply_value. 
+
+The new ModelNew will have the same parameters, and the custom fused_elementwise_cuda function.
+
+Therefore, putting it all together:
+
+The code would look like this:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused element-wise operations (subtract, multiply, ReLU)
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* input,
+    const float subtract_val,
+    const float multiply_val,
+    float* output,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = input[idx];
+        val -= subtract_val;
+        val *= multiply_val;
+        output[idx] = max(val, 0.0f);
+    }
+}
+
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    float subtract_val,
+    float multiply_val
+) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_elementwise_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        subtract_val,
+        multiply_val,
+        output.data_ptr<float>(),
+        size
+    );
+
+    return output;
+}
+"""
+
+fused_elementwise_cpp_source = """
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    float subtract_val,
+    float multiply_val
+);
+"""
+
+# Compile the fused element-wise kernel
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, subtract_value, multiply_value):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.subtract_value = subtract_value
+        self.multiply_value = multiply_value
+        self.fused_elementwise = fused_elementwise
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.fused_elementwise.fused_elementwise_cuda(
+            x,
+            self.subtract_value,
+            self.multiply_value
+        )
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+subtract_value = 2.0
+multiply_value = 1.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, subtract_value, multiply_value]
+```
+
+Wait, but in the get_inputs function, the original code had get_inputs() return a CPU tensor, but the ModelNew's forward function expects the input to be on the device where the model is. Since the kernel is CUDA, the input must be on the GPU. 
+
+In the original code, get_inputs() returns a tensor on CPU. But in the new code, since we're using CUDA kernels, the inputs need to be on CUDA. 
+
+Looking back at the original code's get_inputs() function:
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+But in the example given in the problem statement's first code (the simple addition model), the get_inputs() returns tensors on CUDA. 
+
+Therefore, in the optimized code, to ensure the inputs are on CUDA, we should modify the get_inputs() function to place tensors on CUDA.
+
+Hence, in the code above, the get_inputs() function is changed to:
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+Otherwise, if the model is on CUDA, passing CPU tensors would cause an error.
+
+Therefore, the code above is correct.
+
+Now, check if the kernel is properly written:
+
+The fused_elementwise_cuda function takes the input tensor, subtract_val and multiply_val, and returns the output tensor.
+
+The kernel loops over all elements, applies the operations, and uses max for ReLU.
+
+This should work.
+
+Another thing to check: the output tensor is initialized with empty_like(input), which is correct, and then filled in the kernel.
+
+Yes.
+
+Another point: the kernel's block and grid sizes are set to 256 threads per block, which is standard. 
+
+Potential optimizations for the kernel:
+
+- Using shared memory to handle larger blocks, but for simple element-wise operations, this is unnecessary.
+
+- The kernel is already optimal for element-wise operations.
+
+Therefore, this should be a valid and working code.
+
+Now, the question mentions that the original Model has a linear layer, subtract, multiply, ReLU. The optimized ModelNew replaces the subtract, multiply, and ReLU with a custom fused kernel, thus only changing those three operations. The linear layer remains as a standard PyTorch Linear layer, which is fine because it's already optimized.
+
+This approach should provide a speedup by reducing the number of CUDA kernel launches and memory copies between operations.
+
+Another consideration: the original code's subtract and multiply are element-wise operations, which are already vectorized in PyTorch, but combining them into a single kernel might still save some overhead from multiple kernel launches.
+
+Thus, the code provided above is correct and should work.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused element-wise operations (subtract, multiply, ReLU)
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* input,
+    const float subtract_val,
+    const float multiply_val,
+    float* output,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = input[idx];
+        val -= subtract_val;
+        val *= multiply_val;
+        output[idx] = max(val, 0.0f);
+    }
+}
+
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    float subtract_val,
+    float multiply_val
+) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_elementwise_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        subtract_val,
+        multiply_val,
+        output.data_ptr<float>(),
+        size
+    );
+
+    return output;
+}
+"""
+
+fused_elementwise_cpp_source = """
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor input,
+    float subtract_val,
+    float multiply_val
+);
+"""
+
+# Compile the fused element-wise kernel
+fused_elementwise = load_inline(
+    name="fused_elementwise",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, subtract_value, multiply_value):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.subtract_value = subtract_value
+        self.multiply_value = multiply_value
+        self.fused_elementwise = fused_elementwise
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.fused_elementwise.fused_elementwise_cuda(
+            x,
+            self.subtract_value,
+            self.multiply_value
+        )
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+subtract_value = 2.0
+multiply_value = 1.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, subtract_value, multiply_value]
+```

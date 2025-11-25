@@ -1,0 +1,44 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Your custom CUDA kernels go here
+custom_kernels_source = """
+
+"""
+
+custom_kernels_cpp_source = (
+    ""
+)
+
+# Compile the inline CUDA code for custom kernels
+custom_kernels = load_inline(
+    name="custom_kernels",
+    cpp_sources=custom_kernels_cpp_source,
+    cuda_sources=custom_kernels_source,
+    functions=[],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # Apply softmax using custom CUDA kernel
+        x = self.apply_softmax(x)
+        x = x + self.bias
+        x = x * self.scaling_factor
+        x = torch.sigmoid(x)
+        return x
+    
+    def apply_softmax(self, x):
+        # Implement softmax using custom CUDA kernel
+        pass

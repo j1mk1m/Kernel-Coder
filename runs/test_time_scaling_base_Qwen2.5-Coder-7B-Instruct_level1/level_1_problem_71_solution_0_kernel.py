@@ -1,0 +1,100 @@
+import torch
+import torch.nn as nn
+import torch.fft as fft
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed 2D convolution using FFT
+transposed_convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cufft.h>
+
+// Helper function to perform FFT on 2D data
+void fft_2d(cufftHandle plan, cufftComplex* data, int width, int height) {
+    cufftExecC2C(plan, data, data, CUFFT_FORWARD);
+}
+
+// Helper function to perform inverse FFT on 2D data
+void ifft_2d(cufftHandle plan, cufftComplex* data, int width, int height) {
+    cufftExecC2C(plan, data, data, CUFFT_INVERSE);
+}
+
+// Custom kernel for transposed 2D convolution using FFT
+__global__ void transposed_convolution_fft_kernel(const cufftComplex* input, const cufftComplex* weight, cufftComplex* output, int batch_size, int in_channels, int out_channels, int kernel_size, int height_in, int width_in, int height_out, int width_out) {
+    // Implementation of the transposed 2D convolution using FFT
+    // This is a placeholder and should be replaced with actual implementation
+}
+
+torch::Tensor transposed_convolution_fft_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto kernel_size = weight.size(2);
+    auto height_in = input.size(2);
+    auto width_in = input.size(3);
+    auto height_out = (height_in - 1) * stride + kernel_size - 2 * padding + 1;
+    auto width_out = (width_in - 1) * stride + kernel_size - 2 * padding + 1;
+
+    auto input_fft = torch::empty_like(input, dtype=torch.complex64);
+    auto weight_fft = torch::empty_like(weight, dtype=torch.complex64);
+    auto output_fft = torch::empty_like(output, dtype=torch.complex64);
+
+    cufftHandle plan_input, plan_weight, plan_output;
+    cufftPlan2d(&plan_input, height_in, width_in, CUFFT_Z2Z);
+    cufftPlan2d(&plan_weight, kernel_size, kernel_size, CUFFT_Z2Z);
+    cufftPlan2d(&plan_output, height_out, width_out, CUFFT_Z2Z);
+
+    fft_2d(plan_input, input_fft.data_ptr<cufftComplex>(), width_in, height_in);
+    fft_2d(plan_weight, weight_fft.data_ptr<cufftComplex>(), kernel_size, kernel_size);
+
+    transposed_convolution_fft_kernel<<<...>>>(input_fft.data_ptr<cufftComplex>(), weight_fft.data_ptr<cufftComplex>(), output_fft.data_ptr<cufftComplex>(), batch_size, in_channels, out_channels, kernel_size, height_in, width_in, height_out, width_out);
+
+    ifft_2d(plan_output, output_fft.data_ptr<cufftComplex>(), width_out, height_out);
+
+    cufftDestroy(plan_input);
+    cufftDestroy(plan_weight);
+    cufftDestroy(plan_output);
+
+    return output_fft.real();
+}
+"""
+
+transposed_convolution_cpp_source = (
+    "torch::Tensor transposed_convolution_fft_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for transposed 2D convolution using FFT
+transposed_convolution = load_inline(
+    name="transposed_convolution",
+    cpp_sources=transposed_convolution_cpp_source,
+    cuda_sources=transposed_convolution_source,
+    functions=["transposed_convolution_fft_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, output_padding: int = 0, groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.transposed_convolution_fft = transposed_convolution
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.transposed_convolution_fft.transposed_convolution_fft_cuda(x, self.weight)
+
+# Initialize weights
+in_channels = 32
+out_channels = 32
+kernel_size = 3
+weight = torch.randn(out_channels, in_channels, kernel_size, kernel_size).cuda()
+
+# Create instance of ModelNew
+model_new = ModelNew(in_channels, out_channels, kernel_size)
+
+# Get inputs
+inputs = get_inputs()
+
+# Forward pass
+output = model_new(inputs[0])
+print(output.shape)

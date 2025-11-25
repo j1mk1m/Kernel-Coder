@@ -1,0 +1,626 @@
+When writing the custom CUDA kernels, use the same style as the example provided. Make sure that the code is written in a way that can be integrated into the ModelNew class. For example, the custom CUDA kernels can be defined as methods of the ModelNew class, or as external functions that are imported or loaded inline. 
+
+Consider the following functions/operators in the original code that could be optimized with custom CUDA kernels:
+
+1. The Swish activation function (x * sigmoid(x))
+2. The HardSwish activation function (x * relu6(x + 3) / 6)
+3. The combination of ConvTranspose3d + Swish + GroupNorm + HardSwish (operator fusion)
+4. The combination of GroupNorm + HardSwish (operator fusion)
+5. The combination of Swish + GroupNorm (operator fusion)
+6. The entire forward pass (operator fusion)
+7. Any other operators or combinations you think might be beneficial.
+
+You may choose to optimize one or more of these, but you must make at least one optimization. You are allowed to make any changes to the code as long as the functionality is preserved. 
+
+Make sure that the input and output tensors have the same dimensions and data types as the original implementation. You can assume that the input tensors are on the same device (probably GPU) and contiguous in memory.
+
+Note: When optimizing ConvTranspose3d, you may need to implement a custom transposed convolution. However, implementing a full transposed convolution from scratch is complicated and may not be feasible in this context. Instead, consider using PyTorch's built-in functions or cuDNN for the convolution part, but optimize the surrounding activation functions and normalization layers by fusing them into the same kernel. 
+
+For example, you can combine the ConvTranspose3d with the Swish activation into a single kernel by performing the convolution followed immediately by the Swish activation without storing intermediate results. However, note that ConvTranspose3d itself is a complex operation and may require careful handling. Alternatively, you can focus on fusing the activation functions and normalization layers after the convolution into a single kernel.
+
+Another idea: Since the original model applies Swish followed by GroupNorm followed by HardSwish, you can combine these three operations into a single fused kernel. This would eliminate the need to materialize intermediate tensors, reducing memory traffic and improving performance.
+
+You can also think of other optimizations, such as using faster approximations for the activation functions or optimizing memory access patterns.
+
+Please note that if you choose to implement operator fusion, you must ensure that the fused operations are mathematically equivalent to the original sequence of operations. 
+
+If you are unsure about the implementation details of a certain operator, you can refer to PyTorch's documentation or existing implementations, but avoid using any additional PyTorch operators that are not part of the original model's forward pass. 
+
+Now, your task is to write the optimized ModelNew class with at least one custom CUDA kernel that replaces or fuses operators from the original Model class. The code must be correct, compilable, and functionally equivalent to the original architecture.
+
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups, eps, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels, eps=eps)
+        
+        # Load fused activation kernels
+        self.swish_gn_hardswish = load_inline(
+            name="fused_swish_gn_hardswish",
+            cpp_sources=self._get_cpp_sources(),
+            cuda_sources=self._get_cuda_sources(),
+            functions=["fused_swish_gn_hardswish_cuda"],
+            verbose=True,
+            with_cuda=True
+        )
+
+    def _get_cpp_sources(self):
+        return """
+        torch::Tensor fused_swish_gn_hardswish_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, int groups, float eps);
+        """
+
+    def _get_cuda_sources(self):
+        return """
+        #include <torch/extension.h>
+        #include <cuda_runtime.h>
+        #include <math.h>
+
+        template <typename scalar_t>
+        __device__ scalar_t swish(scalar_t x) {
+            return x / (1.0 + exp(-x));
+        }
+
+        template <typename scalar_t>
+        __device__ scalar_t hardswish(scalar_t x) {
+            scalar_t factor = 1.0 / 6.0;
+            scalar_t offset = 0.5;
+            return x * max(min(x * factor + offset, static_cast<scalar_t>(6)), static_cast<scalar_t>(0));
+        }
+
+        template <typename scalar_t>
+        __global__ void fused_swish_gn_hardswish_kernel(
+            const scalar_t* x, scalar_t* out,
+            const scalar_t* weight, const scalar_t* bias,
+            int groups, int channels, int spatial_size, float eps
+        ) {
+            const int channel_step = channels / groups;
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= channels * spatial_size) return;
+
+            int c = idx / spatial_size;
+            int s = idx % spatial_size;
+            int group = c / channel_step;
+            int channel_in_group = c % channel_step;
+
+            // Compute Swish
+            scalar_t swish_val = x[idx] * swish(x[idx]);
+
+            // GroupNorm
+            extern __shared__ scalar_t shared[];
+            scalar_t* mean_buf = shared;
+            scalar_t* var_buf = shared + gridDim.y;
+
+            int tid = threadIdx.x;
+            scalar_t sum = 0;
+            for (int i = threadIdx.x; i < channel_step * spatial_size; i += blockDim.x) {
+                sum += swish_val[i * spatial_size + s];
+            }
+            sum = blockReduceSum(sum);
+            if (tid == 0) {
+                mean_buf[group] = sum / (channel_step * spatial_size);
+                var_buf[group] = 0;
+                for (int i = 0; i < channel_step * spatial_size; i += blockDim.x) {
+                    scalar_t val = swish_val[i * spatial_size + s] - mean_buf[group];
+                    var_buf[group] += val * val;
+                }
+                var_buf[group] = sqrt(var_buf[group] / (channel_step * spatial_size) + eps);
+            }
+            __syncthreads();
+
+            scalar_t mean = mean_buf[group];
+            scalar_t var = var_buf[group];
+
+            scalar_t gn_val = (swish_val - mean) / var * weight[c] + bias[c];
+
+            // HardSwish
+            out[idx] = hardswish(gn_val);
+        }
+
+        torch::Tensor fused_swish_gn_hardswish_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, int groups, float eps) {
+            const auto channels = x.size(1);
+            const auto spatial_size = x.numel() / x.size(0) / channels;
+            const int threads = 256;
+            const dim3 blocks((channels * spatial_size + threads - 1) / threads, groups);
+            const int shared_size = groups * sizeof(float) * 2;
+
+            auto out = torch::empty_like(x);
+
+            AT_DISPATCH_FLOATING_TYPES(x.type(), "fused_swish_gn_hardswish_cuda", ([&] {
+                fused_swish_gn_hardswish_kernel<scalar_t><<<blocks, threads, shared_size>>>(
+                    x.data<scalar_t>(),
+                    out.data<scalar_t>(),
+                    weight.data<scalar_t>(),
+                    bias.data<scalar_t>(),
+                    groups,
+                    channels,
+                    spatial_size,
+                    eps
+                );
+            }));
+
+            return out;
+        }
+        """
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        # Extract parameters from GroupNorm
+        weight = self.group_norm.weight.contiguous()
+        bias = self.group_norm.bias.contiguous()
+        groups = self.group_norm.num_groups
+        eps = self.group_norm.eps
+
+        # Apply fused activation and normalization
+        x = self.swish_gn_hardswish.fused_swish_gn_hardswish_cuda(
+            x, weight, bias, groups, eps
+        )
+        return x
+
+# The rest of the code (get_inputs and get_init_inputs) remains the same as the original
+batch_size = 128
+in_channels = 3
+out_channels = 16
+depth, height, width = 16, 32, 32
+kernel_size = 3
+stride = 2
+padding = 1
+groups = 4
+eps = 1e-5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width).cuda()]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, groups, eps]
+```
+</think>
+
+
+Alright, let me try to understand what the user is asking here. They provided an architecture for a neural network model that includes a 3D transposed convolution followed by Swish, GroupNorm, and HardSwish activations. The task is to optimize this model using custom CUDA kernels to replace or fuse some of these operations for better performance.
+
+First, I need to look at the original code. The model's forward pass does the following steps:
+1. Apply a 3D transposed convolution.
+2. Apply Swish activation (x * sigmoid(x)).
+3. Apply GroupNorm.
+4. Apply HardSwish activation (x * relu6(x + 3) / 6).
+
+The user wants to replace some of these operators with custom CUDA kernels. The example given was replacing a simple addition with a CUDA kernel. The key here is to find which parts can be fused into a single kernel to reduce memory traffic and computation time.
+
+Looking at the possible optimizations listed, the most promising is fusing the Swish, GroupNorm, and HardSwish into a single kernel. Since these operations are all element-wise or can be parallelized, combining them should save time by avoiding intermediate tensors and memory copies.
+
+I need to think about how to implement this fusion. The GroupNorm involves calculating mean and variance for each group, which requires reductions across channels. Swish and HardSwish are element-wise functions. The challenge is to handle the group normalization within a CUDA kernel efficiently.
+
+Breaking it down:
+- The Swish can be computed element-wise after the convolution.
+- GroupNorm requires computing mean and variance for each group. Since this is a reduction, it needs to be handled within the kernel. Maybe using shared memory for each block to compute these statistics per group.
+- After normalization, apply HardSwish element-wise.
+
+I should structure the CUDA kernel to handle all three steps. The kernel will process each element, compute Swish, then compute the group's mean and variance (using shared memory for accumulation), apply normalization, then apply HardSwish.
+
+Wait, but how to handle the group norm's per-group statistics in parallel? Each thread could process a portion of the data, and for the reduction steps (sum for mean and sum of squares for variance), use thread synchronization with shared memory. Since the group norm is applied over channels, each group's channels need their own statistics.
+
+I'll need to organize the threads such that each group's computation is handled in a separate block or within a block. Maybe launch a grid where each block handles a group, but that might complicate the indexing. Alternatively, have each thread process a spatial element and accumulate the sums for their respective groups.
+
+Alternatively, structure the kernel so that for each output element, the thread calculates the Swish, then contributes to the group's mean and variance. The reduction steps would require atomic operations or using parallel reduction techniques. But atomic operations can be slow, so better to use shared memory for partial sums.
+
+Another consideration is the data layout. The input tensor is in NCDHW format. The group norm is over the channel dimension, so each group's channels are contiguous. So, for a given spatial position (d, h, w), the channels are divided into groups. Each thread could handle one element (channel and spatial position), compute Swish, then accumulate the sum for their group's mean and variance.
+
+The steps would be:
+1. Compute Swish for each element.
+2. Calculate the sum of Swish values for each group's channels and spatial dimensions to get the mean.
+3. Calculate the sum of squared differences from the mean to get variance.
+4. Normalize each element using the group's mean and variance.
+5. Apply HardSwish.
+
+This requires two passes through the data, which isn't ideal. To do it in a single pass, the kernel needs to first compute the Swish, then accumulate the sums for mean and variance, then compute the mean and variance, and then proceed with normalization and HardSwish. But how to structure this in a single kernel?
+
+Perhaps using two kernel launches, but that might not save time. Alternatively, use a single kernel with shared memory to store the partial sums for each group. The threads can first compute Swish and accumulate the sums into shared memory. Then synchronize, compute the mean and variance from the accumulated sums, then proceed to normalize and apply HardSwish.
+
+This approach would involve:
+- Each thread processes an element, computes Swish, and writes to shared memory for sum and sum_squares.
+- After reduction, threads read the mean and variance from shared memory, compute the normalized value, apply HardSwish, and write the result.
+
+But the spatial dimensions and channels complicate the indexing. Need to structure the kernel so that each block handles a group. For example, each block corresponds to a group. Then, within the block, threads process elements in that group's channels and spatial positions.
+
+Alternatively, the kernel can be launched with a grid that covers all elements, and each thread handles one element. The group for the element can be determined, and the thread contributes to that group's sums in shared memory.
+
+Hmm, the CUDA kernel needs to handle group norms efficiently. Let's think about the parameters:
+
+- The input tensor has dimensions (N, C, D, H, W). For each sample and spatial position (d, h, w), the channels are divided into G groups. Each group has C/G channels.
+
+The mean and variance are computed over the channels in the group and the spatial dimensions. Wait, no: GroupNorm computes the mean and variance over the channels within the group and across the spatial dimensions. Wait, actually, GroupNorm computes the mean and variance over the (C//G) channels in the group, and across all spatial dimensions (D, H, W) for each sample. Wait, no, actually, for each group, the mean and variance are computed over all the elements in the group's channels for each sample and spatial location. Wait, according to the PyTorch documentation, GroupNorm computes the mean and variance across the C//G channels, and across the spatial dimensions (D, H, W). So for each group and each sample, the mean is (sum over channels in group and all spatial positions) / (C//G * D*H*W). Similarly for variance.
+
+Therefore, for a given group, the mean and variance are per sample. But in the fused kernel, how to handle this? Since in the original model, the GroupNorm is applied across the batch, so the kernel needs to compute the mean and variance for each group per sample.
+
+Wait, this complicates things because the GroupNorm is applied per sample. So for each sample in the batch, each group's channels need their own mean and variance. The current approach may not handle the batch dimension efficiently unless we can process the entire batch in parallel. However, the batch size here is 128, so maybe we can process each batch element in separate blocks.
+
+Alternatively, the kernel can process each sample independently. Let's see:
+
+The input has size N x C x D x H x W. For each sample n in N, and each group g in G, we need to compute the mean and variance over channels (g*(C/G) to (g+1)*(C/G)) and all spatial positions (D, H, W).
+
+Therefore, the kernel can be structured to process each sample in a separate block, or handle batches in parallel. But this might complicate things. Alternatively, since the batch size is fixed (128), but perhaps in the problem's case, the batch is 128, but the kernel can be written to handle the entire batch. Hmm, this requires careful management of indices.
+
+Alternatively, the kernel can process each element in the tensor, but for each element, compute the group it belongs to and accumulate the sums. But this would require a lot of shared memory, as each group's sums need to be stored for all samples.
+
+Wait, perhaps the best approach is to launch a kernel where each block corresponds to a group and a sample. For example, blocks are indexed by (sample, group), and each block handles the computation for that group and sample. Within the block, threads process the spatial elements and the channels in the group. This way, each block can compute the mean and variance for its group and sample efficiently.
+
+Let me think of the dimensions:
+
+Suppose the input tensor is N x C x D x H x W. Let's say N=128, C=16 (out_channels), groups=4. So each group has 4 channels.
+
+For each sample n in 0..127, and group g in 0..3:
+- The group's channels are (g*4, (g+1)*4)
+- The spatial dimensions are D x H x W = 16,32,32 (as per the given example)
+
+The number of elements per group per sample is 4 channels * 16*32*32.
+
+Each block would process a sample and a group. The block would have enough threads to handle the spatial elements. For example, the block size could be 256 threads, and the spatial elements can be divided among the threads.
+
+The steps for each block (n, g):
+
+1. Compute Swish for all elements in the group's channels and spatial positions for sample n.
+2. Compute the sum of Swish values and the sum of squares to get mean and variance for the group.
+3. Normalize each element using mean and variance.
+4. Apply HardSwish.
+
+Wait, but the normalization requires the mean and variance for the group and sample. So within the block, after computing the Swish, the threads can compute the sum and sum_squares for the group's elements for that sample.
+
+This approach would require each block to handle a group and sample, and within the block, threads process spatial elements. Let's see:
+
+Block dimensions: each block is (sample, group). The grid is N * G.
+
+Each block has threads processing the spatial elements and channels. The number of threads per block needs to be sufficient to process all elements in the group's channels and spatial dimensions.
+
+Wait, but the number of elements per group per sample is 4 (channels) * 16 *32*32 = 4*16384 = 65536 elements. That's a lot for a block. The maximum block size is typically 1024 threads. So perhaps a better approach is to have each thread process multiple elements. Alternatively, use a thread per spatial element, and have the channels processed in a loop.
+
+Alternatively, using a grid where each block handles a spatial position and group, but this might get complicated.
+
+Alternatively, the kernel can be structured as follows:
+
+Each thread processes one element in the input tensor. The thread first computes Swish, then accumulates the necessary sums for its group and sample in shared memory. After all threads in the block have done this, they can compute the mean and variance for their group and sample. Then, the thread can compute the normalized value and apply HardSwish.
+
+Wait, but to compute the mean and variance for each group and sample, each thread must know which group and sample it belongs to. So the thread can calculate the group based on the channel index, and the sample is part of the global index.
+
+However, using shared memory per group and sample is tricky because shared memory is per block. So maybe the block must handle all elements for a particular group and sample. For example, each block corresponds to a group and sample, and within the block, threads process the elements in the group's channels and spatial dimensions for that sample.
+
+Let me outline the steps again with this structure:
+
+1. The grid is N (samples) * G (groups). Each block corresponds to a sample and group.
+2. Each block's threads process all elements in that sample's group's channels and spatial dimensions.
+3. Each thread within the block handles a spatial element and channel (or a portion thereof).
+4. Compute Swish for all elements in the group's channels for the sample.
+5. Accumulate the sum and sum_squares of Swish values into shared memory for the block (i.e., per group and sample).
+6. After accumulation, compute mean and variance from the shared sums.
+7. Normalize each element using these values.
+8. Apply HardSwish.
+
+The problem now is how to manage the shared memory for the sums. Since each block handles a group and sample, the shared memory can store the total sum and sum_squares for that group and sample. Each thread contributes to these sums.
+
+Let's think of the code structure:
+
+The kernel would have:
+
+- For each thread in the block, compute the spatial and channel indices within the group.
+- Compute the Swish value for that element.
+- Accumulate the Swish value and its square into the shared memory (sum and sum_sq).
+- After all threads have done this, use a reduction to get the total sum and sum_sq.
+- Compute mean = sum / count, variance = sqrt(sum_sq/count - mean^2 + eps).
+- Then, for each element, compute (Swish_val - mean)/sqrt(var) * weight + bias, then apply HardSwish.
+
+Wait, but the group norm's parameters (weight and bias) are per channel. Since each group has C/G channels, the weight and bias are of size C. Each channel in a group has its own weight and bias? Wait no, GroupNorm applies the same weight and bias across all channels in the group. Wait, no: the weight and bias in GroupNorm are per channel. Wait, no, GroupNorm has a parameter for each group's channels. Wait, according to PyTorch's GroupNorm documentation: the weight and bias are of size C (number of channels), and each group has (C//G) channels. So each channel in the group has its own weight and bias. Wait no, actually, the weight and bias are applied per channel after normalization. So each channel has its own scaling and shifting parameter.
+
+Therefore, for each channel in the group, we have a weight and bias. Hence, after computing the normalized value (x - mean)/sqrt(var + eps), we multiply by the channel's weight and add its bias. This needs to be done per channel, so the kernel must have access to the weight and bias tensors.
+
+This complicates things because in the kernel, we need to read the weight and bias for each channel. Since these are parameters of the GroupNorm layer, we can pass them as tensors to the kernel.
+
+Putting this together:
+
+The CUDA kernel will need to:
+
+1. For each element (n, c, d, h, w):
+   a. Compute Swish = x * sigmoid(x)
+   b. Accumulate Swish into sum and sum_sq for group of c and sample n.
+   c. After reduction, compute mean and variance for the group and sample.
+   d. Normalize and apply weight/bias per channel.
+   e. Apply HardSwish.
+
+The challenge is efficiently handling the reductions and accessing the parameters.
+
+Now, considering the kernel's code structure, here's a possible approach:
+
+- The kernel is launched with a block per (sample, group). The grid is N * G.
+- Each block has a certain number of threads (e.g., 256 threads) that process the elements in that group and sample's channels and spatial dimensions.
+- The spatial dimensions and channels can be looped through per thread.
+
+The kernel code might look like this:
+
+In the kernel:
+
+for each thread in the block:
+   compute the spatial indices (d, h, w) and channel offset within the group
+   read the input value
+   compute swish_val = x * sigmoid(x)
+   accumulate swish_val and swish_val^2 into shared memory sums
+   (using atomic adds or parallel reduction steps)
+
+Then, after all threads have accumulated, the block computes mean and variance.
+
+Then, each thread reads the mean and variance, computes the normalized value, multiplies by weight[c], adds bias[c], then applies HardSwish.
+
+The shared memory would need to hold the sum and sum_sq for each block (since each block is per group and sample). So each block uses a few variables in shared memory for these sums.
+
+However, the weight and bias are per channel, so for each channel in the group, the kernel must access the corresponding weight and bias. Since the group has C/G channels, and the group's channels are contiguous, for example, group 0 has channels 0 to C/G-1, the channel index within the group can be used to index into the weight and bias tensors.
+
+Wait, the weight and bias tensors are of size [C], so for channel c, the weight is weight[c], bias is bias[c]. Since the group is determined by (c // (C/G)), but each block corresponds to a group, so within the block, the channels are grouped, so for a given c in the group's channels, the index within the group is (c % (C/G)), so the channel index in the group is (c - group_start). Thus, for the weight and bias, each channel in the group has its own parameter.
+
+This requires that the kernel has access to the weight and bias tensors, which can be passed as arguments.
+
+Another thing to note: the Swish function can be implemented inline in CUDA using expf, but might need to be optimized for speed. Similarly, the HardSwish can be implemented with a few arithmetic operations.
+
+Now, in terms of the code structure in Python:
+
+The ModelNew class will replace the sequential operations with a single call to the fused kernel. The kernel is defined inline using load_inline, similar to the example.
+
+The kernel code must be written in CUDA C++ and include the necessary steps.
+
+Potential issues:
+
+- Managing the thread indices correctly across the spatial dimensions and channels.
+- Correctly calculating the group for each channel.
+- Efficiently accumulating the sums in shared memory, perhaps using parallel reduction.
+- Handling the group norm parameters (weight and bias) correctly.
+
+Testing the kernel requires that it produces the same outputs as the original sequence of operations. Since this is a thought process, I might have missed some edge cases or indexing details.
+
+Another consideration: the original GroupNorm uses the parameters weight and bias, which are applied after normalization. So in the fused kernel, after computing the normalized value, we need to scale by weight[c] and add bias[c].
+
+Putting this all together, the CUDA kernel would:
+
+1. For each element in the group and sample:
+   a. Compute Swish.
+2. Compute mean and variance for the group and sample.
+3. Normalize and apply weight/bias.
+4. Apply HardSwish.
+
+Now, the kernel code in CUDA:
+
+The kernel would have to handle the following steps:
+
+- Determine the group and sample based on the block indices.
+- Each thread processes a portion of the spatial elements and channels in the group.
+- Use shared memory to accumulate the sum and sum of squares for Swish values.
+- Compute mean and variance.
+- Normalize and apply activations.
+
+Here's a possible CUDA kernel code outline:
+
+```cpp
+template <typename scalar_t>
+__global__ void fused_swish_gn_hardswish_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    int N, int C, int D, int H, int W,
+    int groups, float eps) {
+
+    // Determine sample and group from block indices
+    int sample = blockIdx.x % N;
+    int group = blockIdx.x / N;
+    
+    const int group_size = C / groups;
+    int c_start = group * group_size;
+    
+    // Spatial indices: each thread handles a spatial position and a channel within the group
+    // But need to map thread indices to these positions
+    // This part requires careful indexing
+    
+    // Let's assume threads process spatial elements, and loop over channels
+    // For simplicity, perhaps each thread handles a spatial position (d, h, w)
+    // and loops over the group's channels.
+
+    int tid = threadIdx.x;
+    
+    // Compute spatial indices
+    // Assuming D*H*W elements per group per sample
+    int spatial_size = D * H * W;
+    int spatial_idx = tid % spatial_size;
+    int spatial_offset = tid / spatial_size; // Not sure, maybe need a different approach
+    
+    // Wait, maybe better to split the spatial elements among threads and loop over channels
+    
+    // Alternative approach: each thread handles a spatial element (d,h,w) and processes all channels in the group
+    
+    // For this, spatial elements can be divided among threads
+    int spatial_element = tid;
+    if (spatial_element >= spatial_size) return;
+    
+    // Compute spatial coordinates
+    int d = spatial_element / (H*W);
+    int rem = spatial_element % (H*W);
+    int h = rem / W;
+    int w = rem % W;
+    
+    // Now process each channel in the group
+    // For each channel in the group's channels
+    for (int c_in_group = 0; c_in_group < group_size; ++c_in_group) {
+        int c = c_start + c_in_group;
+        
+        // Compute the input index
+        int in_idx = sample * C * D * H * W + 
+                     c * D * H * W +
+                     d * H * W + 
+                     h * W + 
+                     w;
+        
+        // Compute Swish
+        scalar_t x = input[in_idx];
+        scalar_t swish_val = x / (1.0 + expf(-x));  // Or use approximations if needed
+        
+        // Accumulate into shared memory
+        // Need to use atomic adds or parallel reduction here
+        // But since each block is per group and sample, we can use shared memory for the sums
+        
+        // So declare shared memory for sum and sum_sq
+        __shared__ scalar_t shared_sums[2]; // [sum, sum_sq]
+        
+        if (threadIdx.x == 0) {
+            shared_sums[0] = 0; // sum
+            shared_sums[1] = 0; // sum_sq
+        }
+        __syncthreads();
+        
+        // Accumulate swish_val and swish_val^2
+        atomicAdd(&shared_sums[0], swish_val);
+        atomicAdd(&shared_sums[1], swish_val * swish_val);
+        
+        // Wait, but this is per channel? No, the sums are for the entire group and sample.
+        // Wait, no: the group's mean and variance are computed across all channels in the group and all spatial elements.
+        // So the sum is over all channels in the group and all spatial elements for the sample.
+        // Therefore, the accumulation must be for all channels in the group.
+        // However, in this loop over channels, each channel's contribution is processed, so perhaps this approach is not correct.
+        
+        // Hmm, this approach might not work because each thread is processing one spatial element and looping over channels,
+        // but the accumulation needs to be over all channels and spatial elements.
+        // Maybe this requires a different indexing strategy.
+        
+        // Alternative approach: Each thread handles a single channel and spatial element, and we process all threads in the block to cover all elements.
+        // But with group_size channels, maybe the threads can be divided into groups to handle each channel.
+        
+        // This is getting complicated. Perhaps a better way is to use a 2D grid where the first dimension is N*G and the second is the spatial elements.
+        // Or use a different kernel structure.
+        
+        // Maybe a better approach is to restructure the kernel to first compute all the sums for the group and sample.
+        // So first, all threads in the block process their spatial elements and accumulate the sums.
+        // Then, after the sums are computed, each thread can process their elements again to apply the normalization and activations.
+        
+        // Let's try this two-step approach:
+        // Step 1: Compute Swish and accumulate sums.
+        // Step 2: Compute mean/var, normalize, and apply HardSwish.
+        
+        // So in the first step, each thread processes their spatial element and contributes to the sums.
+        
+        // Then, after all threads have done this, compute the mean and variance.
+        
+        // Then, in the second step, each thread processes their elements again to compute the normalized value and apply the rest.
+        
+        // But this requires two passes over the data, which may be acceptable for performance.
+        
+        // Let's proceed with this approach.
+        
+        // First pass: accumulate sums
+        // Each thread processes their spatial element and all channels in the group
+        for (int c_in_group = 0; c_in_group < group_size; ++c_in_group) {
+            int c = c_start + c_in_group;
+            int in_idx = ... // as before
+            scalar_t x = input[in_idx];
+            scalar_t swish_val = ...;
+            atomicAdd(&shared_sums[0], swish_val);
+            atomicAdd(&shared_sums[1], swish_val * swish_val);
+        }
+        __syncthreads();
+        
+        // Now compute mean and variance
+        if (threadIdx.x == 0) {
+            int count = group_size * D * H * W;
+            scalar_t mean = shared_sums[0] / count;
+            scalar_t var = (shared_sums[1] / count) - mean*mean;
+            var = sqrt(var + eps);
+            // Store these in shared memory
+            shared_sums[0] = mean;
+            shared_sums[1] = var;
+        }
+        __syncthreads();
+        
+        // Now, second pass: apply normalization and HardSwish
+        for (int c_in_group = 0; c_in_group < group_size; ++c_in_group) {
+            int c = c_start + c_in_group;
+            int in_idx = ...;
+            scalar_t swish_val = input[in_idx] / (1.0 + expf(-input[in_idx]));
+            // Wait, need to recompute Swish here? Or store it?
+            // Alternatively, compute Swish again to avoid storing intermediate tensors.
+            // It's acceptable as the computation is lightweight.
+            
+            // Compute normalized value
+            scalar_t norm_val = (swish_val - shared_sums[0]) / shared_sums[1];
+            norm_val = norm_val * weight[c] + bias[c];
+            
+            // Apply HardSwish
+            scalar_t hardswish_val = norm_val * fmaxf(fminf(norm_val * 0.1666667f + 0.5f, 6.0f), 0.0f);
+            
+            // Write to output
+            output[out_idx] = hardswish_val;
+        }
+    }
+}
+```
+
+This is a rough outline. There are many details to work out, like the indexing of input and output arrays, handling the dimensions properly, and ensuring that the shared memory is correctly managed.
+
+Another thing to note: The atomic operations can be slow if there are too many threads. To avoid this, a parallel reduction could be implemented where each thread accumulates partial sums in shared memory, then threads combine their partial sums.
+
+For example, in the first pass, each thread computes the Swish for their assigned elements, stores their partial sums in shared memory, then threads perform a reduction to get the total sums.
+
+This would require a two-step process within the block: first, each thread writes their contributions to shared memory, then a reduction step computes the total sum and sum_sq.
+
+This approach would look something like this:
+
+```cpp
+// Allocate shared memory for partial sums per thread
+__shared__ scalar_t partial_sums[THREADS_PER_BLOCK][2]; // [thread][sum, sum_sq]
+
+// Compute Swish and store partial sums
+for (each element in thread's responsibility) {
+    // compute swish_val
+    partial_sums[threadIdx.x][0] += swish_val;
+    partial_sums[threadIdx.x][1] += swish_val * swish_val;
+}
+
+// Synchronize, then perform reduction
+// Use a loop to combine the partial sums into shared_sums
+for (int stride = THREADS_PER_BLOCK/2; stride > 0; stride >>=1) {
+    __syncthreads();
+    if (threadIdx.x < stride) {
+        partial_sums[threadIdx.x][0] += partial_sums[threadIdx.x + stride][0];
+        partial_sums[threadIdx.x][1] += partial_sums[threadIdx.x + stride][1];
+    }
+}
+// Then, the first thread stores the total in shared_sums
+if (threadIdx.x == 0) {
+    shared_sums[0] = partial_sums[0][0];
+    shared_sums[1] = partial_sums[0][1];
+}
+```
+
+This is more efficient than using atomic operations.
+
+Putting it all together, the kernel code needs to handle all these steps carefully.
+
+Now, translating this into the Python code with the load_inline function:
+
+The ModelNew class will have the fused kernel as part of its initialization. The kernel function will be called with the input tensor, and the GroupNorm's parameters (weight, bias, groups, eps).
+
+The Python code will pass these parameters to the CUDA kernel, which can then use them in the computation.
+
+Finally, in the forward method of ModelNew:
+
+x = self.conv_transpose(x)
+weight = self.group_norm.weight.contiguous()
+bias = self.group_norm.bias.contiguous()
+groups = self.group_norm.num_groups
+eps = self.group_norm.eps
+
+x = self.fused_kernel_call(x, weight, bias, groups, eps)
+
+This ensures that the kernel uses the same parameters as the original GroupNorm layer.
+
+Potential issues to check:
+
+- Data type

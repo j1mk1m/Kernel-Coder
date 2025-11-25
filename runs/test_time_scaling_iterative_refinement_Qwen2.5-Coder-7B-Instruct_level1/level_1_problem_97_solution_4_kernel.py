@@ -1,0 +1,107 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for scaled dot product attention
+scaled_dot_product_attention_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void scaled_dot_product_attention_kernel(const half* Q, const half* K, const half* V, half* out, int batch_size, int num_heads, int seq_len, int embed_dim) {
+    int head_idx = blockIdx.x;
+    int row_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    int col_idx = blockIdx.z * blockDim.y + threadIdx.y;
+
+    if (head_idx >= num_heads || row_idx >= seq_len || col_idx >= seq_len) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < embed_dim; ++i) {
+        sum += __hmul(Q[row_idx * embed_dim + i], K[col_idx * embed_dim + i]);
+    }
+
+    float scale = 1.0f / sqrt(embed_dim);
+    sum *= scale;
+
+    float max_val = -FLT_MAX;
+    for (int i = 0; i < seq_len; ++i) {
+        max_val = fmax(max_val, sum);
+    }
+
+    float exp_sum = 0.0f;
+    for (int i = 0; i < seq_len; ++i) {
+        exp_sum += exp(sum - max_val);
+    }
+
+    float prob = exp(sum - max_val) / exp_sum;
+
+    out[row_idx * seq_len + col_idx] = __hmul(V[col_idx * embed_dim + row_idx], prob);
+}
+
+torch::Tensor scaled_dot_product_attention_cuda(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+    auto batch_size = Q.size(0);
+    auto num_heads = Q.size(1);
+    auto seq_len = Q.size(2);
+    auto embed_dim = Q.size(3);
+
+    auto out = torch::zeros({batch_size, num_heads, seq_len, seq_len}, Q.options());
+
+    const int block_size_x = 16;
+    const int block_size_y = 16;
+    const int block_size_z = 1;
+
+    dim3 grid_size(num_heads, (seq_len + block_size_x - 1) / block_size_x, (seq_len + block_size_y - 1) / block_size_y);
+    dim3 block_size(block_size_x, block_size_y, block_size_z);
+
+    scaled_dot_product_attention_kernel<<<grid_size, block_size>>>(Q.data_ptr<half>(), K.data_ptr<half>(), V.data_ptr<half>(), out.data_ptr<half>(), batch_size, num_heads, seq_len, embed_dim);
+
+    return out;
+}
+"""
+
+scaled_dot_product_attention_cpp_source = (
+    "torch::Tensor scaled_dot_product_attention_cuda(torch::Tensor Q, torch::Tensor K, torch::Tensor V);"
+)
+
+# Compile the inline CUDA code for scaled dot product attention
+scaled_dot_product_attention = load_inline(
+    name="scaled_dot_product_attention",
+    cpp_sources=scaled_dot_product_attention_cpp_source,
+    cuda_sources=scaled_dot_product_attention_source,
+    functions=["scaled_dot_product_attention_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.scaled_dot_product_attention = scaled_dot_product_attention
+
+    def forward(self, Q, K, V):
+        return self.scaled_dot_product_attention.scaled_dot_product_attention_cuda(Q, K, V)
+
+
+# Test the model
+batch_size = 32
+num_heads = 32
+sequence_length = 512
+embedding_dimension = 1024
+
+Q = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+K = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+V = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+
+model = Model().to('cuda')
+model_new = ModelNew().to('cuda')
+
+out_ref = model(Q, K, V)
+out_new = model_new(Q, K, V)
+
+print("Reference output:", out_ref.shape)
+print("New output:", out_new.shape)
+assert torch.allclose(out_ref, out_new, rtol=1e-3, atol=1e-5)

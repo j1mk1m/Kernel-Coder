@@ -1,0 +1,745 @@
+You may need to create new custom CUDA operators for multiple operators. For example, replacing matmul with a custom implementation, combining matmul + swish into a single kernel, etc. 
+
+Make sure that the new ModelNew has the same interface and behavior as the original Model, so that it can be used as a drop-in replacement. The input and output tensors must be compatible. You must also reimplement get_inputs and get_init_inputs as per the original code.
+
+
+<think>
+Okay, I need to optimize the given PyTorch model using custom CUDA kernels. Let me look at the architecture first. The model does a linear layer (matmul), applies Swish, adds a bias, then applies GroupNorm. 
+
+Hmm, the goal is to replace some of these operations with custom CUDA kernels for speed. Let me think about which parts would benefit most. The matrix multiplication (from Linear layer) is a big candidate since it's a major computation. Also, combining operations like matmul + Swish might save time by reducing memory copies.
+
+Wait, the Swish activation is x * sigmoid(x). If I can combine the matmul and Swish into a single kernel, that could be efficient. Then, the bias addition is an element-wise add, maybe also combine that. But then there's the group norm, which is more complex. Maybe I can handle matmul + Swish + bias in one kernel, then leave group norm as is? Or maybe even combine more?
+
+Alternatively, since the group norm operates over channels grouped into num_groups, which is 64 here, maybe that can be optimized too. But group norm involves normalization over each group, which requires per-group mean and variance calculations. That might be more complex to implement, so perhaps starting with the earlier layers first.
+
+Let me start with the matmul part. The Linear layer in PyTorch is a dense matrix multiplication followed by adding a bias, but here the bias is added separately after Swish. Wait, in the original code, the Linear layer already has a bias parameter (unless we set bias=False, but in the given code, the Linear is initialized without specifying, so by default it includes a bias). Wait, no: looking at the code again, the model's __init__ has self.bias = nn.Parameter(...), which is a separate parameter added after the Swish activation. Oh, so the Linear layer here is without bias, because the bias is added later. Wait, no, the Linear layer's default is to have a bias. Let me check the parameters:
+
+Wait, the user's code defines the Linear layer as self.matmul = nn.Linear(in_features, out_features). The default for nn.Linear is bias=True, so that Linear layer includes its own bias. But then the code adds another bias term (self.bias) after Swish. Wait, that's conflicting. Wait the code says:
+
+def forward(self, x):
+    x = self.matmul(x)  # which includes its own bias
+    x = torch.sigmoid(x) * x  # Swish
+    x = x + self.bias   # adding another bias term
+    x = self.group_norm(x)
+    return x
+
+Wait, so the model has two biases: one from the Linear layer and another self.bias added after Swish. That might be a mistake? Or maybe intentional? The problem states that the optimized model must be a drop-in replacement, so we need to preserve the exact behavior. So I have to make sure that the custom kernels replicate all steps, including both biases. Wait, but perhaps the user made a mistake here, but since the question requires to keep the same behavior, I have to follow it as given.
+
+So the original model's forward path is: matmul (including its own bias) → swish → add self.bias → group norm.
+
+So to optimize, perhaps combine matmul (without bias?), but wait the original includes the Linear's bias. Wait no, the Linear layer includes its own bias by default. So the matmul kernel would need to include the weight multiplication plus its own bias, then add the self.bias after Swish. Wait, but in the original code, after Swish, they add self.bias. So the sequence is:
+
+y = Wx + Linear.bias → swish(y) → swish(y) + self.bias → group norm.
+
+Wait, but maybe the Linear's bias is redundant, but the problem says to keep the same behavior.
+
+Hmm, so when writing a custom matmul kernel, perhaps I can include the Linear's bias in the kernel, then the Swish, then add the self.bias. Alternatively, combine matmul + bias (from Linear) + Swish + add self.bias into a single kernel? That would be more efficient. Let me think:
+
+The original steps after matmul (including its bias) are:
+
+1. Apply Swish: y = x * sigmoid(x)
+2. Add self.bias: z = y + self.bias
+3. Then group norm.
+
+So combining matmul (with Linear's bias) and Swish and adding self.bias into a single kernel would save some time. Because the intermediate steps (storing y and then adding the bias) could be done in a single pass.
+
+Alternatively, perhaps matmul can be optimized with a custom kernel that also adds the Linear's bias, applies Swish, then adds the self.bias. That would be a single kernel for all those steps except group norm.
+
+But group norm is a bit more involved. Let's see. The group norm requires computing mean and variance for each group of channels. Since the group norm is after the Swish and bias addition, maybe combining those steps would be better. But group norm might be complex to implement in a fused kernel, so perhaps better to leave it as is.
+
+So first step: replace the matmul (with its bias) plus the Swish and the self.bias addition with a custom kernel. Let's see.
+
+First, the Linear layer's matmul: it's a dense matrix multiply of input x (shape [batch, in_features]) with weight (shape [out_features, in_features]), then add the bias (shape [out_features]). 
+
+Then, Swish applies element-wise x*sigmoid(x). Then add self.bias (shape [out_features]). 
+
+Wait, the self.bias is of shape (out_features,), so when adding to the output after Swish (which is [batch, out_features]), it's a broadcasted addition. So the Swish output plus self.bias is element-wise addition of the self.bias vector to each row of the tensor.
+
+So combining all these steps into a single kernel:
+
+Input: x (batch_size, in_features)
+Weights: self.matmul.weight (out_features, in_features)
+Linear bias: self.matmul.bias (out_features,)
+Self.bias (out_features,)
+
+The output after the kernel would be:
+
+matmul_result = x @ W^T + Linear.bias
+swish = matmul_result * sigmoid(matmul_result)
+output_before_gn = swish + self.bias
+
+So in a single kernel, compute all of that.
+
+Wait, but the weight matrix is stored as (out_features, in_features), so the matmul is x.matmul(W.t()), right? So in CUDA terms, each element of the output would be computed as a dot product.
+
+Alternatively, perhaps it's better to write a custom matmul with bias, then apply Swish and add self.bias in the same kernel.
+
+Alternatively, write a fused kernel that does the entire sequence.
+
+Yes, that's probably the way to go. Let's plan to create a custom CUDA kernel that takes x, the weight, linear.bias, and self.bias, and computes the entire sequence up to before group norm.
+
+Then, the group norm can be left as is, unless we can optimize it further.
+
+But group norm might not be worth the effort unless it's a significant portion of the time. Let's proceed with the first part.
+
+Now, to code this. The custom kernel would have to handle the matrix multiplication, add the linear's bias, apply Swish, add the self.bias, and return the result.
+
+So the kernel's inputs are:
+
+- Input tensor x (batch_size, in_features)
+- Weight tensor (out_features, in_features)
+- Linear bias (out_features,)
+- Self.bias (out_features,)
+
+The output is a tensor of shape (batch_size, out_features).
+
+The CUDA kernel needs to compute for each output element:
+
+For each batch element, for each output channel:
+
+out[b, c] = (sum_{i} x[b, i] * W[c, i]) + linear_bias[c]
+
+Then apply swish: out[b,c] = out[b,c] * sigmoid(out[b,c])
+
+Then add self.bias[c]: out[b,c] += self.bias[c]
+
+So the kernel can be structured as follows.
+
+The matrix multiplication part is the most compute-heavy. The rest are element-wise operations which are cheaper.
+
+So, let's write the CUDA kernel.
+
+The first step is to implement the matrix multiplication with the weight and bias, then the Swish and self.bias addition.
+
+Let me think about the kernel structure. Since the input is batched, and the output is per-element, we can process each element in parallel. Wait, but the matrix multiply requires a reduction over the in_features dimension. So for each output element (b, c), we need to compute the sum over i of x[b,i] * W[c,i].
+
+This is a typical GEMM (General Matrix-Matrix Multiply) operation, but since we're doing this in a custom kernel, perhaps we can optimize it for this specific case, especially considering the subsequent operations.
+
+However, implementing a custom GEMM might be complex, but perhaps using CUDA's built-in functions like cublas or thrust, but the user probably wants a pure CUDA kernel without relying on external libraries.
+
+Alternatively, proceed with a straightforward kernel, though it might not be as fast as optimized implementations. But since the problem allows any approach, let's proceed.
+
+The plan for the kernel:
+
+Each thread handles one output element (b, c). For each (b, c), compute the dot product between x's row and W's column c, then add linear's bias, then apply Swish and add self.bias.
+
+Wait, but this is O(in_features) per element, which for in_features=1024 would be expensive. For a batch size of 32768 and out_features=4096, the total number of elements is 32768 * 4096 ≈ 134 million, and each requires 1024 multiplications and adds. That's way too much. Wait, that can't be right. Wait, no, that approach would have each output element computed in a separate thread, but with O(in_features) operations per thread, leading to an O(N^3) time, which is not feasible.
+
+Wait, I see. The matrix multiplication is O(batch_size * out_features * in_features). So, the straightforward approach is not going to be efficient. Therefore, perhaps I need to implement a more optimized matrix multiplication kernel.
+
+Alternatively, use CUDA's matrix multiplication primitives. But since the user wants to write a custom kernel, perhaps we can structure the kernel in a way that handles tiles of the matrix, similar to how cuBLAS works, but that's complicated.
+
+Hmm, perhaps this is getting too complex, and maybe the initial approach of fusing the matmul with the subsequent operations isn't feasible unless we can find a better way to handle the matrix multiply.
+
+Alternatively, perhaps it's better to replace the matmul with a custom kernel that does the matrix multiplication, adds the linear's bias, then applies Swish and adds self.bias. But the matmul part must be efficient.
+
+Alternatively, maybe use PyTorch's existing matmul implementation but combine the Swish and bias additions into a single kernel. That way, the matmul is handled by PyTorch's optimized code, and the rest can be done in a custom kernel.
+
+Wait, that's a possibility. So, first compute the matmul with the linear layer (which includes its own bias), then apply Swish and add the self.bias. The Swish and the self.bias addition can be done in a single element-wise kernel, which is much simpler.
+
+Let me see. The steps would be:
+
+x = self.matmul(x) → which is the standard Linear layer, so the matmul and its bias are done by PyTorch's optimized code.
+
+Then, the next steps are:
+
+x = torch.sigmoid(x) * x → element-wise Swish.
+
+x = x + self.bias → element-wise addition (since self.bias is a 1D tensor, broadcasted).
+
+These two steps (Swish and bias addition) can be combined into a single kernel.
+
+So the custom kernel would take x (after matmul) and self.bias, and compute the Swish plus the bias.
+
+That's much simpler and more manageable. Let's see:
+
+The Swish + add bias can be done in a single element-wise kernel. Let's code that.
+
+The kernel would take input tensor (batch_size, out_features), self.bias (out_features), and output the result.
+
+The CUDA kernel for this would be:
+
+for each element i in the output:
+
+out[i] = (x[i] * sigmoid(x[i])) + bias[i]
+
+Wait, but the bias is of shape (out_features,), so for each row (batch element), the same bias is added. So for element (b, c), the self.bias[c] is added. So in the kernel, the bias is a 1D tensor, so we can index by the column index.
+
+Thus, the kernel can be written as an element-wise operation over all elements of the tensor, using the column index to fetch the corresponding bias value.
+
+That's straightforward. Let's proceed with this approach. 
+
+So, first, keep the matmul as the Linear layer (since it's optimized), then combine Swish and bias addition into a custom kernel. Then, leave the group norm as is.
+
+Alternatively, maybe even the Swish can be optimized further, but combining with the bias addition is better.
+
+Another point: The Swish activation is x * sigmoid(x). The sigmoid is 1/(1+exp(-x)). Computing this in a CUDA kernel is feasible.
+
+Now, let's code that.
+
+The custom kernel would be an element-wise kernel that takes the input after the linear layer (so size [batch, out_features]), and the self.bias (size [out_features]), and returns the result after Swish and adding self.bias.
+
+Wait, but the self.bias is part of the model's parameters, so in the model's forward function, we need to pass it into the kernel. Since in PyTorch, when using custom extensions, the parameters can be passed as tensors.
+
+Therefore, the model's forward would be:
+
+def forward(self, x):
+    x = self.linear(x)
+    x = self.custom_swish_add(x, self.bias)
+    x = self.group_norm(x)
+    return x
+
+Thus, the custom_swish_add kernel would take x and bias as inputs, perform element-wise operations.
+
+Now, implementing that kernel:
+
+The CUDA code would be:
+
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void swish_add_kernel(const float* x, const float* bias, float* out, int batch_size, int out_features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * out_features) {
+        int c = idx % out_features;  // column index
+        float val = x[idx];
+        float sig_val = 1.0f / (1.0f + expf(-val));
+        out[idx] = val * sig_val + bias[c];
+    }
+}
+
+Then, the wrapper function in the extension:
+
+torch::Tensor swish_add_cuda(torch::Tensor x, torch::Tensor bias) {
+    int batch_size = x.size(0);
+    int out_features = x.size(1);
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+    const int num_elements = batch_size * out_features;
+    const int num_blocks = (num_elements + block_size - 1) / block_size;
+
+    swish_add_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), batch_size, out_features);
+    return out;
+}
+
+This should work. Then, in the model, replace the Swish and add with this kernel.
+
+Additionally, perhaps the group_norm can be optimized. The group norm involves computing mean and variance over each group of channels. Let me see.
+
+The group norm has num_groups=64, out_features=4096. So each group has 4096/64 = 64 channels.
+
+The computation for each group is: for each group, compute mean and variance over the channels in the group, then normalize each element.
+
+The formula is:
+
+y = (x - E[x]) / sqrt(Var[x] + eps) * gamma + beta
+
+But in PyTorch's GroupNorm, the gamma and beta are learnable parameters. However, in the original model, the GroupNorm is initialized without any affine parameters (since the default is affine=True, but the user didn't specify parameters). Wait, looking at the code: the model initializes self.group_norm = nn.GroupNorm(num_groups, out_features). The default for GroupNorm is affine=True, so it includes learnable scale and bias parameters (gamma and beta). Therefore, the group norm includes scaling and shifting.
+
+Implementing group norm in a custom kernel would be more complex. The steps are:
+
+For each group:
+
+- Compute mean and variance over the channels in the group for each sample.
+
+- Normalize each element by (x - mean)/sqrt(var + eps)
+
+- Multiply by gamma and add beta.
+
+This requires per-group computations, which can be parallelized per group and per sample.
+
+However, given that the group norm is a standard layer, perhaps it's better to leave it as the PyTorch implementation unless it's a major bottleneck. Let's see the dimensions: group norm over 4096 channels in 64 groups (so 64 channels per group).
+
+The input is [32768, 4096]. The computation for each group's mean and variance over the 64 channels for each of the 32768 samples. 
+
+The mean and variance computation is O(batch_size * channels_per_group) for each group. For 64 groups, it's manageable, but still, a custom implementation might be possible.
+
+Alternatively, maybe the current approach of optimizing the Swish + bias addition is sufficient for a speedup.
+
+So proceeding with the first optimization step: replacing the Swish + bias addition with a custom kernel.
+
+Now, let's also check if the matmul can be optimized. The Linear layer's matmul is a dense matrix multiply. The default implementation in PyTorch is already highly optimized using cuBLAS, so replacing that might not give a significant gain unless we can fuse it with subsequent steps.
+
+Alternatively, perhaps fusing the Linear's matmul + bias with the Swish + self.bias addition into a single kernel would be better. But the matrix multiply is the big one. Let's consider that.
+
+If I can write a custom kernel that does the entire sequence (matmul + linear.bias, then Swish and add self.bias), then the intermediate steps are avoided. Let's see:
+
+The kernel would take:
+
+- Input x (batch_size, in_features)
+- Weight (out_features, in_features)
+- Linear bias (out_features,)
+- Self.bias (out_features,)
+
+The output is (batch_size, out_features).
+
+The kernel must compute for each output element (b, c):
+
+output[b,c] = (W[c,:] · x[b,:] + linear_bias[c]) * sigmoid(...) + self.bias[c]
+
+Wait, the Swish is (W·x + lin_bias) * sigmoid(W·x + lin_bias) + self.bias.
+
+Wait, the Swish is applied to the linear result (Wx + lin_bias), then add self.bias.
+
+So the formula is:
+
+temp = Wx + lin_bias
+
+swish_temp = temp * sigmoid(temp)
+
+output = swish_temp + self.bias
+
+Therefore, the entire computation can be done in a single kernel that does the matrix multiply plus the activations and bias additions.
+
+The problem is efficiently computing the matrix multiply part.
+
+To compute W · x for each output element, each thread would need to process one output element (b, c) and compute the dot product over in_features elements.
+
+The in_features is 1024, which is a lot for each thread. So a naive approach would be too slow. Therefore, to do this efficiently, we need to structure the kernel in a way that uses shared memory for tile-based matrix multiplication, similar to how cuBLAS does it.
+
+Alternatively, since the input is 2D and we can process each output element in parallel with some optimizations.
+
+Alternatively, perhaps use a tiled approach where each block of threads handles a tile of the output matrix.
+
+This is getting quite involved. Maybe it's better to proceed with the first approach of combining Swish and bias addition, as the matrix multiply is already optimized.
+
+Alternatively, perhaps the Swish + bias addition is trivial and not worth optimizing? Let me think about the compute times.
+
+The matmul with in_features=1024 and out_features=4096 for batch 32768 would have 32768 * 4096 * 1024 FLOPS (for the dot product, each element requires 1024 multiplies and adds). That's about 137 billion FLOPS. The Swish and bias addition are element-wise, so 32768 * 4096 operations, which is ~134 million, negligible compared to the matmul.
+
+Therefore, the matmul is the main bottleneck. So optimizing the matmul would be better, but replacing it with a custom kernel may not be feasible unless we can do better than cuBLAS, which is unlikely.
+
+Alternatively, perhaps the problem expects us to combine matmul with the subsequent steps into a single kernel for maximum speedup, even if it requires a complex implementation.
+
+Let me try to outline how to do that.
+
+The kernel needs to compute for each output element (b, c):
+
+output[b,c] = (sum_i (W[c, i] * x[b,i])) + linear_bias[c]
+
+then apply Swish and add self.bias.
+
+The matrix multiplication part is the key challenge. To implement this efficiently, we can use a block-wise tiled approach.
+
+Here's a rough outline:
+
+Each block of threads handles a block of output elements. For example, each block can handle a tile of size TB x TB, where TB is the block size. However, since the input is (batch, in_features) and the output is (batch, out_features), we need to structure it properly.
+
+Alternatively, we can tile the computation such that each thread processes a small tile of the matrix.
+
+Alternatively, for each output element (b, c), the dot product can be computed by each thread as follows:
+
+Initialize sum = linear_bias[c]
+
+Then loop over i from 0 to in_features-1:
+
+sum += W[c][i] * x[b][i]
+
+Then compute swish and add self.bias.
+
+But with in_features=1024, this would require each thread to loop 1024 times, which could be slow. However, with 32 threads per block, maybe using shared memory to store the input x and weights?
+
+Alternatively, use a tiled approach where each thread processes multiple elements.
+
+Alternatively, given the high dimensionality, perhaps the best approach is to let the matmul be handled by PyTorch's optimized code, and focus on the element-wise steps.
+
+So proceeding with that, the first optimization is the Swish + bias addition. Let's code that.
+
+Now, also, the group norm may be a candidate. Let's see:
+
+Group norm for each group:
+
+For group g (0 to num_groups-1):
+
+channels in group: start = g * (out_features/num_groups), end = (g+1)*...
+
+Wait, group norm divides the channels into groups. For each group, each sample's features in that group are normalized.
+
+The computation for each group:
+
+For each sample in batch:
+
+Compute mean and variance over the channels in the group.
+
+Then normalize each feature in the group.
+
+Multiply by gamma and add beta.
+
+The parameters gamma and beta are of size out_features, with each group having its own gamma and beta.
+
+Wait, no: in GroupNorm, the gamma and beta are of size C (the number of channels) and are applied per channel, but grouped. So each group has its own gamma and beta, but the implementation may have them as vectors of size C.
+
+Actually, the parameters are of size C. The groups are contiguous chunks of the channels. So gamma and beta are applied per channel, but grouped into groups for the normalization.
+
+Thus, the computation for each group is:
+
+For each sample:
+
+for each group:
+
+compute mean and var over the channels in the group.
+
+then for each channel in the group:
+
+normalized_val = (x - mean) / sqrt(var + eps)
+
+then scale by gamma[channel] and add beta[channel]
+
+But this requires per-channel gamma and beta, but grouped for normalization.
+
+Implementing this in a kernel requires per-group computation.
+
+The steps for a group:
+
+Compute the mean over the group's channels for each sample.
+
+Then variance, then normalize.
+
+The mean and variance are computed over the group's channels for each sample.
+
+This can be done efficiently with shared memory for each block handling a group and sample.
+
+Alternatively, let's think of the dimensions:
+
+Batch size: 32768
+
+Channels: 4096, grouped into 64 groups → 64 channels per group.
+
+For each group (64 groups):
+
+For each batch sample (32768 samples):
+
+Compute mean and var over 64 channels.
+
+Then normalize each channel in the group for that sample.
+
+So for each group and sample, the computation is manageable.
+
+Let's see:
+
+Each group has 64 channels. For each sample in the batch:
+
+mean = (sum over channels in group of x) / 64
+
+var = sum over channels of (x - mean)^2 /64
+
+Then, for each channel in group:
+
+x_normalized = (x - mean)/sqrt(var + eps)
+
+then multiplied by gamma[channel], add beta[channel]
+
+So for each group, processing all samples.
+
+The kernel can process groups in parallel.
+
+Alternatively, structure the kernel such that each block handles a group and a batch range.
+
+Alternatively, per thread handles a sample and group.
+
+This is getting complex, but perhaps the group norm can be implemented as a custom kernel for better performance.
+
+Alternatively, the problem might not require that, and the first optimization (Swish + bias) is sufficient. Since the user's example replaced a simple add, which is element-wise, with a kernel, perhaps this is the expected approach.
+
+So I'll proceed with the first optimization: combining Swish and the self.bias addition into a custom kernel.
+
+Now, writing the code:
+
+First, the custom kernel for Swish and bias addition:
+
+The code in Python would load the inline CUDA code.
+
+Then, the model's new version would have the same layers except for the Swish+bias replaced by the custom kernel.
+
+Wait, the self.bias is a parameter of the model, so in the new model, we need to retain that parameter.
+
+The new model class would be:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super().__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        # load the custom kernel
+        self.swish_add = swish_add_module  # whatever the loaded module is
+
+    def forward(self, x):
+        x = self.matmul(x)
+        x = self.swish_add(x, self.bias)
+        x = self.group_norm(x)
+        return x
+
+Wait, but the custom kernel needs to be compiled as in the example.
+
+So following the example's structure:
+
+We define the CUDA source code for the swish_add kernel, then load it inline.
+
+Let me structure the code accordingly.
+
+First, the CUDA code:
+
+swish_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void swish_add_kernel(const float* x, const float* bias, float* out, int batch_size, int out_features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * out_features) {
+        int c = idx % out_features;
+        float val = x[idx];
+        float sigmoid_val = 1.0f / (1.0f + expf(-val));
+        out[idx] = val * sigmoid_val + bias[c];
+    }
+}
+
+torch::Tensor swish_add_cuda(torch::Tensor x, torch::Tensor bias) {
+    int batch_size = x.size(0);
+    int out_features = x.size(1);
+    auto out = torch::empty_like(x);
+
+    int num_elements = batch_size * out_features;
+    const int block_size = 256;
+    int num_blocks = (num_elements + block_size - 1) / block_size;
+
+    swish_add_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), 
+                                                 bias.data_ptr<float>(), 
+                                                 out.data_ptr<float>(), 
+                                                 batch_size, 
+                                                 out_features);
+    return out;
+}
+"""
+
+Then, the header:
+
+swish_add_cpp_source = (
+    "torch::Tensor swish_add_cuda(torch::Tensor x, torch::Tensor bias);"
+)
+
+Then, load it inline:
+
+swish_add = load_inline(
+    name="swish_add",
+    cpp_sources=swish_add_cpp_source,
+    cuda_sources=swish_add_source,
+    functions=["swish_add_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+Wait, but in the example, the functions argument is a list of the names of the Python functions exposed. Here, the function is called swish_add_cuda, so that's correct.
+
+Then, in the ModelNew class:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super().__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.swish_add = swish_add  # the loaded module
+
+    def forward(self, x):
+        x = self.matmul(x)
+        x = self.swish_add.swish_add_cuda(x, self.bias)  # call the kernel
+        x = self.group_norm(x)
+        return x
+
+Wait, the way to call the function depends on how the module is structured. Looking at the example:
+
+In the example, the loaded module has a function elementwise_add_cuda, so they called self.elementwise_add.elementwise_add_cuda(...).
+
+So here, the loaded module 'swish_add' will have a function called swish_add_cuda, so the call is correct.
+
+Now, also, need to make sure that all the parameters are correctly initialized. The original model's get_init_inputs returns [in_features, out_features, num_groups, bias_shape]. The new model's __init__ must take the same parameters as the original, so yes.
+
+Also, the get_inputs and get_init_inputs must stay the same. The problem states to reimplement them as per the original code. So in the new code, the functions get_inputs and get_init_inputs are unchanged from the original.
+
+Thus, the complete code would look like:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+swish_add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void swish_add_kernel(const float* x, const float* bias, float* out, int batch_size, int out_features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * out_features) {
+        int c = idx % out_features;
+        float val = x[idx];
+        float sigmoid_val = 1.0f / (1.0f + expf(-val));
+        out[idx] = val * sigmoid_val + bias[c];
+    }
+}
+
+torch::Tensor swish_add_cuda(torch::Tensor x, torch::Tensor bias) {
+    int batch_size = x.size(0);
+    int out_features = x.size(1);
+    auto out = torch::empty_like(x);
+
+    int num_elements = batch_size * out_features;
+    const int block_size = 256;
+    int num_blocks = (num_elements + block_size - 1) / block_size;
+
+    swish_add_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), 
+                                                 bias.data_ptr<float>(), 
+                                                 out.data_ptr<float>(), 
+                                                 batch_size, 
+                                                 out_features);
+    return out;
+}
+"""
+
+swish_add_cpp_source = (
+    "torch::Tensor swish_add_cuda(torch::Tensor x, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+swish_add = load_inline(
+    name="swish_add",
+    cpp_sources=swish_add_cpp_source,
+    cuda_sources=swish_add_source,
+    functions=["swish_add_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super().__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.swish_add = swish_add  # Access the custom function
+
+    def forward(self, x):
+        x = self.matmul(x)
+        x = self.swish_add.swish_add_cuda(x, self.bias)  # Call the custom kernel
+        x = self.group_norm(x)
+        return x
+
+# Keep the original input and initialization functions
+batch_size = 32768
+in_features = 1024
+out_features = 4096
+num_groups = 64
+bias_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, bias_shape]
+```
+
+Wait, but in the original code's get_inputs, the input is generated with torch.rand(...) but not moved to CUDA. However, in the example provided by the user, the get_inputs in the first example uses .cuda(). So probably, the original code's get_inputs returns tensors on CPU, but the model expects CUDA inputs. Since the problem states that the new model must be a drop-in replacement, the inputs should be on the same device as the model. But in PyTorch, the model parameters are on the same device as the inputs. So perhaps the new code's get_inputs should generate CUDA tensors. Let me check the original code's get_inputs:
+
+In the original code:
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, bias_shape]
+
+But the model's parameters are on CPU unless moved. To ensure compatibility, the new code's get_inputs should return tensors on the same device as the model. Since the example in the problem's first example used .cuda(), perhaps the user expects the inputs to be on CUDA. Therefore, in the new code's get_inputs, we should move the input tensors to CUDA.
+
+Thus, in the new code's get_inputs:
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+Similarly, get_init_inputs remains the same.
+
+Therefore, the final code includes this change.
+
+Another thing to check: the group_norm layer. The original code uses nn.GroupNorm(num_groups, out_features). The number of groups is 64, and the number of channels is out_features (4096). The GroupNorm constructor requires the number of groups and the number of channels. So that's correct.
+
+Now, verifying that all steps are correctly implemented:
+
+- The matmul is done via PyTorch's Linear layer, which includes its own bias.
+
+- The Swish and self.bias addition are replaced by the custom kernel.
+
+- The group_norm is unchanged.
+
+This should match the original model's behavior.
+
+Additionally, the kernel's implementation is correct:
+
+The sigmoid is computed as 1/(1+exp(-x)), then multiplied by x to get Swish, then adding the bias[c], where c is the column index (since idx % out_features gives the column).
+
+The kernel loops over all elements, which is correct for an element-wise operation.
+
+The block size of 256 is arbitrary but reasonable. The number of blocks is computed correctly.
+
+Potential optimizations for the kernel:
+
+- Using shared memory to cache the bias tensor, but since it's small (4096 elements), it's probably already in L2 cache.
+
+- Unrolling the loop for the sigmoid computation, but it's a single computation per element.
+
+Overall, this should work.
+
+Now, another optimization: the group norm can be implemented in a custom kernel for further speedup. Let's consider that.
+
+Implementing group norm:
+
+The parameters for group norm are gamma and beta, which are learnable parameters of the group norm layer. In the original model, the group norm is initialized with default affine=True, so these parameters exist.
+
+The group norm computation for each group:
+
+For each group g:
+
+- Channels in group: channels = out_features // num_groups (64 here)
+
+- For each sample in batch:
+
+    - Get the slice of the input corresponding to this group.
+
+    - Compute mean and variance over the channels in the group.
+
+    - Normalize each element in the group slice.
+
+    - Multiply by gamma and add beta.
+
+The gamma and beta are per-channel, so for each channel in the group, use gamma[channel] and beta[channel].
+
+To implement this in CUDA:
+
+We can structure the kernel to process each group and each sample.
+
+Let me outline the steps:
+
+1. For each group g:
+
+    a. Determine the start and end channel indices: start = g * channels_per_group, end = start + channels_per_group.
+
+    b. For each sample in batch:
+
+        i. Compute the mean over channels start to end for this sample.
+
+        ii. Compute variance over the same channels.
+
+        iii. Normalize each element in the channels.
+
+        iv. Apply gamma and beta.
+
+But doing this per sample and per group can be structured in parallel.
+
+Alternatively, process in parallel for all samples and groups.
+
+The kernel could be structured as follows:
+
+Each thread block handles a group and processes a subset of the batch.
+
+Alternatively, each

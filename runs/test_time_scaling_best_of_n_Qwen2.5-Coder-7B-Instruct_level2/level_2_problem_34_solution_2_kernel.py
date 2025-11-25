@@ -1,0 +1,187 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D transposed convolution
+conv_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int D_in, int H_in, int W_in, int D_out, int H_out, int W_out, int kernel_size, int stride, int padding) {
+    int n = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (n >= batch_size || c >= out_channels || d >= D_out) return;
+
+    float sum = 0.0f;
+    for (int i = 0; i < kernel_size; ++i) {
+        for (int j = 0; j < kernel_size; ++j) {
+            for (int k = 0; k < kernel_size; ++k) {
+                int d_in = d * stride - padding + i;
+                int h_in = ((c % (H_out * W_out)) / W_out) * stride - padding + j;
+                int w_in = ((c % (H_out * W_out)) % W_out) * stride - padding + k;
+                if (d_in >= 0 && d_in < D_in && h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                    int input_idx = n * in_channels * D_in * H_in * W_in + c * D_in * H_in * W_in + d_in * H_in * W_in + h_in * W_in + w_in;
+                    int weight_idx = c * in_channels * kernel_size * kernel_size * kernel_size + (i * kernel_size * kernel_size + j * kernel_size + k) * in_channels + n;
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+    }
+
+    output[n * out_channels * D_out * H_out * W_out + c * D_out * H_out * W_out + d * H_out * W_out + (c / (H_out * W_out)) * stride - padding + (c % (H_out * W_out)) / W_out * stride - padding + (c % (H_out * W_out)) % W_out * stride - padding] = sum;
+}
+
+void conv_transpose_launcher(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int D_in, int H_in, int W_in, int D_out, int H_out, int W_out, int kernel_size, int stride, int padding) {
+    dim3 threads(16, 16, 1);
+    dim3 blocks((W_out + threads.x - 1) / threads.x, (H_out + threads.y - 1) / threads.y, (D_out + threads.z - 1) / threads.z);
+
+    conv_transpose_kernel<<<blocks, threads>>>(input, weight, output, batch_size, in_channels, out_channels, D_in, H_in, W_in, D_out, H_out, W_out, kernel_size, stride, padding);
+}
+"""
+
+conv_transpose_cpp_source = (
+    "void conv_transpose_launcher(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int D_in, int H_in, int W_in, int D_out, int H_out, int W_out, int kernel_size, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for 3D transposed convolution
+conv_transpose = load_inline(
+    name="conv_transpose",
+    cpp_sources=conv_transpose_cpp_source,
+    cuda_sources=conv_transpose_source,
+    functions=["conv_transpose_launcher"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Layer Normalization
+layer_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void layer_norm_kernel(const float* input, float* mean, float* var, float* output, int batch_size, int channels, int spatial_size, float epsilon) {
+    int n = blockIdx.z * blockDim.z + threadIdx.z;
+    int c = blockIdx.y * blockDim.y + threadIdx.y;
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (n >= batch_size || c >= channels || s >= spatial_size) return;
+
+    int idx = n * channels * spatial_size + c * spatial_size + s;
+    mean[c] += input[idx];
+    var[c] += input[idx] * input[idx];
+
+    __syncthreads();
+
+    if (s == 0) {
+        mean[c] /= spatial_size;
+        var[c] /= spatial_size;
+        var[c] -= mean[c] * mean[c];
+        var[c] = max(var[c], epsilon);
+        output[idx] = (input[idx] - mean[c]) / sqrt(var[c]);
+    }
+}
+
+void layer_norm_launcher(const float* input, float* mean, float* var, float* output, int batch_size, int channels, int spatial_size, float epsilon) {
+    dim3 threads(16, 16, 1);
+    dim3 blocks((spatial_size + threads.x - 1) / threads.x, (channels + threads.y - 1) / threads.y, (batch_size + threads.z - 1) / threads.z);
+
+    layer_norm_kernel<<<blocks, threads>>>(input, mean, var, output, batch_size, channels, spatial_size, epsilon);
+}
+"""
+
+layer_norm_cpp_source = (
+    "void layer_norm_launcher(const float* input, float* mean, float* var, float* output, int batch_size, int channels, int spatial_size, float epsilon);"
+)
+
+# Compile the inline CUDA code for Layer Normalization
+layer_norm = load_inline(
+    name="layer_norm",
+    cpp_sources=layer_norm_cpp_source,
+    cuda_sources=layer_norm_source,
+    functions=["layer_norm_launcher"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for GELU Activation
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_kernel(float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = input[idx] * 0.5 * (1 + tanh(sqrt(2 / M_PI) * (input[idx] + 0.044715 * input[idx] * input[idx] * input[idx])));
+    }
+}
+
+void gelu_launcher(float* input, float* output, int size) {
+    dim3 threads(256, 1, 1);
+    dim3 blocks((size + threads.x - 1) / threads.x);
+
+    gelu_kernel<<<blocks, threads>>>(input, output, size);
+}
+"""
+
+gelu_cpp_source = (
+    "void gelu_launcher(float* input, float* output, int size);"
+)
+
+# Compile the inline CUDA code for GELU Activation
+gelu = load_inline(
+    name="gelu",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_source,
+    functions=["gelu_launcher"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True, eps=1e-5, scaling_factor=1.0):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.eps = eps
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        # 3D Transposed Convolution
+        batch_size, _, D_in, H_in, W_in = x.shape
+        D_out = (D_in - 1) * self.stride + self.kernel_size - 2 * self.padding
+        H_out = (H_in - 1) * self.stride + self.kernel_size - 2 * self.padding
+        W_out = (W_in - 1) * self.stride + self.kernel_size - 2 * self.padding
+        output_size = batch_size * self.out_channels * D_out * H_out * W_out
+        input_ptr = x.contiguous().data_ptr()
+        weight_ptr = torch.randn(self.out_channels, self.in_channels, self.kernel_size, self.kernel_size, self.kernel_size).contiguous().data_ptr()
+        output_ptr = torch.zeros(output_size, dtype=torch.float32).contiguous().data_ptr()
+
+        conv_transpose_launcher(input_ptr, weight_ptr, output_ptr, batch_size, self.in_channels, self.out_channels, D_in, H_in, W_in, D_out, H_out, W_out, self.kernel_size, self.stride, self.padding)
+
+        # Layer Normalization
+        mean_ptr = torch.zeros(self.out_channels, dtype=torch.float32).contiguous().data_ptr()
+        var_ptr = torch.zeros(self.out_channels, dtype=torch.float32).contiguous().data_ptr()
+        norm_output_ptr = torch.zeros(output_size, dtype=torch.float32).contiguous().data_ptr()
+
+        layer_norm_launcher(output_ptr, mean_ptr, var_ptr, norm_output_ptr, batch_size, self.out_channels, D_out * H_out * W_out, self.eps)
+
+        # GELU Activation
+        gelu_output_ptr = torch.zeros(output_size, dtype=torch.float32).contiguous().data_ptr()
+
+        gelu_launcher(norm_output_ptr, gelu_output_ptr, output_size)
+
+        # Scaling
+        scaled_output_ptr = gelu_output_ptr * self.scaling_factor
+
+        return torch.from_numpy(scaled_output_ptr.reshape(batch_size, self.out_channels, D_out, H_out, W_out)).to(x.device)

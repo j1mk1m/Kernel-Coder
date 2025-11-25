@@ -1,0 +1,48 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+transposed_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Custom CUDA kernel implementation for transposed convolution
+// ...
+
+torch::Tensor transposed_conv_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int padding, int dilation, int groups) {
+    // Kernel launch and computation
+    // ...
+    return output;
+}
+"""
+
+transposed_conv_cpp_source = (
+    "torch::Tensor transposed_conv_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int padding, int dilation, int groups);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+transposed_conv = load_inline(
+    name="transposed_conv",
+    cpp_sources=transposed_conv_cpp_source,
+    cuda_sources=transposed_conv_source,
+    functions=["transposed_conv_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, groups, num_groups):
+        super(ModelNew, self).__init__()
+        self.transposed_conv = transposed_conv
+
+    def forward(self, x):
+        x = self.transposed_conv.transposed_conv_cuda(x, self.weight, self.bias, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)
+        x = F.gelu(x)
+        x = self.group_norm(x)
+        return x
+
+# Initialize the weights and biases for the transposed convolution
+# ...

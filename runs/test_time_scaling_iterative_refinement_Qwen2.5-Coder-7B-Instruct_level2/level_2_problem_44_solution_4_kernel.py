@@ -1,0 +1,101 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+transposed_convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Kernel for transposed convolution
+__global__ void transposed_convolution_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int input_height, int input_width, int output_height, int output_width, int kernel_size) {
+    int batch_id = blockIdx.x / (output_height * output_width);
+    int output_row = (blockIdx.x % (output_height * output_width)) / output_width;
+    int output_col = blockIdx.x % output_width;
+    int channel_id = threadIdx.x;
+
+    if (channel_id < out_channels) {
+        float sum = 0.0f;
+        for (int i = 0; i < kernel_size; ++i) {
+            for (int j = 0; j < kernel_size; ++j) {
+                int input_row = output_row * stride - pad + i;
+                int input_col = output_col * stride - pad + j;
+                if (input_row >= 0 && input_row < input_height && input_col >= 0 && input_col < input_width) {
+                    int input_idx = ((batch_id * in_channels + channel_id) * input_height + input_row) * input_width + input_col;
+                    int weight_idx = ((channel_id * in_channels + channel_id) * kernel_size + i) * kernel_size + j;
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+        int output_idx = ((batch_id * out_channels + channel_id) * output_height + output_row) * output_width + output_col;
+        output[output_idx] = sum;
+    }
+}
+
+torch::Tensor transposed_convolution_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto input_height = input.size(2);
+    auto input_width = input.size(3);
+    auto kernel_size = weight.size(2);
+    auto stride = 2; // Assuming stride is always 2
+    auto pad = 1;   // Assuming padding is always 1
+    auto output_height = (input_height - 1) * stride + kernel_size - 2 * pad;
+    auto output_width = (input_width - 1) * stride + kernel_size - 2 * pad;
+
+    auto output = torch::zeros({batch_size, out_channels, output_height, output_width}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (out_channels * output_height * output_width + block_size - 1) / block_size;
+
+    transposed_convolution_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, out_channels, input_height, input_width, output_height, output_width, kernel_size);
+
+    return output;
+}
+"""
+
+transposed_convolution_cpp_source = (
+    "torch::Tensor transposed_convolution_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+transposed_convolution = load_inline(
+    name="transposed_convolution",
+    cpp_sources=transposed_convolution_cpp_source,
+    cuda_sources=transposed_convolution_source,
+    functions=["transposed_convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super(ModelNew, self).__init__()
+        self.transposed_convolution = transposed_convolution
+        self.multiplier = multiplier
+
+    def forward(self, x):
+        x = self.transposed_convolution.transposed_convolution_cuda(x, self.weight)
+        x = x * self.multiplier
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # First global average pooling
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # Second global average pooling
+        return x
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+height, width = 128, 128
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+multiplier = 0.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier]

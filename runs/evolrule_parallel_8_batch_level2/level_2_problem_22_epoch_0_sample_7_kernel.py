@@ -1,0 +1,198 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused operations: matmul + scaling + residual addition + clamp
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+template <typename scalar_t>
+__global__ void fused_operations_kernel(
+    const torch::PackedTensorAccessor<scalar_t,2> input,
+    const torch::PackedTensorAccessor<scalar_t,2> weight,
+    const scalar_t scale_factor,
+    const scalar_t clamp_min,
+    const scalar_t clamp_max,
+    torch::PackedTensorAccessor<scalar_t,2> output_intermediate
+) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int hidden_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (batch_idx >= output_intermediate.size(0) || hidden_idx >= output_intermediate.size(1)) {
+        return;
+    }
+
+    scalar_t sum = 0;
+    for (int i = 0; i < input.size(1); ++i) {
+        sum += input[batch_idx][i] * weight[i][hidden_idx];
+    }
+
+    // Apply scaling and residual addition (x + x is equivalent to multiplying by 2)
+    sum = sum * scale_factor * 2; // Since scaling is applied after matmul and before residual add
+
+    // Clamp operation
+    if (sum < clamp_min) sum = clamp_min;
+    if (sum > clamp_max) sum = clamp_max;
+
+    output_intermediate[batch_idx][hidden_idx] = sum;
+}
+
+torch::Tensor fused_operations_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    float scale_factor,
+    float clamp_min,
+    float clamp_max) {
+    
+    const int batch_size = input.size(0);
+    const int hidden_size = weight.size(1);
+    auto output_intermediate = torch::empty({batch_size, hidden_size}, input.options());
+
+    dim3 threads(32, 8);
+    dim3 blocks((batch_size + threads.x - 1) / threads.x, (hidden_size + threads.y - 1) / threads.y);
+
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "fused_operations_cuda", ([&] {
+        fused_operations_kernel<scalar_t><<<blocks, threads>>>(
+            input.packed_accessor<scalar_t,2>(),
+            weight.packed_accessor<scalar_t,2>(),
+            scale_factor,
+            clamp_min,
+            clamp_max,
+            output_intermediate.packed_accessor<scalar_t,2>());
+    }));
+
+    return output_intermediate;
+}
+"""
+
+# Define the custom CUDA kernel for logsumexp
+logsumexp_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void logsumexp_kernel(
+    const torch::PackedTensorAccessor<scalar_t,2> input,
+    torch::PackedTensorAccessor<scalar_t,2> output
+) {
+    int batch_idx = blockIdx.x;
+    scalar_t max_val = -INFINITY;
+
+    // Find max for each batch
+    for (int i = 0; i < input.size(1); ++i) {
+        if (input[batch_idx][i] > max_val) {
+            max_val = input[batch_idx][i];
+        }
+    }
+
+    scalar_t sum = 0;
+    for (int i = 0; i < input.size(1); ++i) {
+        sum += exp(input[batch_idx][i] - max_val);
+    }
+
+    output[batch_idx][0] = log(sum) + max_val;
+}
+
+torch::Tensor logsumexp_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    auto output = torch::empty({batch_size, 1}, input.options());
+
+    dim3 threads(256);
+    dim3 blocks((batch_size + threads.x - 1) / threads.x);
+
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "logsumexp_cuda", ([&] {
+        logsumexp_kernel<scalar_t><<<blocks, threads>>>(
+            input.packed_accessor<scalar_t,2>(),
+            output.packed_accessor<scalar_t,2>());
+    }));
+
+    return output;
+}
+"""
+
+# Define the custom CUDA kernel for Mish activation
+mish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template <typename scalar_t>
+__global__ void mish_kernel(torch::PackedTensorAccessor<scalar_t,2> input) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= input.numel()) return;
+
+    scalar_t x = input[idx];
+    input[idx] = x * tanh(log(1 + exp(x)));
+}
+
+torch::Tensor mish_cuda(torch::Tensor input) {
+    const int size = input.numel();
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    AT_DISPATCH_FLOATING_TYPES(input.type(), "mish_cuda", ([&] {
+        mish_kernel<scalar_t><<<num_blocks, block_size>>>(
+            input.packed_accessor<scalar_t,2>());
+    }));
+
+    return input;
+}
+"""
+
+# Compile all custom CUDA kernels
+fused_ops_cpp = "torch::Tensor fused_operations_cuda(torch::Tensor, torch::Tensor, float, float, float);"
+fused_ops = load_inline(
+    name="fused_operations",
+    cpp_sources=fused_ops_cpp,
+    cuda_sources=fused_ops_source,
+    functions=["fused_operations_cuda"],
+    verbose=True
+)
+
+logsumexp_cpp = "torch::Tensor logsumexp_cuda(torch::Tensor);"
+logsumexp = load_inline(
+    name="logsumexp",
+    cpp_sources=logsumexp_cpp,
+    cuda_sources=logsumexp_source,
+    functions=["logsumexp_cuda"],
+    verbose=True
+)
+
+mish_cpp = "torch::Tensor mish_cuda(torch::Tensor);"
+mish = load_inline(
+    name="mish",
+    cpp_sources=mish_cpp,
+    cuda_sources=mish_source,
+    functions=["mish_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scale_factor, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.matmul_weight = nn.Parameter(torch.empty(hidden_size, input_size))  # Transposed for kernel
+        nn.init.xavier_normal_(self.matmul_weight)  # Initialize weights
+        self.scale_factor = scale_factor
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+        self.fused_ops = fused_ops
+        self.logsumexp = logsumexp
+        self.mish = mish
+
+    def forward(self, x):
+        # Convert x to row-major for better CUDA performance
+        x = x.contiguous()
+        output_intermediate = self.fused_ops.fused_operations_cuda(
+            x,
+            self.matmul_weight.t(),  # Transpose back to match dimensions
+            self.scale_factor,
+            self.clamp_min,
+            self.clamp_max
+        )
+        logsumexp_output = self.logsumexp.logsumexp_cuda(output_intermediate)
+        mish_output = self.mish.mish_cuda(logsumexp_output)
+        return mish_output * logsumexp_output  # Matches original equation
+
+def get_init_inputs():
+    return [input_size, hidden_size, scale_factor, clamp_min, clamp_max]

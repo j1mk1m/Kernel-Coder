@@ -1,0 +1,305 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution transpose
+conv_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cudnn.h>
+
+__global__ void conv_transpose_kernel(float* x, float* weight, float* out, int batch_size, int in_channels, int out_channels, int height, int width, int kernel_size, int stride, int padding, int output_padding) {
+    int n = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+    if (n < batch_size && c < out_channels) {
+        int h_out = ((height - 1) * stride + kernel_size - 2 * padding + output_padding) / stride;
+        int w_out = ((width - 1) * stride + kernel_size - 2 * padding + output_padding) / stride;
+        for (int i = 0; i < h_out; ++i) {
+            for (int j = 0; j < w_out; ++j) {
+                int h_in = i * stride - padding;
+                int w_in = j * stride - padding;
+                for (int k = 0; k < in_channels; ++k) {
+                    int index_in = n * in_channels * height * width + k * height * width + h_in * width + w_in;
+                    int index_out = n * out_channels * h_out * w_out + c * h_out * w_out + i * w_out + j;
+                    out[index_out] += x[index_in] * weight[c * in_channels * kernel_size * kernel_size + k * kernel_size * kernel_size + (h_in % kernel_size) * kernel_size + (w_in % kernel_size)];
+                }
+            }
+        }
+    }
+}
+
+torch::Tensor conv_transpose_cuda(torch::Tensor x, torch::Tensor weight, int stride, int padding, int output_padding) {
+    auto batch_size = x.size(0);
+    auto in_channels = x.size(1);
+    auto out_channels = weight.size(0);
+    auto height = x.size(2);
+    auto width = x.size(3);
+    auto kernel_size = weight.size(2);
+
+    auto out = torch::zeros({batch_size, out_channels, ((height - 1) * stride + kernel_size - 2 * padding + output_padding) / stride, ((width - 1) * stride + kernel_size - 2 * padding + output_padding) / stride}, device=x.device());
+
+    const int block_size = 8;
+    const int num_blocks_n = (batch_size + block_size - 1) / block_size;
+    const int num_blocks_c = (out_channels + block_size - 1) / block_size;
+
+    conv_transpose_kernel<<<num_blocks_n * num_blocks_c, block_size * block_size * block_size>>>(x.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(), batch_size, in_channels, out_channels, height, width, kernel_size, stride, padding, output_padding);
+
+    return out;
+}
+"""
+
+conv_transpose_cpp_source = (
+    "torch::Tensor conv_transpose_cuda(torch::Tensor x, torch::Tensor weight, int stride, int padding, int output_padding);"
+)
+
+# Compile the inline CUDA code for convolution transpose
+conv_transpose = load_inline(
+    name="conv_transpose",
+    cpp_sources=conv_transpose_cpp_source,
+    cuda_sources=conv_transpose_source,
+    functions=["conv_transpose_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for minimum operation
+min_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void min_kernel(float* x, float* out, int batch_size, int channels, int height, int width) {
+    int n = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+    if (n < batch_size && c < channels) {
+        int h_out = height;
+        int w_out = width;
+        for (int i = 0; i < h_out; ++i) {
+            for (int j = 0; j < w_out; ++j) {
+                int index = n * channels * height * width + c * height * width + i * width + j;
+                out[index] = x[index];
+                for (int k = i + 1; k < h_out; ++k) {
+                    int index_k = n * channels * height * width + c * height * width + k * width + j;
+                    if (x[index_k] < out[index]) {
+                        out[index] = x[index_k];
+                    }
+                }
+            }
+        }
+    }
+}
+
+torch::Tensor min_cuda(torch::Tensor x) {
+    auto batch_size = x.size(0);
+    auto channels = x.size(1);
+    auto height = x.size(2);
+    auto width = x.size(3);
+
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 8;
+    const int num_blocks_n = (batch_size + block_size - 1) / block_size;
+    const int num_blocks_c = (channels + block_size - 1) / block_size;
+
+    min_kernel<<<num_blocks_n * num_blocks_c, block_size * block_size * block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), batch_size, channels, height, width);
+
+    return out;
+}
+"""
+
+min_cpp_source = (
+    "torch::Tensor min_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for minimum operation
+min_op = load_inline(
+    name="min_op",
+    cpp_sources=min_cpp_source,
+    cuda_sources=min_source,
+    functions=["min_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for sum operation
+sum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void sum_kernel(float* x, float* out, int batch_size, int channels, int height, int width) {
+    int n = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+    if (n < batch_size && c < channels) {
+        int h_out = height;
+        int w_out = width;
+        for (int i = 0; i < h_out; ++i) {
+            for (int j = 0; j < w_out; ++j) {
+                int index = n * channels * height * width + c * height * width + i * width + j;
+                out[index] = x[index];
+                for (int k = i + 1; k < h_out; ++k) {
+                    int index_k = n * channels * height * width + c * height * width + k * width + j;
+                    out[index] += x[index_k];
+                }
+            }
+        }
+    }
+}
+
+torch::Tensor sum_cuda(torch::Tensor x) {
+    auto batch_size = x.size(0);
+    auto channels = x.size(1);
+    auto height = x.size(2);
+    auto width = x.size(3);
+
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 8;
+    const int num_blocks_n = (batch_size + block_size - 1) / block_size;
+    const int num_blocks_c = (channels + block_size - 1) / block_size;
+
+    sum_kernel<<<num_blocks_n * num_blocks_c, block_size * block_size * block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), batch_size, channels, height, width);
+
+    return out;
+}
+"""
+
+sum_cpp_source = (
+    "torch::Tensor sum_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for sum operation
+sum_op = load_inline(
+    name="sum_op",
+    cpp_sources=sum_cpp_source,
+    cuda_sources=sum_source,
+    functions=["sum_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for GELU activation
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_kernel(float* x, float* out, int batch_size, int channels, int height, int width) {
+    int n = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+    if (n < batch_size && c < channels) {
+        int h_out = height;
+        int w_out = width;
+        for (int i = 0; i < h_out; ++i) {
+            for (int j = 0; j < w_out; ++j) {
+                int index = n * channels * height * width + c * height * width + i * width + j;
+                out[index] = x[index] * 0.5 * (1 + tanh(sqrt(2 / M_PI) * (x[index] + 0.044715 * pow(x[index], 3))));
+            }
+        }
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor x) {
+    auto batch_size = x.size(0);
+    auto channels = x.size(1);
+    auto height = x.size(2);
+    auto width = x.size(3);
+
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 8;
+    const int num_blocks_n = (batch_size + block_size - 1) / block_size;
+    const int num_blocks_c = (channels + block_size - 1) / block_size;
+
+    gelu_kernel<<<num_blocks_n * num_blocks_c, block_size * block_size * block_size>>>(x.data_ptr<float>(), out.data_ptr<float>(), batch_size, channels, height, width);
+
+    return out;
+}
+"""
+
+gelu_cpp_source = (
+    "torch::Tensor gelu_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for GELU activation
+gelu_op = load_inline(
+    name="gelu_op",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for addition
+add_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void add_kernel(float* x, float* y, float* out, int batch_size, int channels, int height, int width) {
+    int n = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z * blockDim.z + threadIdx.z;
+    if (n < batch_size && c < channels) {
+        int h_out = height;
+        int w_out = width;
+        for (int i = 0; i < h_out; ++i) {
+            for (int j = 0; j < w_out; ++j) {
+                int index = n * channels * height * width + c * height * width + i * width + j;
+                out[index] = x[index] + y[index];
+            }
+        }
+    }
+}
+
+torch::Tensor add_cuda(torch::Tensor x, torch::Tensor y) {
+    auto batch_size = x.size(0);
+    auto channels = x.size(1);
+    auto height = x.size(2);
+    auto width = x.size(3);
+
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 8;
+    const int num_blocks_n = (batch_size + block_size - 1) / block_size;
+    const int num_blocks_c = (channels + block_size - 1) / block_size;
+
+    add_kernel<<<num_blocks_n * num_blocks_c, block_size * block_size * block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), out.data_ptr<float>(), batch_size, channels, height, width);
+
+    return out;
+}
+"""
+
+add_cpp_source = (
+    "torch::Tensor add_cuda(torch::Tensor x, torch::Tensor y);"
+)
+
+# Compile the inline CUDA code for addition
+add_op = load_inline(
+    name="add_op",
+    cpp_sources=add_cpp_source,
+    cuda_sources=add_source,
+    functions=["add_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = conv_transpose
+        self.min_op = min_op
+        self.sum_op = sum_op
+        self.gelu_op = gelu_op
+        self.add_op = add_op
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.conv_transpose.conv_transpose_cuda(x, self.weight, self.stride, self.padding, self.output_padding)
+        x = self.min_op.min_cuda(x)
+        x = self.sum_op.sum_cuda(x)
+        x = self.gelu_op.gelu_cuda(x)
+        x = self.add_op.add_cuda(x, self.bias)
+        return x

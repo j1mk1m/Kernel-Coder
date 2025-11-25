@@ -1,0 +1,723 @@
+First, I need to analyze the given architecture to identify which operators can be optimized with custom CUDA kernels. The original model has three main operations: a convolution, instance normalization, and a division by a constant. 
+
+Starting with the convolution layer. PyTorch's `nn.Conv2d` is already highly optimized, so replacing it might not yield significant gains unless there's a specific optimization (like fusing with subsequent layers). However, fusing convolution with instance normalization could reduce memory accesses and improve performance.
+
+Next, instance normalization (`nn.InstanceNorm2d`) involves calculating mean and variance for each instance and channel, then normalizing. This has several steps: mean calculation, variance, subtraction, division, and scaling. Implementing this as a custom kernel might allow for better vectorization or parallelization, especially since instance norm operates per-channel and per-instance.
+
+The division by a constant is a simple element-wise operation. While PyTorch's division is fast, combining it with the instance norm could save an extra kernel launch, improving efficiency.
+
+Considering operator fusion: combining the instance norm and division into a single kernel would eliminate intermediate memory copies and reduce kernel launch overhead. Similarly, fusing the convolution with instance norm might also be beneficial, but convolution's complexity (especially with padding, strides) might complicate the kernel.
+
+However, fusing convolution and instance norm might be complex due to the convolution's computational steps. Let me check the parameters. The given model uses a kernel_size of 3, which is manageable. The instance norm follows immediately after the convolution, so data dependency is direct. 
+
+Alternatively, since the instance norm requires per-channel statistics, maybe the fused kernel can compute the convolution output, then compute the mean/variance on the fly, normalize, and divide by the constant. But convolution itself is a compute-intensive operation with significant memory accesses. Writing a fused conv+instance norm+division kernel might be challenging but could yield better performance.
+
+Alternatively, maybe first focus on fusing instance norm and division, since those are both element-wise operations after convolution. Let's analyze:
+
+The instance norm formula is:
+
+y = (x - mean) / sqrt(var + eps) * gamma + beta
+
+Here, since the user's instance norm might not have affine parameters (since they're using `nn.InstanceNorm2d(out_channels)` without specifying `affine=True`), so gamma and beta are 1 and 0 by default. So the formula simplifies to:
+
+y = (x - mean) / sqrt(var + eps)
+
+Then, divide by `divide_by`, so the final result is [(x - mean)/sqrt(var + eps)] / divide_by.
+
+But if the instance norm is using default parameters (no affine), then the division by the constant could be incorporated into the normalization step. For example, the final division by 'divide_by' can be merged into the normalization's denominator term, but since the variance term involves a square root and epsilon, it's not straightforward. However, the division by a constant is a simple scaling factor applied after the instance norm. 
+
+Therefore, the instance norm and division can be fused into a single kernel. 
+
+Alternatively, perhaps even the convolution can be fused with instance norm. But convolution is a more complex operation. Let me think: the convolution produces an output tensor, then instance norm is applied. To fuse them, the kernel would have to compute the convolution result, compute the mean/var for each channel-instance, then normalize. But the convolution's output is needed to compute the mean and variance. This might require storing intermediate results or re-computing parts, which could be inefficient. Maybe it's better to first try fusing instance norm and division, then see if that's enough.
+
+Alternatively, perhaps the division by a constant can be incorporated into the instance norm computation. Since the division by a constant is just multiplying by 1/divide_by, that scaling factor can be multiplied after the normalization. So in the instance norm kernel, instead of returning (x - mean)/sqrt(var + eps), we can do [(x - mean)/sqrt(var + eps)] * (1/divide_by). That would fuse the division into the instance norm calculation, eliminating the need for a separate step. This would save a kernel launch and memory access. 
+
+So, replacing the instance norm and division with a custom fused kernel seems feasible and beneficial.
+
+Now, the steps to implement this:
+
+1. Write a CUDA kernel that computes instance norm followed by division by a constant.
+   - The instance norm requires computing mean and variance for each channel and instance. Since it's 2D instance norm (for images), each instance (sample in batch) and each channel is treated separately.
+
+   The input is a 4D tensor (N, C, H, W). For each sample in N and channel in C, compute mean and variance over HxW elements. 
+
+   The steps are:
+
+   For each element in the tensor:
+
+   a) Compute mean over spatial dimensions (H, W) for each (N,C).
+
+   b) Compute variance over spatial dimensions for each (N,C).
+
+   c) Normalize: (x - mean) / sqrt(var + eps)
+
+   d) Multiply by (1/divide_by) to incorporate the division.
+
+   The main challenge is efficiently computing the mean and variance for each (N,C) group. This can be done using CUDA's thread and block structures. 
+
+   One approach is to have each thread handle a spatial position (H, W), and for each (N,C), accumulate sums into shared memory or using atomic operations. But since all threads for a given (N,C) can collaborate, perhaps using a block per (N,C) group. 
+
+   Alternatively, using a tiled approach where each thread block computes the mean and variance for a specific (N,C) group. 
+
+   The plan for the kernel:
+
+   - Launch one block per (N,C) group. Since the input is N x C x H x W, the total number of (N,C) groups is N*C. So the grid dimension would be N*C.
+
+   - Each block processes one (N,C) group. Within each block, threads can compute the sum and sum of squares over the spatial dimensions (H*W elements).
+
+   - For each block:
+
+      - Compute the sum of all elements in the current (N,C) group.
+
+      - Compute the sum of squares.
+
+      - Compute mean = sum / (H*W)
+
+      - Compute variance = (sum_sq / (H*W)) - mean^2
+
+      - Then, for each element in the (N,C) group, compute (x - mean)/sqrt(var + eps) * (1/divide_by)
+
+   - However, the variance calculation can be done once per block, then broadcast the mean and variance to all threads in the block to compute the normalized values.
+
+   To implement this:
+
+   The kernel would have two main steps: a reduction step to compute mean and variance, then an element-wise normalization step.
+
+   The reduction can be done using shared memory to accumulate the partial sums. 
+
+   Let's outline the steps in code:
+
+   For each block (handling N=n, C=c):
+
+      - Each thread processes a spatial element (h, w). The total elements are H*W.
+
+      - The number of threads per block would be, say, 256, so if H*W is large, multiple threads per element might not be efficient. Wait, actually, the number of elements is H*W, so for each spatial element, assign one thread. If H*W is large, this might require a lot of threads, but since the block is per (N,C), which is N=128 and C=128 (given in get_init_inputs: in_channels=64, out_channels=128; but the instance norm is on out_channels, so C=128. So N=128, C=128, so total blocks 128*128 = 16384. Each block has H*W threads, which is 128x128 = 16384 threads. Wait, but CUDA has limits on the number of threads per block (max 1024 in many GPUs). So this approach would not work, since 128x128=16384 threads per block exceeds the maximum threads per block.
+
+   Therefore, this approach isn't feasible. Need a better way.
+
+Alternative approach:
+
+Use a block size that can handle the spatial dimensions with smaller threads. For example, use a 2D block or tiles. Let's think of the spatial dimensions as a grid. For each (N,C) group, process the spatial elements in parallel with threads in a 2D block. But even then, the number of threads might be too large.
+
+Another approach is to use a grid of blocks where each block handles a group of (N,C), and each thread within the block handles a portion of the spatial elements. Then, use shared memory to accumulate the sum and sum_sq across threads.
+
+Let me think of the block as having, say, 256 threads. The spatial elements are H*W, so for each thread in the block, process H*W / 256 elements. Each thread computes the partial sum and sum_sq of their assigned elements, then combine these using shared memory.
+
+Steps for a block processing (n,c):
+
+1. Initialize shared memory for sum and sum_sq. Each thread might need to contribute to these. 
+
+2. Each thread loads a portion of the spatial elements, computes their contribution to sum and sum_sq.
+
+3. Use a reduction in shared memory to compute total sum and sum_sq across all threads.
+
+4. Compute mean and variance.
+
+5. Then, each thread can compute the normalized values and store them.
+
+This way, the number of threads per block can be manageable.
+
+Let's outline the kernel code structure:
+
+__global__ void fused_instance_norm_divide(const float* input, float* output, int batch_size, int channels, int height, int width, float divide_by, float eps) {
+
+    // Each block corresponds to a (n, c) group
+    int n = blockIdx.x / channels;
+    int c = blockIdx.x % channels;
+
+    // The spatial indices are h and w, handled by threads within the block.
+
+    // Each thread processes a portion of the spatial elements.
+
+    // Calculate total spatial elements per group: h*w
+    int spatial_size = height * width;
+
+    // Each thread handles a chunk of the spatial elements
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+
+    // Iterate over the spatial elements assigned to this thread
+    for (int idx = tid; idx < spatial_size; idx += stride) {
+        // Compute h and w from linear index idx
+        int h = idx / width;
+        int w = idx % width;
+
+        // Get the value at (n,c,h,w)
+        int input_offset = ((n * channels + c) * height + h) * width + w;
+        float val = input[input_offset];
+
+        local_sum += val;
+        local_sum_sq += val * val;
+    }
+
+    // Use shared memory to accumulate the sums
+    __shared__ float s_sum[256]; // Or size of blockDim.x, but need to adjust
+    __shared__ float s_sum_sq[256];
+
+    s_sum[threadIdx.x] = local_sum;
+    s_sum_sq[threadIdx.x] = local_sum_sq;
+
+    __syncthreads();
+
+    // Perform reduction in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            s_sum[threadIdx.x] += s_sum[threadIdx.x + s];
+            s_sum_sq[threadIdx.x] += s_sum_sq[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float total_sum = s_sum[0];
+        float total_sum_sq = s_sum_sq[0];
+
+        float mean = total_sum / spatial_size;
+        float var = (total_sum_sq / spatial_size) - (mean * mean);
+        float inv_std = 1.0f / sqrt(var + eps);
+        float scale = inv_std / divide_by;
+
+        // Store mean and scale in shared memory so all threads can access
+        s_sum[0] = mean;
+        s_sum_sq[0] = scale;
+    }
+    __syncthreads();
+
+    // Now compute the output for each spatial element assigned to this thread
+    float mean = s_sum[0];
+    float scale = s_sum_sq[0];
+
+    for (int idx = tid; idx < spatial_size; idx += stride) {
+        int h = idx / width;
+        int w = idx % width;
+        int input_offset = ((n * channels + c) * height + h) * width + w;
+
+        float val = input[input_offset];
+        float normalized = (val - mean) * scale; // because scale includes 1/sqrt(var + eps) * 1/divide_by
+
+        output[input_offset] = normalized;
+    }
+}
+
+This is a rough sketch. The block dimension must be chosen appropriately. Let's say we use 256 threads per block. The spatial elements per (n,c) group are 128x128 = 16384. Each thread would process 16384 / 256 ≈ 64 elements in the first loop, which is manageable.
+
+The shared memory usage here is for two arrays of size blockDim.x. Since we're using 256 threads, each array would need 256 floats, which is acceptable.
+
+The reduction phase uses a standard parallel reduction approach. 
+
+The final computation for each element is (val - mean) * scale, where scale is (1 / sqrt(var + eps)) / divide_by.
+
+This kernel would replace the instance norm and division by the constant.
+
+Now, in PyTorch, to call this kernel, we need to pass the input tensor and the parameters. The instance norm has an epsilon parameter, which in PyTorch's default is 1e-5. Since the user's model didn't specify it, we need to include that in the code.
+
+Wait, in the given code, the instance norm is initialized with default parameters, so the eps is 1e-5. So in the kernel, we can hardcode that or make it a parameter. Since the user's model doesn't change it, perhaps hardcoding is okay, but better to make it a parameter.
+
+Alternatively, since the user's code doesn't specify eps, maybe we can hardcode it as 1e-5.
+
+Now, the next step is to wrap this kernel into a PyTorch extension.
+
+First, let's define the CUDA source code for the fused instance norm and division.
+
+Then, in the ModelNew class, replace the instance norm and division with a call to this kernel.
+
+Additionally, the convolution is still using PyTorch's Conv2d. Since the user's example replaced a simple add with a custom kernel, but convolution is more complex, perhaps there's no benefit unless fused with other ops.
+
+Alternatively, maybe fusing convolution with the instance norm and division would be better, but that's more complex. Let's proceed with the instance norm + division first.
+
+Now, let's also check the division operation. The user's code has x = x / self.divide_by. Since self.divide_by is a constant (2.0 in the example), we can pass this as a parameter to the kernel.
+
+So the kernel will take:
+
+- input tensor (from conv output)
+- output tensor
+- batch_size, channels, height, width (the shape parameters)
+- divide_by (the constant)
+- eps (epsilon for instance norm)
+
+Now, in the ModelNew, the instance norm and division steps are replaced by this kernel. The convolution remains as is.
+
+Therefore, the code structure would be:
+
+class ModelNew(nn.Module):
+
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.fused_instance_norm_divide = load_inline... # the custom kernel
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.fused_instance_norm_divide.fused_instance_norm_divide_cuda(x, batch_size, channels, height, width, divide_by, eps)
+        return x
+
+Wait, but the parameters like batch_size, height, width are not known at initialization. Wait, in the given problem, the get_inputs function generates inputs with batch_size 128, height and width 128. But in a general model, the input dimensions can vary. However, the problem statement says that the code must be fully functional with the given get_inputs and get_init_inputs. 
+
+The get_init_inputs function returns [in_channels, out_channels, kernel_size, divide_by], which are the parameters for the model's __init__. The kernel needs the input's shape (batch_size, channels, height, width) at runtime. Since the input is passed to the forward function, we can extract these dimensions dynamically.
+
+Therefore, in the forward pass, after the convolution, the output tensor x will have shape (N, C_out, H', W'), where H' and W' depend on the convolution's padding and stride. However, in the given problem, the original code uses kernel_size 3, but doesn't specify padding or stride, so by default, padding=0, stride=1. 
+
+Wait, the original Model's __init__ has parameters in_channels, out_channels, kernel_size, divide_by. The convolution is initialized with those parameters, so the kernel_size is 3, but stride is 1, padding 0. So the output spatial dimensions would be (height - kernel_size + 1, width - kernel_size + 1). Given that the input to the model is generated by get_inputs as torch.rand(batch_size, in_channels, height, width), which for the given example has height and width 128, the output after convolution would have (128-3+1, 128-3+1) = 126x126? Wait, no, if input is 128x128, kernel_size 3, then output spatial dimensions are (128 - 3 + 1) = 126. So H' and W' are 126. 
+
+Wait, but the instance norm is applied to the output of the convolution, so the dimensions after convolution are important. Therefore, in the kernel, we need to pass the current spatial dimensions (H', W'). However, since the kernel is called in the forward function, we can get those dimensions from the input tensor to the kernel.
+
+Thus, the kernel function should accept the input tensor, and we can extract batch_size = x.size(0), channels = x.size(1), height = x.size(2), width = x.size(3). Therefore, in the PyTorch wrapper function for the kernel, we can compute these parameters from the input tensor.
+
+So the kernel's parameters would be:
+
+input: tensor
+output: tensor (allocated by the wrapper)
+divide_by: float
+eps: float (default 1e-5)
+
+The wrapper function would extract the shape from the input tensor.
+
+Therefore, the CUDA source code would have a function like:
+
+torch::Tensor fused_instance_norm_divide_cuda(torch::Tensor input, float divide_by, float eps = 1e-5) {
+
+    // Extract dimensions
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    auto output = torch::empty_like(input);
+
+    // Calculate grid and block dimensions
+    int num_blocks = batch_size * channels; // each block handles one (n,c) group
+    dim3 block_size(256); // threads per block
+
+    // Launch kernel
+    fused_instance_norm_divide_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        height,
+        width,
+        divide_by,
+        eps
+    );
+
+    return output;
+}
+
+But we need to ensure that the block size is appropriate. Let's pick 256 threads per block as before.
+
+Now, we also need to handle cases where the number of threads per block may not divide the spatial elements exactly, but the loop in the kernel handles that with a for loop over idx.
+
+Potential issues:
+
+1. The number of blocks might be large (batch_size * channels). For the given example, batch_size=128, channels=128 (since out_channels=128), so blocks=128*128=16384. CUDA can handle this as long as the maximum grid size is not exceeded. Modern GPUs support grids up to 2^31, so this is okay.
+
+2. The shared memory usage per block is 256 floats (s_sum and s_sum_sq), which is 2KB per block, acceptable.
+
+3. The kernel may have divergence in the first loop if the spatial_size is not a multiple of the block size, but the loop is fine.
+
+Another thing: in the kernel, the input and output are stored in linear memory, so the input_offset calculation must be correct.
+
+Wait, the input is a 4D tensor (N, C, H, W). The linear index for a given (n,c,h,w) is:
+
+n * C*H*W + c * H*W + h * W + w.
+
+Therefore, the input_offset calculation in the kernel is correct as written.
+
+Now, in the PyTorch code, when we call the kernel function, it needs to accept the input tensor and the constants.
+
+Thus, putting this all together, the code for the fused instance norm and division is:
+
+First, define the CUDA kernel code as a string.
+
+Then, compile it with load_inline.
+
+Now, also note that the original model uses instance norm with default parameters (no affine, so no gamma and beta). In the custom kernel, we don't need to handle those parameters because the instance norm is done with the default scaling (gamma=1, beta=0). So the kernel correctly implements the default behavior.
+
+Now, the complete code for the ModelNew would be:
+
+The model_new code replaces the instance norm and division with the custom kernel. The convolution remains as PyTorch's nn.Conv2d.
+
+Thus, the code structure would be:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused instance norm and divide CUDA kernel
+fused_instance_norm_divide_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+#define EPS 1e-5  // Default epsilon for instance norm
+
+__global__ void fused_instance_norm_divide_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int channels,
+    int height,
+    int width,
+    float divide_by,
+    float eps
+) {
+    // Each block handles a (n, c) group
+    int n = blockIdx.x / channels;
+    int c = blockIdx.x % channels;
+
+    int spatial_size = height * width;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+
+    // Compute partial sums for mean and variance
+    for (int idx = tid; idx < spatial_size; idx += stride) {
+        int h = idx / width;
+        int w = idx % width;
+        int input_offset = ((n * channels + c) * height + h) * width + w;
+        float val = input[input_offset];
+        local_sum += val;
+        local_sum_sq += val * val;
+    }
+
+    // Use shared memory for reduction
+    __shared__ float s_sum[256];
+    __shared__ float s_sum_sq[256];
+    s_sum[tid] = local_sum;
+    s_sum_sq[tid] = local_sum_sq;
+    __syncthreads();
+
+    // Reduce using parallel reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum = s_sum[0];
+        float total_sum_sq = s_sum_sq[0];
+        float mean = total_sum / spatial_size;
+        float var = (total_sum_sq / spatial_size) - (mean * mean);
+        float inv_std = 1.0f / sqrtf(var + eps);
+        float scale = inv_std / divide_by;
+
+        // Store mean and scale in shared memory for access by all threads
+        s_sum[0] = mean;
+        s_sum_sq[0] = scale;
+    }
+    __syncthreads();
+
+    // Compute normalized values
+    float mean = s_sum[0];
+    float scale = s_sum_sq[0];
+
+    for (int idx = tid; idx < spatial_size; idx += stride) {
+        int h = idx / width;
+        int w = idx % width;
+        int output_offset = ((n * channels + c) * height + h) * width + w;
+        int input_offset = output_offset; // same as input's offset
+        float val = input[input_offset];
+        output[output_offset] = (val - mean) * scale;
+    }
+}
+
+torch::Tensor fused_instance_norm_divide_cuda(torch::Tensor input, float divide_by, float eps = EPS) {
+    // Ensure input is on CUDA
+    CHECK_CUDA(input);
+
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    dim3 grid(batch_size * channels);
+    dim3 block(block_size);
+
+    fused_instance_norm_divide_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        height,
+        width,
+        divide_by,
+        eps
+    );
+
+    return output;
+}
+
+// Utility macro to check if a tensor is CUDA
+#define CHECK_CUDA(x) AT_ASSERTM(x.type().is_cuda(), #x " must be a CUDA tensor")
+
+"""
+
+# Define the CPP header for the function
+fused_instance_norm_divide_cpp_source = """
+torch::Tensor fused_instance_norm_divide_cuda(torch::Tensor input, float divide_by, float eps);
+"""
+
+# Compile the CUDA code
+fused_instance_norm_divide = load_inline(
+    name="fused_instance_norm_divide",
+    cuda_sources=fused_instance_norm_divide_source,
+    cpp_sources=fused_instance_norm_divide_cpp_source,
+    functions=["fused_instance_norm_divide_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.fused_instance_norm_divide = fused_instance_norm_divide  # Store the module
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Call the custom kernel with divide_by and default eps
+        x = self.fused_instance_norm_divide.fused_instance_norm_divide_cuda(x, divide_by)
+        return x
+```
+
+Wait, in the forward function, the 'divide_by' is a parameter of the model, so in the __init__, we need to store it. Wait, looking back at the original Model's __init__:
+
+Original Model has:
+
+def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+    super().__init__()
+    self.conv = ...
+    self.instance_norm = ...
+    self.divide_by = divide_by
+
+Thus, in the ModelNew, we also need to store divide_by as an attribute.
+
+Wait, the ModelNew's __init__ should take the same parameters as the original model, and store divide_by.
+
+Wait, in the code above, in ModelNew's __init__, we have:
+
+def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+    super().__init__()
+    self.conv = ...
+    self.fused_instance_norm_divide = ... # the loaded module
+    self.divide_by = divide_by  # Add this line
+
+Then, in the forward:
+
+x = self.fused_instance_norm_divide.fused_instance_norm_divide_cuda(x, self.divide_by)
+
+Otherwise, the divide_by is not accessible.
+
+So adding that line is necessary.
+
+Also, in the fused_instance_norm_divide_cuda function's parameters, the 'eps' is optional with default 1e-5. Since the original instance norm uses the default, we can rely on that.
+
+Therefore, the corrected code for ModelNew:
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.fused_instance_norm_divide = fused_instance_norm_divide  # The loaded module
+        self.divide_by = divide_by
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.fused_instance_norm_divide.fused_instance_norm_divide_cuda(x, self.divide_by)
+        return x
+
+Additionally, in the CUDA source, the macro CHECK_CUDA is used, but in the code, the function fused_instance_norm_divide_cuda doesn't check if the input is on CUDA. Since the problem's get_inputs returns CUDA tensors, this might be safe, but better to include the check. 
+
+The line:
+
+#define CHECK_CUDA(x) AT_ASSERTM(x.type().is_cuda(), #x " must be a CUDA tensor")
+
+is part of the CUDA source, and in the function:
+
+void fused_instance_norm_divide_cuda(torch::Tensor input, ...) {
+    CHECK_CUDA(input);
+    ...
+}
+
+So that's handled.
+
+Now, the complete code with all corrections should be as follows.
+
+Also, in the CUDA kernel, the macro EPS is defined as 1e-5. So the default value in the function is okay.
+
+Potential issues to check:
+
+- The input tensor's dimensions are correctly read in the kernel function. The code uses input.size(0), etc., which should be correct.
+
+- The block size of 256 may not be optimal. However, it's a common choice and should work.
+
+- The kernel launch parameters: grid size is batch_size * channels, which for the given problem (batch_size=128, channels=128) gives 16384 blocks. This is acceptable.
+
+- The shared memory arrays s_sum and s_sum_sq have size 256, which matches the block size of 256 threads. So for a block_size of 256, the arrays are correctly sized.
+
+Another point: in the reduction step, after the parallel reduction, the first thread (tid ==0) stores mean and scale in shared memory. Then all threads can read those values. This should work.
+
+Testing this code with the given input parameters should work.
+
+Therefore, the final answer is the code as described above, wrapped in markdown code blocks.
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused instance norm and divide CUDA kernel
+fused_instance_norm_divide_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+#define EPS 1e-5  // Default epsilon for instance norm
+
+__global__ void fused_instance_norm_divide_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int channels,
+    int height,
+    int width,
+    float divide_by,
+    float eps
+) {
+    // Each block handles a (n, c) group
+    int n = blockIdx.x / channels;
+    int c = blockIdx.x % channels;
+
+    int spatial_size = height * width;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+
+    // Compute partial sums for mean and variance
+    for (int idx = tid; idx < spatial_size; idx += stride) {
+        int h = idx / width;
+        int w = idx % width;
+        int input_offset = ((n * channels + c) * height + h) * width + w;
+        float val = input[input_offset];
+        local_sum += val;
+        local_sum_sq += val * val;
+    }
+
+    // Use shared memory for reduction
+    __shared__ float s_sum[256];
+    __shared__ float s_sum_sq[256];
+    s_sum[tid] = local_sum;
+    s_sum_sq[tid] = local_sum_sq;
+    __syncthreads();
+
+    // Reduce using parallel reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum = s_sum[0];
+        float total_sum_sq = s_sum_sq[0];
+        float mean = total_sum / spatial_size;
+        float var = (total_sum_sq / spatial_size) - (mean * mean);
+        float inv_std = 1.0f / sqrtf(var + eps);
+        float scale = inv_std / divide_by;
+
+        // Store mean and scale in shared memory for access by all threads
+        s_sum[0] = mean;
+        s_sum_sq[0] = scale;
+    }
+    __syncthreads();
+
+    // Compute normalized values
+    float mean = s_sum[0];
+    float scale = s_sum_sq[0];
+
+    for (int idx = tid; idx < spatial_size; idx += stride) {
+        int h = idx / width;
+        int w = idx % width;
+        int output_offset = ((n * channels + c) * height + h) * width + w;
+        int input_offset = output_offset; // same as input's offset
+        float val = input[input_offset];
+        output[output_offset] = (val - mean) * scale;
+    }
+}
+
+torch::Tensor fused_instance_norm_divide_cuda(torch::Tensor input, float divide_by, float eps = EPS) {
+    // Ensure input is on CUDA
+    CHECK_CUDA(input);
+
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    dim3 grid(batch_size * channels);
+    dim3 block(block_size);
+
+    fused_instance_norm_divide_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        height,
+        width,
+        divide_by,
+        eps
+    );
+
+    return output;
+}
+
+// Utility macro to check if a tensor is CUDA
+#define CHECK_CUDA(x) AT_ASSERTM(x.type().is_cuda(), #x " must be a CUDA tensor")
+
+"""
+
+# Define the CPP header for the function
+fused_instance_norm_divide_cpp_source = """
+torch::Tensor fused_instance_norm_divide_cuda(torch::Tensor input, float divide_by, float eps);
+"""
+
+# Compile the CUDA code
+fused_instance_norm_divide = load_inline(
+    name="fused_instance_norm_divide",
+    cuda_sources=fused_instance_norm_divide_source,
+    cpp_sources=fused_instance_norm_divide_cpp_source,
+    functions=["fused_instance_norm_divide_cuda"],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.fused_instance_norm_divide = fused_instance_norm_divide
+        self.divide_by = divide_by
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.fused_instance_norm_divide.fused_instance_norm_divide_cuda(x, self.divide_by)
+        return x
+```

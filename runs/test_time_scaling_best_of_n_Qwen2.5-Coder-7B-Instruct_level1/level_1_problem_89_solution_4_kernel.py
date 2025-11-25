@@ -1,0 +1,88 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for prefix sum
+prefix_sum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void prefix_sum_kernel(const float* input, float* output, int batch_size, int input_size) {
+    extern __shared__ float shared[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load data into shared memory
+    if (i < input_size) {
+        shared[tid] = input[i];
+    } else {
+        shared[tid] = 0;
+    }
+
+    __syncthreads();
+
+    // Perform prefix sum in shared memory
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared[tid] += shared[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Write result back to global memory
+    if (i < input_size) {
+        output[i] = shared[tid];
+    }
+}
+
+torch::Tensor prefix_sum_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto input_size = input.size(1);
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (input_size + block_size - 1) / block_size;
+
+    prefix_sum_kernel<<<batch_size, block_size, block_size * sizeof(float)>>>(
+        input.data_ptr<float>(), output.data_ptr<float>(), batch_size, input_size);
+
+    return output;
+}
+"""
+
+prefix_sum_cpp_source = (
+    "torch::Tensor prefix_sum_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for prefix sum
+prefix_sum = load_inline(
+    name="prefix_sum",
+    cpp_sources=prefix_sum_cpp_source,
+    cuda_sources=prefix_sum_source,
+    functions=["prefix_sum_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.prefix_sum = prefix_sum
+
+    def forward(self, x):
+        if self.dim == 0:
+            return torch.cumsum(x, dim=self.dim)
+        elif self.dim == 1:
+            # Assuming input has shape (batch_size, input_size)
+            batch_size = x.size(0)
+            input_size = x.size(1)
+            reshaped_input = x.view(-1, input_size)
+            reshaped_output = self.prefix_sum.prefix_sum_cuda(reshaped_input)
+            return reshaped_output.view(batch_size, input_size)
+        else:
+            raise ValueError("Unsupported dimension for prefix sum")

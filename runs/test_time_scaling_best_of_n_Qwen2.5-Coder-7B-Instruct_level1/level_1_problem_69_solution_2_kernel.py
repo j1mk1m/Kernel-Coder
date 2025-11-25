@@ -1,0 +1,48 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Your custom CUDA kernel source code goes here
+custom_cuda_source = """
+// Include necessary headers
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Define your custom CUDA kernel
+__global__ void custom_kernel(...) {
+    // Kernel implementation
+}
+
+// Define the function that will be exposed to PyTorch
+torch::Tensor custom_function(torch::Tensor input) {
+    // Function implementation
+    return output_tensor;
+}
+"""
+
+# Compile the inline CUDA code
+custom_cuda_module = load_inline(
+    name="custom_cuda_module",
+    cpp_sources="",  # Add your C++ sources here if needed
+    cuda_sources=custom_cuda_source,
+    functions=["custom_function"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the new model class using the custom CUDA function
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=(1, 1), padding=(0, 0), output_padding=(0, 0), dilation=(1, 1), groups=1, bias=False):
+        super(ModelNew, self).__init__()
+        self.custom_function = custom_cuda_module.custom_function
+
+    def forward(self, x):
+        return self.custom_function(x)
+
+# Example usage
+model_new = ModelNew(in_channels, out_channels, kernel_size)
+input_data = get_inputs()[0]
+output_data = model_new(input_data)
+print(output_data.shape)

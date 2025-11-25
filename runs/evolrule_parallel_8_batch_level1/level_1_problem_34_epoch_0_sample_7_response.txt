@@ -1,0 +1,1323 @@
+You can make the following assumptions:
+
+1. The input tensor to the model is always contiguous and in CUDA.
+
+2. The batch size is always 112.
+
+3. The input dimensions (features, dim1, dim2) are 64, 512, 512.
+
+You can make any other assumptions necessary to implement a working solution, but you must clarify them.
+
+
+
+Okay, I need to optimize the given PyTorch model that uses an InstanceNorm2d layer. The goal is to replace the existing operator with a custom CUDA kernel to gain speedups. Let me think through how to approach this.
+
+First, I recall that Instance Normalization involves normalizing each feature map within a batch independently. The formula for instance normalization is similar to batch normalization but operates over each instance (sample) rather than the entire batch. The steps are: compute the mean and variance for each (batch, channel) slice, then subtract the mean and divide by the standard deviation, then apply affine transformation if needed.
+
+The existing nn.InstanceNorm2d implementation in PyTorch might have some overhead, especially with small batch sizes or specific tensor dimensions. The user provided a batch size of 112, which isn't too small, but maybe the custom kernel can be optimized for their specific input dimensions (features=64, dim1=512, dim2=512). 
+
+The plan is to write a CUDA kernel that performs all steps of instance normalization. Let's outline the steps:
+
+1. **Compute Mean and Variance for Each Instance:**
+   For each instance (each sample in the batch) and each channel, compute the mean and variance over the spatial dimensions (height and width).
+
+2. **Normalize and Apply Affine Transform:**
+   Subtract the mean, divide by sqrt(variance + eps), then multiply by gamma and add beta if affine is enabled. Since the given model doesn't mention affine parameters, I'll check the default. Wait, nn.InstanceNorm2d by default has affine=False unless specified. The user's code uses the default, so we can ignore affine parameters. So, no gamma and beta; just normalize using mean and variance.
+
+3. **CUDA Kernel Design:**
+   The input is a 4D tensor (batch, channels, height, width). Each instance (batch element) has C channels, each of size HxW. The normalization is done per channel per instance.
+
+   To compute mean and variance efficiently, for each instance and channel, we can process the spatial elements. The kernel can be structured to handle this per instance and channel.
+
+   Maybe we can parallelize over the batch and channels, with each thread block handling a channel in a batch instance. Then, within a block, threads can compute partial sums for mean and variance.
+
+   Let me think of the steps in code:
+
+   For each element in the input tensor:
+
+   - Iterate over batch (B), channel (C), then spatial dimensions (H, W).
+
+   Alternatively, since the computation for each channel in each instance is independent, we can structure the kernel to process each (batch, channel) pair in parallel.
+
+   The kernel can be divided into two parts: first compute the mean and variance for each (B,C), then do the normalization.
+
+   First, the mean computation:
+
+   For each (b, c):
+
+   mean = sum(x[b,c,:,:]) / (H*W)
+
+   variance = sum((x[b,c,:,:] - mean)^2) / (H*W)
+
+   Then, normalization:
+
+   x_normalized = (x[b,c,:,:] - mean) / sqrt(variance + eps)
+
+   Since the eps is a small value (default 1e-5 in PyTorch), we need to include that.
+
+   To compute these efficiently, for each (b,c), we can have a thread block that processes the spatial dimensions. The block can handle a single (b,c), and threads within the block compute partial sums for mean and variance.
+
+   Let's outline the kernel steps:
+
+   1. **Mean Calculation:**
+      - For each (b, c), each thread in the block processes a spatial element (h, w), accumulating the sum into shared memory.
+      - After reduction, the mean is stored.
+
+   2. **Variance Calculation:**
+      - Similarly, after computing the mean, each thread computes the squared difference, accumulates into shared memory again to get variance.
+
+   3. **Normalization:**
+      - Using the computed mean and variance, each thread in the block applies the normalization.
+
+   However, doing this in two separate passes (first compute stats, then normalize) might be straightforward but could have some overhead. Alternatively, combine the steps into a single kernel. Wait, but the variance depends on the mean, so the mean must be computed first. So perhaps first compute the mean and variance for all (b,c) pairs, store them, then launch a second kernel to do the normalization using those stats.
+
+   Alternatively, compute mean and variance first in one kernel, then compute the normalized values in another kernel.
+
+   Let me think about the data layout. The input is (B, C, H, W). Since the input is contiguous and on CUDA, we can access it using a linear index.
+
+   Let me think of the dimensions:
+
+   B = 112
+   C = 64
+   H = 512
+   W = 512
+
+   The total elements per (b,c) is H*W = 262,144. For each (b,c), we need to compute the mean and variance over these elements.
+
+   So, for the first kernel (computing stats):
+
+   - We can have a grid of B * C blocks. Each block handles one (b,c) pair.
+
+   - Each block's threads can process the H*W elements. To process this efficiently, perhaps divide the H*W elements into chunks assigned to each thread.
+
+   For a block handling (b,c), the number of threads could be, say, 512 (a typical CUDA block size). Then, each thread processes (H*W)/512 elements. But 262,144 / 512 = 512 elements per thread, which might be okay.
+
+   Alternatively, use a larger block size if possible, but need to fit into the maximum threads per block (1024 for many GPUs). Let me pick 512 threads per block for simplicity.
+
+   The steps in the stats kernel:
+
+   Each block for (b,c):
+
+   1. Initialize shared memory for partial sums (sum, sum_sq).
+
+   2. Each thread loads a chunk of elements from the input tensor for this (b,c) and adds to the partial sums.
+
+   3. After all threads have contributed, perform a block-wide reduction to compute total sum and sum of squares.
+
+   4. Compute mean = sum / (H*W)
+
+   5. Compute variance = (sum_sq - mean^2 * H*W) / (H*W)
+
+   Wait, actually variance can be computed as (sum_sq - (sum^2)/(H*W)) / (H*W). That's a way to compute it to avoid one loop. So perhaps better to compute sum and sum_sq first.
+
+   So the variance would be (sum_sq - mean^2 * H*W) / (H*W) ?
+
+   Wait, let me recheck:
+
+   variance = E[x^2] - (E[x])^2
+
+   So variance = (sum_sq / N) - (mean)^2
+
+   where N = H*W.
+
+   So yes, that's correct.
+
+   So for the variance, once we have the sum and sum_sq, we can compute it.
+
+   So the steps in the block:
+
+   Each thread in the block processes a set of elements (from the spatial dimensions) and accumulates to the shared memory partial sums (sum and sum_sq).
+
+   Once all threads have done their part, the block reduces these partial sums to get total sum and sum_sq.
+
+   Then, compute mean = sum / N
+
+   variance = (sum_sq / N) - mean^2
+
+   variance is then stored in an output array (for all B and C).
+
+   Then, the second kernel will take these means and variances, and compute the normalized x.
+
+   The normalization kernel would again process each (b,c) pair, and for each spatial element, compute (x - mean) / sqrt(variance + eps).
+
+   Now, for the normalization kernel, again, each (b,c) can be a block, and threads process elements in parallel.
+
+   Now, how to organize the data for the mean and variance arrays. Since B=112 and C=64, the total elements for means and variances are 112*64 each.
+
+   So, we can have a 2D array for means, of size B x C, and same for variances.
+
+   The first kernel (stats) will compute these, and the second kernel (normalize) will use them.
+
+   Let me outline the CUDA code structure.
+
+   First, the stats kernel:
+
+   The kernel function could look like this:
+
+   __global__ void compute_instance_norm_stats(
+       const float* input, float* means, float* variances,
+       int B, int C, int H, int W, float eps
+   ) {
+       // Each block handles a (b, c) pair.
+       int b = blockIdx.x;
+       int c = blockIdx.y;
+
+       // Get the pointer to the input for this (b,c)
+       const float* data = input + b * C * H * W + c * H * W;
+
+       // Shared memory for partial sums
+       extern __shared__ float shared[];
+
+       float* s_sum = shared;
+       float* s_sum_sq = shared + blockDim.x;
+
+       int tid = threadIdx.x;
+
+       // Initialize shared memory
+       if (tid == 0) {
+           s_sum[0] = 0.0f;
+           s_sum_sq[0] = 0.0f;
+       }
+       __syncthreads();
+
+       // Each thread processes a chunk of elements
+       int N = H * W;
+       for (int i = tid; i < N; i += blockDim.x) {
+           float val = data[i];
+           atomicAdd(s_sum, val);
+           atomicAdd(s_sum_sq, val * val);
+       }
+       __syncthreads();
+
+       // After all threads have added, reduce the shared memory to get total sum and sum_sq
+       // Wait, but atomicAdd might be slow here. Alternatively, a better approach would be to use a reduction tree.
+
+       // Hmm, using atomic operations for large N could be inefficient. Maybe better to do a block reduction.
+
+       // Let me think again: the block is handling the entire N elements, so each thread is processing a chunk.
+
+       // Alternatively, each thread first computes their own partial sums, then combine with others using shared memory.
+
+       // Maybe the approach with atomicAdd is too slow, so perhaps a better way is needed.
+
+       // Let's try another approach. Each thread processes a portion and stores into shared memory.
+
+       // Wait, maybe the initial approach is not the best. Let me rethink.
+
+       // Maybe use a parallel reduction approach. For a block of 512 threads, each thread can process a few elements.
+
+       // Let me first calculate the total number of elements per block: N = H*W = 262,144.
+
+       // If each thread processes 512 elements (since 262,144 / 512 is ~512?), wait 262,144 divided by 512 is exactly 512 (since 512*512=262,144). Oh, perfect!
+
+       // Because H and W are 512 each, so H*W is 512*512 = 262,144.
+
+       // So if the block has 512 threads, each thread can process exactly 512 elements. Wait, no:
+
+       512 threads * 512 elements per thread = 262,144 elements. So yes, each thread can process exactly 512 elements.
+
+       Wait, 262,144 / 512 = 512 elements per thread.
+
+       That's a good division. So each thread can handle 512 elements.
+
+       So each thread can process their own chunk.
+
+       So, for each thread in the block, they process their own chunk, accumulating their local sum and sum_sq.
+
+       Then, after that, we need to perform a reduction across all threads in the block to get the total sum and sum_sq.
+
+       So here's the plan:
+
+       Each thread processes 512 elements, computes their own local sum and sum_sq.
+
+       Then, using shared memory, perform a reduction among the threads.
+
+       Let me structure this step by step.
+
+       First, each thread loads their 512 elements, computes sum and sum_sq locally.
+
+       Then, write their partial sums into shared memory.
+
+       Then, perform a block reduction (like a parallel reduction) to get the total sum and sum_sq.
+
+       Let's see code:
+
+       In the kernel:
+
+       int b = blockIdx.x; // blockIdx is (B, C) ?
+
+       Wait, the grid for the stats kernel is B x C, so blockIdx.x is the batch index, blockIdx.y is the channel index.
+
+       So the block index is (b, c).
+
+       Then, inside the kernel:
+
+       const int tid = threadIdx.x;
+
+       // Each thread's chunk starts at tid * 512 ?
+
+       Wait, each thread is assigned a chunk of 512 elements. Since each thread has an index from 0 to 511, the starting index in the data array for this thread would be tid * 512.
+
+       So the loop for each element in the chunk:
+
+       for (int i = 0; i < 512; ++i) {
+           int pos = tid * 512 + i;
+           if (pos < N) { // but N is 262,144, and tid*512 +512 may exceed?
+
+           Wait, 512 threads * 512 elements each = exactly N (262,144). So no, all positions are valid.
+
+           So:
+
+           float val = data[pos];
+           local_sum += val;
+           local_sq_sum += val * val;
+       }
+
+       Then, store local_sum and local_sq_sum into shared memory.
+
+       Then, perform a reduction in shared memory.
+
+       So first, each thread writes their local sums into shared memory:
+
+       s_sum[tid] = local_sum;
+
+       s_sum_sq[tid] = local_sq_sum;
+
+       Then, perform a reduction using a loop, halving the number of active threads each step.
+
+       For example:
+
+       for (int s = blockDim.x / 2; s > 0; s >>=1) {
+           if (tid < s) {
+               s_sum[tid] += s_sum[tid + s];
+               s_sum_sq[tid] += s_sum_sq[tid + s];
+           }
+           __syncthreads();
+       }
+
+       After this, the total sum is in s_sum[0], total sum_sq is in s_sum_sq[0].
+
+       Then, if the thread is 0, compute mean and variance:
+
+       if (tid ==0) {
+           float mean = s_sum[0]/N;
+           float var = (s_sum_sq[0]/N) - mean * mean;
+           means[b * C + c] = mean;
+           variances[b * C + c] = var + eps; // or add eps here? Wait, the variance is used as sqrt(var + eps). Hmm, perhaps better to store var and compute sqrt(var + eps) later.
+
+           Wait, the variance here is the variance (without eps), so the normalized term is 1 / sqrt(var + eps). So the variance array should store var, and then when computing the normalization, we add eps to it.
+
+           So the variance stored is the variance, and when we compute the denominator, we do sqrt(var + eps).
+
+       }
+
+       That's the stats kernel.
+
+       Then, the normalization kernel:
+
+       __global__ void apply_instance_norm(
+           const float* input, const float* means, const float* variances,
+           float* output,
+           int B, int C, int H, int W, float eps
+       ) {
+           // Same as stats kernel: block for (b,c)
+           int b = blockIdx.x;
+           int c = blockIdx.y;
+
+           const float* data_in = input + b * C * H * W + c * H * W;
+           float* data_out = output + b * C * H * W + c * H * W;
+
+           float mean = means[b * C + c];
+           float var = variances[b * C + c];
+           float denom = rsqrt(var + eps); // rsqrt is 1/sqrt
+
+           int tid = threadIdx.x;
+
+           // Each thread processes 512 elements as before
+           for (int i = 0; i < 512; ++i) {
+               int pos = tid * 512 + i;
+               float val = data_in[pos];
+               data_out[pos] = (val - mean) * denom;
+           }
+       }
+
+       Wait, but in the normalization kernel, each thread processes 512 elements again. That's okay.
+
+       Now, handling the memory allocations:
+
+       The main function in Python would first call the stats kernel, then the norm kernel.
+
+       Also, the input and output tensors must be on CUDA.
+
+       Now, the steps in Python would be:
+
+       1. Pre-allocate tensors for means and variances: size B x C.
+
+       2. Launch compute_instance_norm_stats kernel with grid (B, C), block size 512, shared memory for the two partial sums. Wait, the shared memory needs to be enough to hold the per-thread sums. The shared memory for the stats kernel would need to be 2 * blockDim.x floats. Since blockDim.x is 512, that's 512 * 2 * 4 bytes = 4KB, which is acceptable.
+
+       The shared memory size for the stats kernel is:
+
+       The code uses:
+
+       extern __shared__ float shared[];
+
+       and s_sum and s_sum_sq are pointers to the start and offset by blockDim.x.
+
+       So the total size needed is 2 * blockDim.x bytes (since each is float). Wait, no, the total size is blockDim.x * 2 floats. So to allocate shared memory, when launching the kernel, the user must specify the shared memory size.
+
+       The kernel call would be:
+
+       compute_instance_norm_stats<<<grid, block, sharedMemSize>>>(...)
+
+       where sharedMemSize = 2 * block_size * sizeof(float).
+
+       In the stats kernel's case, block_size is 512, so 512 * 2 floats, so 512 * 2 * 4 bytes = 4096 bytes, which is okay.
+
+       Now, putting this all into code.
+
+       Let's structure the CUDA code as follows:
+
+       First, define the CUDA kernels in a string. Then, compile it with torch.utils.cpp_extension.load_inline.
+
+       The Python code would have to:
+
+       1. Define the CUDA kernels as strings.
+
+       2. Load them into a module.
+
+       3. The ModelNew class will use these kernels in its forward pass.
+
+       Let me outline the steps in the Python code.
+
+       The forward function of ModelNew will:
+
+       - Get the input tensor x (which is on CUDA, contiguous).
+
+       - Allocate the output tensor of the same size as x.
+
+       - Allocate tensors for means and variances (size B x C).
+
+       - Compute the grid and block dimensions for the CUDA kernels.
+
+       - Launch compute_instance_norm_stats kernel.
+
+       - Launch apply_instance_norm kernel.
+
+       But since PyTorch requires using CUDA streams for proper synchronization, perhaps we need to ensure that the kernels are launched properly and that dependencies are handled.
+
+       Also, the kernel parameters must include all the necessary constants: B, C, H, W, and eps (which is the default 1e-5).
+
+       Let me code the CUDA kernels.
+
+       Let me start with the compute_instance_norm_stats kernel.
+
+       The kernel code:
+
+       __global__ void compute_instance_norm_stats(
+           const float* input,
+           float* means,
+           float* variances,
+           int B,
+           int C,
+           int H,
+           int W,
+           float eps
+       ) {
+           int b = blockIdx.x;
+           int c = blockIdx.y;
+
+           const float* data = input + b * C * H * W + c * H * W;
+           int N = H * W;
+
+           extern __shared__ float shared[];
+           float* s_sum = shared;
+           float* s_sum_sq = shared + blockDim.x;
+
+           int tid = threadIdx.x;
+
+           // Initialize shared memory
+           if (tid == 0) {
+               s_sum[0] = 0.0f;
+               s_sum_sq[0] = 0.0f;
+           }
+           __syncthreads();
+
+           // Each thread processes 512 elements (since N=512*512, and blockDim.x=512)
+           // Each thread has 512 elements to process
+           float local_sum = 0.0f;
+           float local_sq_sum = 0.0f;
+           for (int i = 0; i < 512; ++i) {
+               int pos = tid * 512 + i; // Wait, wait, no, that would be tid * 512 + i. Wait, if each thread is handling 512 elements, then their starting position is tid * 512 ?
+
+               Wait, the total elements per (b,c) is N=512*512=262,144. With 512 threads, each thread can handle exactly 512 elements.
+
+               So the first thread (tid=0) processes positions 0 to 511.
+
+               The second thread (tid=1) processes 512 to 1023, etc. Wait, no, 512 elements per thread would be:
+
+               Each thread's starting index is tid * 512.
+
+               So for i from 0 to 511, the position is tid * 512 + i.
+
+               Wait, but 512 * 512 = 262,144, so that's exactly covered by 512 threads each doing 512 elements. Perfect.
+
+               So the loop over i from 0 to 511:
+
+               for (int i = 0; i < 512; ++i) {
+                   int pos = tid * 512 + i;
+                   float val = data[pos];
+                   local_sum += val;
+                   local_sq_sum += val * val;
+               }
+
+           }
+
+           // Store local sums to shared memory
+           s_sum[tid] = local_sum;
+           s_sum_sq[tid] = local_sq_sum;
+           __syncthreads();
+
+           // Reduction
+           for (int s = blockDim.x/2; s > 0; s >>=1) {
+               if (tid < s) {
+                   s_sum[tid] += s_sum[tid + s];
+                   s_sum_sq[tid] += s_sum_sq[tid + s];
+               }
+               __syncthreads();
+           }
+
+           if (tid ==0) {
+               float total_sum = s_sum[0];
+               float total_sq_sum = s_sum_sq[0];
+               float mean = total_sum / N;
+               float var = (total_sq_sum / N) - mean * mean;
+               means[b * C + c] = mean;
+               variances[b * C + c] = var; // variance stored without eps
+           }
+       }
+
+       Then the apply_instance_norm kernel:
+
+       __global__ void apply_instance_norm(
+           const float* input,
+           const float* means,
+           const float* variances,
+           float* output,
+           int B,
+           int C,
+           int H,
+           int W,
+           float eps
+       ) {
+           int b = blockIdx.x;
+           int c = blockIdx.y;
+
+           const float* data_in = input + b * C * H * W + c * H * W;
+           float* data_out = output + b * C * H * W + c * H * W;
+
+           float mean = means[b * C + c];
+           float var = variances[b * C + c];
+           float denom = rsqrt(var + eps);
+
+           int tid = threadIdx.x;
+
+           for (int i = 0; i < 512; ++i) {
+               int pos = tid * 512 + i;
+               float val = data_in[pos];
+               data_out[pos] = (val - mean) * denom;
+           }
+       }
+
+       Now, in Python, when we call these kernels, we need to handle the dimensions.
+
+       The parameters for the kernels would include:
+
+       - input: the input tensor (B, C, H, W)
+
+       - means and variances: tensors of size (B*C,)
+
+       The grid dimensions for compute_instance_norm_stats are (B, C), so the block dim is (512, 1, 1), and grid is (B, C).
+
+       The shared memory size for the stats kernel is 2 * 512 * sizeof(float). Since in CUDA, shared memory is specified in bytes, the required size is (blockDim.x * 2) * 4 (since each float is 4 bytes). So for blockDim.x=512, that's 512 * 2 * 4 = 4096 bytes.
+
+       The apply kernel has the same grid and block dimensions, but shared memory isn't needed there.
+
+       Now, in Python code, the steps would be:
+
+       In the forward function of ModelNew:
+
+       def forward(self, x):
+           B, C, H, W = x.size() # But according to the given, B is 112, C=64, H=W=512. We can hardcode these?
+
+           # Since the problem states that the input is always contiguous and on CUDA, and with given dims.
+
+           # Allocate output tensor
+           output = torch.empty_like(x)
+
+           # Allocate means and variances tensors
+           means = torch.zeros(B*C, dtype=torch.float32, device=x.device)
+           variances = torch.zeros(B*C, dtype=torch.float32, device=x.device)
+
+           # Kernel parameters
+           block_size = 512
+           grid_dim = (B, C)
+
+           # Compute stats
+           self.compute_stats_kernel(
+               grid=grid_dim,
+               block=(block_size,),
+               shared_mem=2 * block_size * 4,  # 2 * block_size floats, each 4 bytes
+               stream=torch.cuda.current_stream().cuda_stream,
+               # arguments
+               input=x.data_ptr(),
+               means=means.data_ptr(),
+               variances=variances.data_ptr(),
+               B=B, C=C, H=H, W=W,
+               eps=1e-5
+           )
+
+           # Apply normalization
+           self.apply_norm_kernel(
+               grid=grid_dim,
+               block=(block_size,),
+               stream=torch.cuda.current_stream().cuda_stream,
+               # arguments
+               input=x.data_ptr(),
+               means=means.data_ptr(),
+               variances=variances.data_ptr(),
+               output=output.data_ptr(),
+               B=B, C=C, H=H, W=W,
+               eps=1e-5
+           )
+
+           return output
+
+       But in the code using load_inline, the functions are passed as a list, and the kernels are wrapped in the module.
+
+       Wait, in the example given, the kernel function was wrapped into a Python function via the load_inline. So in our case, we need to create a wrapper function for each kernel.
+
+       Let me see: The example had a Python function elementwise_add_cuda that calls the CUDA kernel. Similarly, we need two functions here: one for compute_stats and one for apply_norm.
+
+       So in the CUDA code strings:
+
+       First, define the compute_instance_norm_stats and apply_instance_norm kernels.
+
+       Then, create wrapper functions in C++ that can be called from Python.
+
+       So in the CUDA source:
+
+       // compute stats
+       torch::Tensor compute_instance_norm_stats_cuda(
+           torch::Tensor input,
+           int B, int C, int H, int W,
+           float eps
+       ) {
+           // Allocate means and variances tensors
+           auto means = torch::zeros({B*C}, input.options());
+           auto variances = torch::zeros({B*C}, input.options());
+
+           // Launch kernel
+           const int block_size = 512;
+           dim3 grid(B, C);
+           dim3 block(block_size);
+
+           auto stream = at::cuda::getCurrentCUDAStream();
+
+           compute_instance_norm_stats<<<grid, block, 2 * block_size * sizeof(float), stream>>>(
+               input.data_ptr<float>(),
+               means.data_ptr<float>(),
+               variances.data_ptr<float>(),
+               B, C, H, W,
+               eps
+           );
+
+           // Wait for kernel to finish
+           // But since we're using the same stream, maybe not needed?
+
+           return std::make_tuple(means, variances); // Wait, but returning two tensors. Need to adjust.
+
+           Wait, can't return two tensors from a single function. So perhaps return a tuple, or have the function take pointers to store them?
+
+           Alternatively, maybe have the Python side pass the means and variances tensors. Hmm, this is getting complicated. Alternatively, make the compute_stats function return the means and variances, but in C++, you can't return multiple tensors from a function easily. So perhaps the wrapper function must take output tensors as arguments.
+
+           Alternatively, perhaps split into two steps: first compute the means and variances, then the normalization. But in C++, the function can return a tuple of tensors, but in PyTorch's cpp extensions, you can return tuples.
+
+           Alternatively, better to have the compute_stats function take the input and return the means and variances as a tuple.
+
+           Wait, let's see. The example had a single function that returns the output tensor.
+
+           So perhaps the compute_stats_cuda function takes the input and returns the means and variances as tensors, which are then passed to the apply function.
+
+           But in C++, the wrapper function can return a tuple of tensors. Let me adjust:
+
+           The compute_instance_norm_stats_cuda function would:
+
+           torch::Tensor compute_instance_norm_stats_cuda(torch::Tensor input, int B, int C, int H, int W, float eps) {
+               // Allocate means and variances
+               auto options = input.options();
+               auto means = torch::empty({B * C}, options);
+               auto variances = torch::empty({B * C}, options);
+
+               // Launch kernel
+               const int block_size = 512;
+               dim3 grid(B, C);
+               dim3 block(block_size);
+
+               auto stream = at::cuda::getCurrentCUDAStream();
+
+               compute_instance_norm_stats<<<grid, block, 2 * block_size * sizeof(float), stream>>>(
+                   input.data_ptr<float>(),
+                   means.data_ptr<float>(),
+                   variances.data_ptr<float>(),
+                   B, C, H, W, eps
+               );
+
+               return std::make_tuple(means, variances);
+           }
+
+           Then, the apply function:
+
+           torch::Tensor apply_instance_norm_cuda(
+               torch::Tensor input,
+               torch::Tensor means,
+               torch::Tensor variances,
+               int B, int C, int H, int W,
+               float eps
+           ) {
+               auto output = torch::empty_like(input);
+
+               const int block_size = 512;
+               dim3 grid(B, C);
+               dim3 block(block_size);
+
+               auto stream = at::cuda::getCurrentCUDAStream();
+
+               apply_instance_norm<<<grid, block, 0, stream>>>(
+                   input.data_ptr<float>(),
+                   means.data_ptr<float>(),
+                   variances.data_ptr<float>(),
+                   output.data_ptr<float>(),
+                   B, C, H, W, eps
+               );
+
+               return output;
+           }
+
+           Then, in the Python code, we can call these functions.
+
+           So in the Python model:
+
+           class ModelNew(nn.Module):
+               def __init__(self):
+                   super().__init__()
+                   # Load the CUDA kernels
+                   self.compute_stats = compute_stats
+                   self.apply_norm = apply_norm
+
+               def forward(self, x):
+                   B, C, H, W = x.size()
+                   # Assuming the problem's given dimensions, but since the user said input is always 112, 64,512,512, but the code should handle dynamic B,C,H,W? Or are they fixed?
+
+                   # According to the problem statement, the input dimensions are fixed (features=64, dim1=512, dim2=512, batch_size=112). So we can hardcode these?
+
+                   # The problem says: "You can make the following assumptions: 1. The input tensor is contiguous and CUDA. 2. batch size is always 112. 3. input dims are 64,512,512. So yes, can hardcode.
+
+                   # So in the forward function, we can set B=112, C=64, H=512, W=512.
+
+                   # Wait but the input x is given as parameter, so perhaps it's better to use x.size(), but since the user says the input is always those dimensions, perhaps we can hardcode.
+
+                   # Let's check the get_inputs function:
+
+                   # def get_inputs():
+                   #     x = torch.rand(112, 64, 512, 512)
+                   #     return [x]
+
+                   # So the forward function can just use those dimensions.
+
+                   B = 112
+                   C = 64
+                   H = 512
+                   W = 512
+                   eps = 1e-5
+
+                   means, variances = self.compute_stats(x, B, C, H, W, eps)
+                   output = self.apply_norm(x, means, variances, B, C, H, W, eps)
+                   return output
+
+           Wait but in the wrapper functions, the parameters B, C, H, W are passed as integers. Since they are fixed, in the Python code, they can be hard-coded.
+
+           Now, putting all this into code.
+
+           Now, compiling this.
+
+           The CUDA code strings for the two kernels and their wrapper functions.
+
+           Let me write the CUDA code as a string:
+
+           The CUDA source for the kernels and the wrapper functions:
+
+           instance_norm_source = """
+           #include <torch/extension.h>
+           #include <cuda_runtime.h>
+           #include <ATen/ATen.h>
+           #include <ATen/cuda/CUDAContext.h>
+
+           #define eps 1e-5  // Not sure if this should be a parameter or constant. Wait, in the function, it is passed.
+
+           __global__ void compute_instance_norm_stats(
+               const float* input,
+               float* means,
+               float* variances,
+               int B,
+               int C,
+               int H,
+               int W,
+               float eps
+           ) {
+               // ... same code as above
+           }
+
+           __global__ void apply_instance_norm(
+               const float* input,
+               const float* means,
+               const float* variances,
+               float* output,
+               int B,
+               int C,
+               int H,
+               int W,
+               float eps
+           ) {
+               // ... same code as above
+           }
+
+           torch::Tensor compute_instance_norm_stats_cuda(torch::Tensor input, int B, int C, int H, int W, float eps) {
+               // ... same code as above
+           }
+
+           torch::Tensor apply_instance_norm_cuda(
+               torch::Tensor input,
+               torch::Tensor means,
+               torch::Tensor variances,
+               int B, int C, int H, int W,
+               float eps
+           ) {
+               // ... same code as above
+           }
+
+           PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+               m.def("compute_instance_norm_stats", &compute_instance_norm_stats_cuda, "Compute instance norm stats");
+               m.def("apply_instance_norm", &apply_instance_norm_cuda, "Apply instance norm");
+           }
+           """
+
+           Wait, in the kernel code, the eps is passed as an argument, so we can't hardcode it. The wrapper function takes it as a parameter.
+
+           Now, in the Python code, we need to load this CUDA code.
+
+           So in the Python script:
+
+           from torch.utils.cpp_extension import load_inline
+
+           # Define the CUDA source code as above.
+           instance_norm_source = [the CUDA code above]
+
+           # Compile the CUDA code
+           instance_norm = load_inline(
+               name='instance_norm',
+               cpp_sources="",
+               cuda_sources=instance_norm_source,
+               functions=['compute_instance_norm_stats', 'apply_instance_norm'],
+               verbose=True
+           )
+
+           Then, in the ModelNew class:
+
+           class ModelNew(nn.Module):
+               def __init__(self):
+                   super().__init__()
+                   self.compute_stats = instance_norm.compute_instance_norm_stats
+                   self.apply_norm = instance_norm.apply_instance_norm
+
+               def forward(self, x):
+                   B = 112
+                   C = 64
+                   H = 512
+                   W = 512
+                   eps = 1e-5
+                   means, variances = self.compute_stats(x, B, C, H, W, eps)
+                   output = self.apply_norm(x, means, variances, B, C, H, W, eps)
+                   return output
+
+           Wait, but in the wrapper function compute_instance_norm_stats_cuda, the function returns a tuple of means and variances, which in PyTorch C++ extensions can be done via std::tuple.
+
+           However, when using the load_inline with functions, the function signatures must match. Let me check the example again.
+
+           In the example, the function elementwise_add_cuda returns a tensor. So similarly, the compute_stats function should return a tuple of tensors, but in PyTorch's cpp extensions, returning tuples is possible.
+
+           The code in the wrapper function returns a std::tuple<torch::Tensor, torch::Tensor>, which should be handled correctly by the PyTorch bindings.
+
+           So the code should work.
+
+           Now, I need to ensure that all the CUDA code is correctly written, with proper error checking and parameters.
+
+           Let me go back to the compute_instance_norm_stats kernel code and correct any possible mistakes.
+
+           In the compute_instance_norm_stats kernel:
+
+           The loop for processing the 512 elements:
+
+           for (int i = 0; i < 512; ++i) {
+
+               int pos = tid * 512 + i;
+
+           }
+
+           Since each thread is processing 512 elements, but 512 * 512 threads would exactly cover the N elements.
+
+           Also, in the shared memory allocation:
+
+           The shared array is of size blockDim.x * 2 floats. Because s_sum and s_sum_sq each need blockDim.x elements (for each thread's partial sum).
+
+           So the shared memory size is indeed 2 * blockDim.x * sizeof(float).
+
+           Also, in the reduction loop:
+
+           for (int s = blockDim.x / 2; s > 0; s >>=1) {
+
+               if (tid < s) {
+
+                   s_sum[tid] += s_sum[tid + s];
+
+                   s_sum_sq[tid] += s_sum_sq[tid + s];
+
+               }
+
+               __syncthreads();
+
+           }
+
+           This should correctly reduce the sums.
+
+           After that, the tid ==0 thread writes to the means and variances arrays.
+
+           Now, in the apply_instance_norm kernel:
+
+           The denom is computed as rsqrt(var + eps), which is the reciprocal of the sqrt(var + eps).
+
+           Then, the output is (val - mean) * denom.
+
+           That is correct.
+
+           Now, in the Python code, when we call compute_instance_norm_stats_cuda, it returns means and variances, which are tensors of size B*C.
+
+           Then, the apply function takes those as inputs.
+
+           Now, in the kernel launch for apply_instance_norm:
+
+           The block size is 512, grid is (B, C).
+
+           Each thread processes 512 elements as before.
+
+           Now, possible issues:
+
+           - The input and output tensors must be contiguous. Since the problem states that the input is contiguous and on CUDA, that's okay.
+
+           - The code assumes that the input tensor is in (B, C, H, W) order. Since PyTorch uses channels first, this is correct.
+
+           - The kernel indices must be correct. The data pointer is correctly calculated as input + b*C*H*W + c*H*W. Since the input is a 4D tensor, the linear index for (b, c, h, w) is b*(C*H*W) + c*(H*W) + h*W + w. But in the kernel, we are accessing data[pos], where pos is the offset within the (b,c) slice. So the data pointer for (b,c) is indeed correct.
+
+           - The variance is stored as var (without eps), and the denom uses variances[b*C + c] + eps? Wait, no, in the apply kernel, the denom is rsqrt(var + eps). Wait, in the compute kernel, the variances[b*C + c] = var (the variance). So in the denom, we add eps to var.
+
+           Yes, that's correct.
+
+           Now, I think this should work. Now, compiling this code may have some issues, but I'll proceed to write the code as per this plan.
+
+           Also, in the CUDA code, we need to make sure that the function definitions are correctly wrapped in the PYBIND11_MODULE block.
+
+           The full code:
+
+           The CUDA source (instance_norm_source) would be:
+
+           instance_norm_source = """
+           #include <torch/extension.h>
+           #include <cuda_runtime.h>
+           #include <ATen/ATen.h>
+           #include <ATen/cuda/CUDAContext.h>
+
+           #define THREADS_PER_BLOCK 512
+
+           __global__ void compute_instance_norm_stats(
+               const float* input,
+               float* means,
+               float* variances,
+               int B,
+               int C,
+               int H,
+               int W,
+               float eps
+           ) {
+               int b = blockIdx.x;
+               int c = blockIdx.y;
+
+               const float* data = input + b * C * H * W + c * H * W;
+               int N = H * W;
+
+               extern __shared__ float shared[];
+               float* s_sum = shared;
+               float* s_sum_sq = shared + blockDim.x;
+
+               int tid = threadIdx.x;
+
+               if (tid == 0) {
+                   s_sum[0] = 0.0f;
+                   s_sum_sq[0] = 0.0f;
+               }
+               __syncthreads();
+
+               // Each thread processes 512 elements
+               float local_sum = 0.0f;
+               float local_sq_sum = 0.0f;
+               for (int i = 0; i < 512; ++i) {
+                   int pos = tid * 512 + i;
+                   float val = data[pos];
+                   local_sum += val;
+                   local_sq_sum += val * val;
+               }
+
+               s_sum[tid] = local_sum;
+               s_sum_sq[tid] = local_sq_sum;
+               __syncthreads();
+
+               // Reduction
+               for (int s = blockDim.x/2; s > 0; s >>= 1) {
+                   if (tid < s) {
+                       s_sum[tid] += s_sum[tid + s];
+                       s_sum_sq[tid] += s_sum_sq[tid + s];
+                   }
+                   __syncthreads();
+               }
+
+               if (tid == 0) {
+                   float total_sum = s_sum[0];
+                   float total_sq_sum = s_sum_sq[0];
+                   float mean = total_sum / N;
+                   float var = (total_sq_sum / N) - mean * mean;
+                   means[b * C + c] = mean;
+                   variances[b * C + c] = var;
+               }
+           }
+
+           __global__ void apply_instance_norm(
+               const float* input,
+               const float* means,
+               const float* variances,
+               float* output,
+               int B,
+               int C,
+               int H,
+               int W,
+               float eps
+           ) {
+               int b = blockIdx.x;
+               int c = blockIdx.y;
+
+               const float* data_in = input + b * C * H * W + c * H * W;
+               float* data_out = output + b * C * H * W + c * H * W;
+
+               float mean = means[b * C + c];
+               float var = variances[b * C + c];
+               float denom = rsqrtf(var + eps);
+
+               int tid = threadIdx.x;
+
+               for (int i = 0; i < 512; ++i) {
+                   int pos = tid * 512 + i;
+                   float val = data_in[pos];
+                   data_out[pos] = (val - mean) * denom;
+               }
+           }
+
+           torch::Tensor compute_instance_norm_stats_cuda(torch::Tensor input, int B, int C, int H, int W, float eps) {
+               auto options = input.options();
+               auto means = torch::empty({B * C}, options);
+               auto variances = torch::empty({B * C}, options);
+
+               const int block_size = THREADS_PER_BLOCK;
+               dim3 grid(B, C);
+               dim3 block(block_size);
+
+               auto stream = at::cuda::getCurrentCUDAStream();
+
+               compute_instance_norm_stats<<<grid, block, 2 * block_size * sizeof(float), stream>>>(
+                   input.data_ptr<float>(),
+                   means.data_ptr<float>(),
+                   variances.data_ptr<float>(),
+                   B, C, H, W, eps
+               );
+
+               return std::make_tuple(means, variances);
+           }
+
+           torch::Tensor apply_instance_norm_cuda(
+               torch::Tensor input,
+               torch::Tensor means,
+               torch::Tensor variances,
+               int B, int C, int H, int W,
+               float eps
+           ) {
+               auto output = torch::empty_like(input);
+
+               const int block_size = THREADS_PER_BLOCK;
+               dim3 grid(B, C);
+               dim3 block(block_size);
+
+               auto stream = at::cuda::getCurrentCUDAStream();
+
+               apply_instance_norm<<<grid, block, 0, stream>>>(
+                   input.data_ptr<float>(),
+                   means.data_ptr<float>(),
+                   variances.data_ptr<float>(),
+                   output.data_ptr<float>(),
+                   B, C, H, W, eps
+               );
+
+               return output;
+           }
+
+           PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+               m.def("compute_instance_norm_stats", &compute_instance_norm_stats_cuda, "Compute instance norm stats");
+               m.def("apply_instance_norm", &apply_instance_norm_cuda, "Apply instance norm");
+           }
+           """
+
+           The Python code:
+
+           import torch
+           import torch.nn as nn
+           from torch.utils.cpp_extension import load_inline
+
+           instance_norm_source = """... [above code] ..."""
+
+           instance_norm = load_inline(
+               name='instance_norm',
+               cuda_sources=instance_norm_source,
+               functions=['compute_instance_norm_stats', 'apply_instance_norm'],
+               verbose=True
+           )
+
+           class ModelNew(nn.Module):
+               def __init__(self):
+                   super().__init__()
+                   self.compute_stats = instance_norm.compute_instance_norm_stats
+                   self.apply_norm = instance_norm.apply_instance_norm
+
+               def forward(self, x):
+                   B = 112
+                   C = 64
+                   H = 512
+                   W = 512
+                   eps = 1e-5
+                   means, variances = self.compute_stats(x, B, C, H, W, eps)
+                   output = self.apply_norm(x, means, variances, B, C, H, W, eps)
+                   return output
+
+           Now, some considerations:
+
+           - The CUDA code must handle the case where the total number of elements per (b,c) is exactly divisible by the number of threads and the elements per thread. In this case, since H*W=512*512=262,144 and block size 512, each thread processes exactly 512 elements, which fits perfectly.
+
+           - The use of rsqrtf instead of rsqrt. rsqrtf is the float version of rsqrt.
+
+           - The code uses threadIdx.x for tid, which is okay.
+
+           Potential issues:
+
+           - The compute_instance_norm_stats kernel may have a division by N. Since N is 512*512 = 262,144, which is a large number, but with float precision it should be okay.
+
+           - The reduction in the stats kernel may have precision issues, but for the given problem, it's acceptable.
+
+           - The grid dimensions are (B, C), which could be large (112 x 64 = 7168 blocks). CUDA can handle that as the maximum grid size is much larger.
+
+           Also, in the Python forward function, since the input is always of shape (112,64,512,512), the B, C, H, W parameters can be hardcoded.
+
+           This should work. Now, compiling this code should give the optimized ModelNew class.
+</think>
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+
+#define THREADS_PER_BLOCK 512
+
+__global__ void compute_instance_norm_stats(
+    const float* input,
+    float* means,
+    float* variances,
+    int B,
+    int C,
+    int H,
+    int W,
+    float eps
+) {
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+
+    const float* data = input + b * C * H * W + c * H * W;
+    int N = H * W;
+
+    extern __shared__ float shared[];
+    float* s_sum = shared;
+    float* s_sum_sq = shared + blockDim.x;
+
+    int tid = threadIdx.x;
+
+    if (tid == 0) {
+        s_sum[0] = 0.0f;
+        s_sum_sq[0] = 0.0f;
+    }
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    float local_sq_sum = 0.0f;
+    for (int i = 0; i < 512; ++i) {
+        int pos = tid * 512 + i;
+        float val = data[pos];
+        local_sum += val;
+        local_sq_sum += val * val;
+    }
+
+    s_sum[tid] = local_sum;
+    s_sum_sq[tid] = local_sq_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sum_sq[tid] += s_sum_sq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float total_sum = s_sum[0];
+        float total_sq_sum = s_sum_sq[0];
+        float mean = total_sum / N;
+        float var = (total_sq_sum / N) - mean * mean;
+        means[b * C + c] = mean;
+        variances[b * C + c] = var;
+    }
+}
+
+__global__ void apply_instance_norm(
+    const float* input,
+    const float* means,
+    const float* variances,
+    float* output,
+    int B,
+    int C,
+    int H,
+    int W,
+    float eps
+) {
+    int b = blockIdx.x;
+    int c = blockIdx.y;
+
+    const float* data_in = input + b * C * H * W + c * H * W;
+    float* data_out = output + b * C * H * W + c * H * W;
+
+    float mean = means[b * C + c];
+    float var = variances[b * C + c];
+    float denom = rsqrtf(var + eps);
+
+    int tid = threadIdx.x;
+
+    for (int i = 0; i < 512; ++i) {
+        int pos = tid * 512 + i;
+        float val = data_in[pos];
+        data_out[pos] = (val - mean) * denom;
+    }
+}
+
+torch::Tensor compute_instance_norm_stats_cuda(torch::Tensor input, int B, int C, int H, int W, float eps) {
+    auto options = input.options();
+    auto means = torch::empty({B * C}, options);
+    auto variances = torch::empty({B * C}, options);
+
+    const int block_size = THREADS_PER_BLOCK;
+    dim3 grid(B, C);
+    dim3 block(block_size);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    compute_instance_norm_stats<<<grid, block, 2 * block_size * sizeof(float), stream>>>(
+        input.data_ptr<float>(),
+        means.data_ptr<float>(),
+        variances.data_ptr<float>(),
+        B, C, H, W, eps
+    );
+
+    return std::make_tuple(means, variances);
+}
+
+torch::Tensor apply_instance_norm_cuda(
+    torch::Tensor input,
+    torch::Tensor means,
+    torch::Tensor variances,
+    int B, int C, int H, int W,
+    float eps
+) {
+    auto output = torch::empty_like(input);
+
+    const int block_size = THREADS_PER_BLOCK;
+    dim3 grid(B, C);
+    dim3 block(block_size);
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    apply_instance_norm<<<grid, block, 0, stream>>>(
+        input.data_ptr<float>(),
+        means.data_ptr<float>(),
+        variances.data_ptr<float>(),
+        output.data_ptr<float>(),
+        B, C, H, W, eps
+    );
+
+    return output;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("compute_instance_norm_stats", &compute_instance_norm_stats_cuda, "Compute instance norm stats");
+    m.def("apply_instance_norm", &apply_instance_norm_cuda, "Apply instance norm");
+}
+"""
+
+instance_norm = load_inline(
+    name='instance_norm',
+    cuda_sources=instance_norm_source,
+    functions=['compute_instance_norm_stats', 'apply_instance_norm'],
+    verbose=True
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.compute_stats = instance_norm.compute_instance_norm_stats
+        self.apply_norm = instance_norm.apply_instance_norm
+
+    def forward(self, x):
+        B = 112
+        C = 64
+        H = 512
+        W = 512
+        eps = 1e-5
+        means, variances = self.compute_stats(x, B, C, H, W, eps)
+        output = self.apply_norm(x, means, variances, B, C, H, W, eps)
+        return output
+```

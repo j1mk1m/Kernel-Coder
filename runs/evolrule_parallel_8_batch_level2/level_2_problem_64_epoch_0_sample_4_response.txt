@@ -1,0 +1,906 @@
+You have to make sure the code can be compiled and run without errors. You may assume that all inputs are of the same type, the model uses float32, and the inputs are on a CUDA device. You may assume the batch size, in_features and out_features are as given in the code. 
+
+The code is going to be executed on an A100 GPU. 
+
+**Do not use any of the standard pytorch functions for the operators you are replacing.** (for example, if you replace torch.logsumexp, you must not use torch.logsumexp in your code) 
+
+The fused kernel must not have any synchronization points except for the ones implicitly added by PyTorch's autograd engine. 
+
+The fused kernel must have no memory allocations except for the output tensor. 
+
+When writing CUDA kernels, you should make sure that the kernel launches are done in the same way as the pytorch example (using load_inline and functions). 
+
+Your goal is to find the best possible speedup. Please think carefully, which operators to replace and how to fuse them for maximum speedup. 
+
+The fused kernel should handle all the operations in a single kernel launch. 
+
+Wait, the user wants me to optimize the given Model architecture using custom CUDA kernels. Let me first look at the original model structure again.
+
+The model has a linear layer (gemm), then logsumexp, followed by two leaky_relu layers and two gelu layers. The user wants to replace some or all of these operations with custom CUDA kernels for speedup. 
+
+The key here is to figure out which operators to replace and how to fuse them. Since the goal is maximum speedup, we need to minimize the number of kernel launches and memory accesses. 
+
+Looking at the sequence: gemm is a matrix multiplication with bias, then logsumexp over dim=1, then two leaky_relu and two gelu. 
+
+First, the linear layer (gemm) is a major operation. Implementing it in a custom kernel might not be straightforward since PyTorch's linear is already optimized, but maybe fusing it with subsequent operations can save time. 
+
+However, the next step after gemm is logsumexp, which is a reduction operation along dim 1. Then, two leaky_relu and two gelu. 
+
+If we can fuse all these operations into a single kernel, that would be ideal. Let me think about the data flow:
+
+1. Gemm (matrix multiplication with bias)
+2. Logsumexp over dim=1 (reduction)
+3. Apply leaky_relu twice
+4. Apply gelu twice
+
+Wait, actually, the sequence is:
+
+After the linear layer (gemm), the output is x (shape [batch_size, out_features]). Then logsumexp is applied along dim=1, which reduces it to [batch_size, 1]. Then, applying leaky_relu twice on the [batch_size, 1] tensor, and then gelu twice again. 
+
+So after the logsumexp, the tensor is much smaller (only 1 element per batch). The subsequent activations are applied on this reduced tensor. 
+
+Therefore, the computation after logsumexp is trivial in terms of computation load, since it's only 1 element per sample. So the main computational cost is in the gemm and the logsumexp. 
+
+Wait, but logsumexp is a reduction operation. Let's think about the logsumexp formula: log(sum(exp(x))), over dim 1. 
+
+The logsumexp over a dimension can be done by first exponentiating each element, summing along the dimension, then taking the log of that sum. 
+
+So, maybe we can try to fuse the gemm with the logsumexp and subsequent activations into a single kernel. 
+
+Alternatively, perhaps the gemm can be fused with the logsumexp, and then the rest can be done with a simple kernel. 
+
+Alternatively, since the logsumexp is a reduction, which is a more complex operation, maybe it's better to separate the gemm from the logsumexp, but fuse the logsumexp with the subsequent activations. 
+
+Wait, but the problem requires us to replace operators with custom CUDA kernels. So perhaps the best approach is to implement a fused kernel that does the following steps in a single kernel launch:
+
+- Matrix multiplication (gemm) of the input x with the weight matrix and adding the bias (if present)
+- Then, for each sample (each row), compute the logsumexp over the row (dim=1)
+- Then apply the two leaky_relu and two gelu activations on the resulting [batch_size, 1] tensor.
+
+Wait, but after the logsumexp, the tensor becomes [batch_size, 1]. So the subsequent activations are applied on this reduced tensor, which is a 1-dimensional per sample. 
+
+Therefore, the activations after logsumexp are trivial in terms of computation. The bulk of the computation is in the gemm and logsumexp. 
+
+Therefore, perhaps fusing the gemm and logsumexp into a single kernel would give the most benefit, and then the subsequent activations can be handled in a second kernel. 
+
+Alternatively, maybe it's possible to combine all steps into a single kernel, but that might be complex. Let's think step by step.
+
+First, the gemm operation is a matrix multiplication of (batch_size x in_features) * (in_features x out_features) + bias (out_features). This is O(batch_size * in_features * out_features) operations. Since in_features and out_features are both 8192, this is a huge computation (approx 8192^2 * 1024 operations). This is going to be the most time-consuming part. 
+
+However, the logsumexp is applied after this, which reduces the output of the linear layer (size [batch_size, out_features]) to [batch_size, 1]. So the logsumexp is a reduction over the out_features dimension. 
+
+Therefore, the logsumexp requires for each sample (each row) to compute the log of the sum of exponentials of all elements in that row. 
+
+So, the plan is:
+
+1. Compute the linear layer (gemm + bias).
+2. For each row, compute logsumexp over the row.
+3. Apply two leaky_relu and two gelu activations on the resulting [batch_size, 1] tensor.
+
+But the problem is that step 1 and step 2 are both computationally heavy. Step 1 is O(8192^2 * batch_size) and step 2 is O(8192 * batch_size). So step 1 is the main one, but step 2 is still significant. 
+
+If we can combine steps 1 and 2 into a single kernel, that would save the time of storing the intermediate results of the linear layer on the GPU memory. 
+
+So the idea is to compute the linear layer's output (which is a huge tensor) but immediately compute the logsumexp over each row, so that we don't need to store the entire output. 
+
+This would reduce memory usage and eliminate the need to transfer the linear layer's output from the GPU to memory and then back in for the logsumexp computation. 
+
+Let me formalize the computation:
+
+The linear layer computes: y = x @ W^T + b, where W is [out_features, in_features], b is [out_features].
+
+Then, for each row i (sample), the logsumexp is log( sum_{j=0}^{out_features-1} exp(y[i,j]) )
+
+Therefore, the logsumexp can be computed as log( sum_{j} exp(y[i,j]) )
+
+Therefore, instead of computing y fully and then reducing, we can compute the sum(exp(y[i,j])) during the matrix multiplication.
+
+Wait, but how?
+
+Let me think: for each sample i in the batch, and for each output feature j (from 0 to out_features-1), the value y[i,j] = sum_{k=0}^{in_features-1} x[i,k] * W[j,k] + b[j]
+
+But to compute the sum over j of exp(y[i,j]) for each i, we can compute this sum as we compute the matrix multiplication, without storing the full y tensor.
+
+This way, we can compute the sum(exp(y[i,j])) for each i as part of the matrix multiplication. 
+
+This would require a kernel that for each sample i, computes the sum over j of exp( (x[i] @ W[:,j] + b[j]) ), but since j is the output dimension, and the sum is over all j for each i, this is challenging. 
+
+Alternatively, perhaps we can restructure the computation such that for each i, we compute the sum over j of exp(y[i,j]) as we compute y[i,j], but without storing all the y[i,j]. 
+
+However, since y[i,j] depends on W[j,:] and x[i], and since each j is independent, but the sum over j requires all y[i,j], it's not possible to compute this incrementally. 
+
+Therefore, the logsumexp requires all the y[i,j] for each j in order to compute the sum. Therefore, the logsumexp cannot be computed without first computing the entire y tensor. 
+
+Hmm, so that's a problem. That means that step 1 (computing the linear layer) is necessary, and cannot be combined with logsumexp in a way that saves memory, unless we can find a way to compute the sum(exp(y[i,j])) without storing all y[i,j], but I don't think that's possible. 
+
+Therefore, perhaps the best we can do is to combine the linear layer (gemm + bias) and the logsumexp into a single kernel. Let's think about how to do that.
+
+The linear layer computation requires multiplying the input x with the weight matrix and adding the bias. The logsumexp requires, for each row i, computing the sum over j of exp(y[i,j]), then taking the log. 
+
+The idea is to compute the linear layer's result and, for each row, accumulate the sum(exp(y[i,j])) in a per-row accumulator. 
+
+This way, we can compute the linear layer's result and the logsumexp in a single pass, thus saving some computation and memory.
+
+Let me structure this:
+
+The kernel will process each element y[i,j] = x[i] @ W[j] + b[j]
+
+But instead of storing y[i,j], we can compute exp(y[i,j]) and add it to a per-row sum. 
+
+Therefore, the per-row sum is the sum over j of exp(y[i,j]). 
+
+Thus, the kernel can be structured as follows:
+
+For each row i in the batch:
+
+    Initialize sum[i] = 0
+
+    For each j in 0..out_features-1:
+
+        compute y_ij = dot product of x[i] and W[j], plus bias[j]
+
+        exp_y_ij = exp(y_ij)
+
+        atomicAdd( sum[i], exp_y_ij )
+
+    Then, the logsumexp for row i is log( sum[i] )
+
+This way, we can compute the logsumexp without needing to store the full y tensor. 
+
+This would save memory (since we don't have to store the y tensor) and potentially save computation (since we don't have to store and load it). 
+
+However, this requires a kernel that for each i and j computes the dot product. 
+
+But the problem is that the dot product between x[i] (length in_features) and W[j] (length in_features) is O(in_features) per j. 
+
+So for each i and j, we have O(in_features) operations, leading to O(batch_size * out_features * in_features) operations, which is the same as the original gemm. So the computation time would be similar, but with the advantage of not needing to store the y tensor. 
+
+However, the kernel might have higher memory access overhead because for each j, you have to load W[j,:] and x[i], but since W is a matrix of size out_features x in_features, this could lead to poor memory access patterns. 
+
+Alternatively, perhaps we can reorganize the computation in a way that takes advantage of shared memory or coalesced accesses, but that's getting complicated.
+
+Alternatively, perhaps it's better to compute the linear layer normally (using PyTorch's optimized matmul) and then compute the logsumexp in a custom kernel, but that might not be better. 
+
+Alternatively, maybe the logsumexp can be fused with the linear layer using a custom kernel, even if it's not faster. 
+
+Alternatively, maybe the logsumexp can be replaced with an optimized kernel. Let me think.
+
+First, the linear layer (gemm + bias):
+
+The standard way is using PyTorch's nn.Linear, which is optimized. So perhaps replacing that with a custom kernel won't give much gain, especially since PyTorch uses cuBLAS. 
+
+But if we can combine the linear layer and logsumexp into a single kernel, it might save some time. 
+
+Let me think of the steps required:
+
+The standard approach:
+
+1. Compute y = x @ W^T + b (this is O(batch_size * in_features * out_features) FLOPs)
+2. For each row i in y:
+
+   a. Compute the exponential of all elements in row i (O(out_features) per row)
+
+   b. Sum all those exponentials (O(out_features) per row)
+
+   c. Take the log of that sum (O(1) per row)
+
+So steps 2a, 2b, 2c require O( (out_features) * batch_size ) operations. 
+
+So in terms of FLOPs, the gemm is the main cost, but the logsumexp is a smaller cost, but still significant. 
+
+The problem is that in terms of memory usage, the gemm requires storing a [batch_size, out_features] tensor, which for 1024 x 8192 is about 1024*8192*4 bytes = ~33MB (since each float is 4 bytes). Wait, 1024*8192 is ~8 million elements, so 8e6 *4 ~32MB. That's manageable, but perhaps the kernel fusion can help. 
+
+Alternatively, perhaps the logsumexp can be computed in a way that doesn't require storing the entire y tensor. 
+
+So, let's try to design a kernel that does both steps 1 and 2 together.
+
+The kernel would need to:
+
+- For each sample i in the batch:
+   - For each output feature j (from 0 to out_features-1):
+       - compute the dot product between x[i] and W[j,:] (assuming W is stored as [out_features, in_features])
+       - add the bias[j]
+       - compute exp(y_ij)
+       - accumulate this into a sum for row i
+   - After all j, store log(sum) in the output tensor for row i.
+
+Wait, but this requires that for each i, we process all j's sequentially. Since the batch size is 1024, and out_features is 8192, this is going to be a lot of threads. 
+
+Alternatively, we can parallelize over the batch and features. Let me think of the thread organization:
+
+Let's have each thread handle a specific (i,j) pair. 
+
+Each thread computes the dot product between x[i] and W[j], adds the bias, computes exp, and adds to the sum for row i. 
+
+However, adding to the sum for row i must be done atomically or with some reduction. 
+
+The steps would be:
+
+1. Initialize an array sums of length batch_size, initialized to zero.
+
+2. For all (i,j) pairs:
+
+   a. Compute y_ij = x[i] @ W[j] + b[j]
+
+   b. exp_y_ij = exp(y_ij)
+
+   c. atomicAdd(sums[i], exp_y_ij)
+
+3. Then, compute log(sums[i]) for each i.
+
+The problem with this approach is that step 2 is O(batch_size * out_features) threads, which for 1024 * 8192 = ~8 million threads. That's a lot, but manageable on A100. 
+
+Each thread would need to load x[i], W[j], and the bias[j], compute the dot product. 
+
+However, the dot product between x[i] (size in_features) and W[j] (size in_features) requires in_features multiplications and additions. 
+
+That's going to be computationally intensive. 
+
+Wait, but this is exactly the same as the original gemm computation, except here we're doing it in a different way. 
+
+The original gemm computes y_ij = sum_{k} x[i,k] * W[j,k] + b[j], which is the same as what we need here. 
+
+Therefore, the total FLOPs are the same as the gemm, but with the added computation of exp and the atomicAdd. 
+
+So, the question is whether this approach is faster than the original gemm followed by logsumexp. 
+
+The atomicAdd might be a problem because it's a synchronization point and can cause thread divergence. 
+
+Alternatively, maybe we can use a shared memory reduction for the sums. 
+
+Alternatively, perhaps it's better to compute the gemm first, then compute the logsumexp in a separate kernel, but in a way that is optimized. 
+
+Alternatively, maybe the logsumexp can be optimized with a custom kernel, even without fusing with gemm. 
+
+Alternatively, perhaps the logsumexp is not the main computational bottleneck. Let's estimate the time:
+
+Assuming that the gemm is O(1024 * 8192 * 8192) FLOPs, which is roughly 6.8e+10 FLOPs. 
+
+Assuming that the GPU can do about 15 TFLOPS (A100 has ~19.5 TFLOPS), then this would take about 6.8e10 / 15e12 ≈ 0.45 seconds. 
+
+The logsumexp is O(1024 * 8192) FLOPs for the exponentials and sums, plus the log. That's about 8.4e6 FLOPs, which is negligible compared to the gemm. 
+
+Therefore, the main time is the gemm. Since PyTorch's linear layer is already using optimized cuBLAS, which is highly optimized, replacing it with a custom kernel may not be beneficial. 
+
+Therefore, perhaps the best optimization is to focus on the logsumexp. 
+
+Alternatively, perhaps fusing the logsumexp with the subsequent activations can help. 
+
+The logsumexp produces a [batch_size, 1] tensor. Then, applying two leaky_relu and two gelu. Since these activations are applied to a 1-element tensor per sample, the computation is trivial. 
+
+Therefore, the main computational cost is the gemm and logsumexp. 
+
+Therefore, perhaps the best optimization is to implement the logsumexp with a custom kernel. 
+
+Let me think about how to write a custom logsumexp kernel. 
+
+The logsumexp over dim=1 (the columns) of the linear layer's output. 
+
+The standard implementation would be:
+
+def logsumexp(x, dim=1, keepdim=True):
+    max_val = x.max(dim, keepdim=True)[0]
+    return (x - max_val).exp().sum(dim, keepdim=True).log() + max_val
+
+This is numerically stable. 
+
+So the steps are:
+
+1. Find the maximum along dim 1 for each row. 
+
+2. Subtract the max from each element to prevent overflow. 
+
+3. Exponentiate, sum along dim 1, take log, add back the max. 
+
+Implementing this in a CUDA kernel. 
+
+Alternatively, perhaps we can compute this in a single kernel. 
+
+The problem is that the logsumexp requires a reduction over the features, so each row needs to be processed. 
+
+The kernel would need to compute the max, then the sum of exp(x_i - max), then the log plus max. 
+
+But to compute the max per row, we can first compute the max for each row, then use that to compute the sum. 
+
+This would require two passes: one to compute the max, another to compute the sum. 
+
+Alternatively, in a single kernel, each thread can compute the max and the sum for a row. 
+
+Let me think of a kernel that processes each row. 
+
+For each row in the input tensor (size batch_size x features):
+
+   - Compute max_val = max of the row.
+
+   - Compute sum_exp = sum(exp(x_i - max_val))
+
+   - logsumexp_val = log(sum_exp) + max_val
+
+The output tensor will have one element per row, stored in a [batch_size, 1] tensor. 
+
+To compute this, each thread can handle a row. 
+
+The steps in the kernel would be:
+
+for each row in 0..batch_size-1:
+
+   max_val = -inf
+
+   sum_exp = 0.0
+
+   for each feature in 0..features-1:
+
+       current_val = x[row][feature]
+
+       if current_val > max_val:
+
+           max_val = current_val
+
+       tmp = exp(current_val - max_val)
+
+       sum_exp += tmp
+
+   logsumexp = log(sum_exp) + max_val
+
+   output[row] = logsumexp
+
+This approach has O(features) operations per row. 
+
+For features=8192 and batch_size=1024, this requires 1024 * 8192 = ~8.5 million operations, which is manageable. 
+
+The problem is that each thread would need to process an entire row of 8192 elements. 
+
+Each thread would have to process 8192 elements sequentially. 
+
+To parallelize this, we can assign each row to a thread block. 
+
+Each block would handle a single row. 
+
+Within a block, threads can collaborate to compute the max and sum. 
+
+Let's think of a block of 256 threads. 
+
+For a row with 8192 elements, we can divide the elements among the threads. 
+
+Each thread processes a chunk of the row's elements. 
+
+For example, each thread processes 32 elements (since 8192 / 256 = 32). 
+
+Each thread computes the max of their chunk and the sum_exp of their chunk. 
+
+Then, perform a block-wide reduction to compute the overall max and sum_exp. 
+
+This way, the kernel can efficiently compute the max and sum for each row in parallel. 
+
+This would be more efficient than having a single thread process the entire row. 
+
+So here's how the kernel could be structured:
+
+Each thread block is assigned to a single row. 
+
+Each thread in the block handles a portion of the row's elements. 
+
+Each thread computes partial max and partial sum for their portion. 
+
+Then, perform a reduction within the block to get the global max and total sum_exp. 
+
+Then compute the logsumexp for the row and write it to the output tensor. 
+
+This approach would be much faster. 
+
+Therefore, implementing a custom logsumexp kernel with block-wise reduction would be beneficial. 
+
+So the plan is:
+
+- Keep the linear layer as is (using PyTorch's optimized implementation)
+
+- Replace the logsumexp with a custom CUDA kernel (fused with the subsequent activations?)
+
+Wait, the subsequent activations after logsumexp are applied to the [batch_size, 1] tensor. 
+
+So after logsumexp, the tensor is of size [batch_size, 1]. Applying two leaky_relu and two gelu on this is trivial, but perhaps can be combined into a single kernel. 
+
+Alternatively, the activations can be applied in sequence using PyTorch functions, but since they are simple, maybe a custom kernel can do them in a single step. 
+
+But since the tensor is only 1 element per sample, the computation is minimal. 
+
+Therefore, perhaps the main gain is in the logsumexp kernel. 
+
+Therefore, the plan is:
+
+- Keep the linear layer as is.
+
+- Replace logsumexp with a custom CUDA kernel. 
+
+- Then, apply the subsequent activations using PyTorch functions, or combine them into a kernel. 
+
+Alternatively, the logsumexp and the two leaky_relu and two gelu can be fused into a single kernel, but given that the activations are on a 1-element tensor, this is trivial and may not be worth the effort. 
+
+Therefore, the main focus is on the logsumexp kernel. 
+
+Now, let's think about implementing the custom logsumexp kernel. 
+
+The input to the logsumexp kernel is the output of the linear layer (a tensor of shape [batch_size, out_features]).
+
+The output is a tensor of shape [batch_size, 1].
+
+The kernel needs to process each row (each sample) independently. 
+
+Let me outline the steps for the kernel:
+
+Kernel structure:
+
+- Each block processes a single row.
+
+- Each thread in the block processes a chunk of elements in the row. 
+
+- Each thread computes partial max and partial sum_exp (sum of exp(x_i - current_max)) for their chunk. 
+
+- Then, within the block, we perform a reduction to find the global max and the total sum_exp. 
+
+Wait, but the max and sum are interdependent. Because the max is needed to compute the exp terms. 
+
+Therefore, the process is:
+
+1. For each row, compute the maximum value in that row.
+
+2. Subtract the max from each element in the row to get x_i - max.
+
+3. Compute the sum of exp(x_i - max) over all elements in the row.
+
+4. The logsumexp is log(sum) + max.
+
+Therefore, the reduction steps are:
+
+First, compute the max of the row. 
+
+Second, compute the sum of exp(x_i - max) over the row. 
+
+Therefore, the kernel can first compute the max, then compute the sum given the max. 
+
+Alternatively, in a single pass, we can track both the max and the sum. 
+
+But for reduction, it's better to separate into two passes. 
+
+Alternatively, the first pass computes the max for each row, then the second pass uses the max to compute the sum. 
+
+But this requires two kernel launches, which may be less efficient. 
+
+Alternatively, in a single kernel, each block can compute both the max and the sum. 
+
+Let me try to structure the kernel:
+
+Each block processes a single row. 
+
+Each thread in the block processes a chunk of elements (e.g., 32 elements). 
+
+The steps per block:
+
+Initialize block_max to -INFINITY, and block_sum_exp to 0.0.
+
+Each thread processes their chunk of elements:
+
+- Compute local_max = max of their chunk.
+
+- Compute local_sum = sum of exp( element - local_max_candidate )
+
+Wait, but the local_max is only for their chunk. 
+
+Alternatively, compute for each element in their chunk:
+
+current_val = x[row][element]
+
+Compare with local_max:
+
+if current_val > local_max:
+
+    local_max = current_val
+
+Compute temp = exp(current_val - local_max_candidate) ? Not sure. 
+
+Hmm, this is getting a bit tangled. 
+
+Perhaps it's better to first compute the max for the row. 
+
+First, compute the max for each row. 
+
+Then, compute the sum of exp(x_i - row_max) for each row. 
+
+These two steps can be done in separate kernels. 
+
+But this requires two kernel launches. 
+
+Alternatively, the first kernel computes the max for each row and stores it, then the second kernel uses the max to compute the sum. 
+
+This way, the two steps are separated. 
+
+But the first step (max reduction) can be implemented with a kernel that for each row, reduces the max across its elements. 
+
+The max reduction can be done efficiently with a block reduction. 
+
+Similarly for the sum. 
+
+Alternatively, the entire process can be done in a single kernel, by first computing the max and then using it to compute the sum. 
+
+Wait, here's an approach:
+
+Each block processes a row. 
+
+Within the block, each thread processes a portion of the row. 
+
+Each thread computes the max and the sum of exp(x_i - current_max) for their portion. 
+
+Then, perform a reduction in the block to get the overall max and sum. 
+
+Wait, but how can we track both max and the sum? 
+
+The problem is that the max is needed to compute the terms in the sum. 
+
+Therefore, first, compute the max for the row. 
+
+Once the max is known, compute the sum of exp(x_i - max). 
+
+Therefore, the kernel can first compute the max, then compute the sum. 
+
+This requires two passes over the data. 
+
+Alternatively, in a single kernel, the threads can first compute partial max and partial sum. 
+
+Wait, let's try this:
+
+Each thread in the block processes a chunk of the row's elements. 
+
+For each element in their chunk:
+
+- current_val = x[row][element]
+
+- update the thread's local_max (starting from -inf)
+
+- accumulate the value into the local_sum (starting from 0)
+
+After processing all elements in their chunk, the thread has a local_max and local_sum. 
+
+Then, in the block, we can first compute the global_max by taking the maximum of all the thread's local_max. 
+
+Once the global_max is known, then we can recompute the sum over all elements, using the global_max. 
+
+Wait, but that would require reprocessing the elements again, which is inefficient. 
+
+Alternatively, first compute the global_max, then have each thread process their chunk again, this time using the global_max to compute the exp terms and accumulate into the sum. 
+
+This would require two passes over the data for each row. 
+
+This is not ideal. 
+
+Another approach is to compute the max and the sum in a single pass, but the sum is computed as the sum of exp(current_val - current_max), where current_max is the running max. 
+
+However, this would be incorrect because the current_max is not the global max. 
+
+Alternatively, the following approach can be used:
+
+Compute the global max first. 
+
+Then compute the sum using the global max. 
+
+This requires two passes but can be done efficiently with block reductions. 
+
+First kernel: compute the row max.
+
+Second kernel: compute the sum using the max. 
+
+Let me outline how to implement this. 
+
+First, compute the row max:
+
+Each block handles a row. 
+
+Each thread processes a chunk of elements in the row. 
+
+Each thread computes the local_max of their chunk. 
+
+Then, a block reduction (using shared memory) finds the global_max for the row. 
+
+The global_max is stored in a buffer. 
+
+Second kernel: compute the sum of exp(x_i - global_max) for each row. 
+
+Again, each block handles a row. 
+
+Each thread processes their chunk, and for each element in their chunk:
+
+compute term = exp( (element - global_max) )
+
+add to local_sum. 
+
+Then, a block reduction sums all local_sums to get the total_sum. 
+
+The logsumexp is log(total_sum) + global_max. 
+
+This requires two kernel launches. 
+
+The total FLOPs would be manageable. 
+
+The code for this would be as follows: 
+
+First, a kernel to compute the max for each row. 
+
+Second, a kernel to compute the sum. 
+
+Alternatively, this can be done in a single kernel by first computing the max, storing it in shared memory, then computing the sum. 
+
+Here's an outline of the single kernel approach:
+
+__global__ void logsumexp_kernel(const float* input, float* output, int batch_size, int features, float* row_max) {
+
+    int row = blockIdx.x;
+
+    extern __shared__ float sdata[];
+
+    // Shared memory to store partial max and partial sums
+
+    // Each thread processes a portion of the row
+
+    int tid = threadIdx.x;
+
+    int nthreads = blockDim.x;
+
+    float local_max = -INFINITY;
+
+    float local_sum = 0.0f;
+
+    for (int i = tid; i < features; i += nthreads) {
+
+        float val = input[row * features + i];
+
+        if (val > local_max) {
+
+            local_max = val;
+
+        }
+
+    }
+
+    // Reduce within the block to find the global max for the row
+
+    // Step 1: compute max
+
+    __shared__ float block_max;
+
+    // Use a reduction to find the max in shared memory
+
+    // ... similar to a block reduction for max
+
+    if (threadIdx.x == 0) {
+
+        block_max = -INFINITY;
+
+    }
+
+    __syncthreads();
+
+    // Perform reduction here for max...
+
+    // After reduction, block_max contains the global max for the row
+
+    // Now, compute the sum of exp(val - block_max)
+
+    // Reset local_sum
+
+    local_sum = 0.0f;
+
+    for (int i = tid; i < features; i += nthreads) {
+
+        float val = input[row * features + i];
+
+        float term = expf(val - block_max);
+
+        local_sum += term;
+
+    }
+
+    // Reduce within block to get total_sum
+
+    // ... similar to sum reduction
+
+    if (threadIdx.x == 0) {
+
+        float total_sum = ... ; // result of sum reduction
+
+        output[row] = logf(total_sum) + block_max;
+
+    }
+
+}
+
+Wait, this requires performing two reductions: first for the max, then for the sum. 
+
+But the problem is that after computing the max, the threads need to process the elements again to compute the sum. 
+
+This would require two passes over the data. 
+
+Alternatively, perhaps the first loop can be used to compute both the max and store the values. 
+
+Alternatively, using shared memory to store the max and then have each thread process their chunk again. 
+
+This might be possible but is getting complex. 
+
+Alternatively, let's proceed with the two kernel approach, which might be easier to code and understand. 
+
+First, compute the row max:
+
+Kernel 1: compute max for each row. 
+
+Kernel 2: compute the sum using the row max. 
+
+Then combine into the final logsumexp value. 
+
+Alternatively, the two kernels can be combined into a single kernel by first computing the max, then the sum. 
+
+Alternatively, let's proceed with writing the logsumexp kernel in a way that can be done efficiently. 
+
+Another thing to consider is that the logsumexp can be implemented with a block-wide reduction for each row. 
+
+Let me look for an example. 
+
+Alternatively, using CUDA's warp-level primitives could help. 
+
+Alternatively, here's a possible implementation:
+
+The kernel for logsumexp:
+
+Each thread block is responsible for one row.
+
+The number of threads per block can be chosen as, say, 256.
+
+The block processes the row's features in chunks. 
+
+The code outline:
+
+__global__ void logsumexp_kernel(const float* input, float* output, int batch_size, int features) {
+
+    __shared__ float sdata[256]; // Assuming block size 256.
+
+    int row = blockIdx.x;
+
+    int tid = threadIdx.x;
+
+    // Each thread processes a chunk of elements in the row.
+
+    float local_max = -FLT_MAX;
+
+    float local_sum = 0.0f;
+
+    for (int i = tid; i < features; i += blockDim.x) {
+
+        float val = input[row * features + i];
+
+        if (val > local_max) {
+
+            local_max = val;
+
+        }
+
+    }
+
+    // Step 1: compute the block max via reduction.
+
+    // Reduction for max.
+
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+
+        __syncthreads();
+
+        if (tid < s) {
+
+            if (sdata[tid + s] > sdata[tid]) {
+
+                sdata[tid] = sdata[tid + s];
+
+            }
+
+        }
+
+    }
+
+    float row_max = (tid ==0 ) ? sdata[0] : 0;
+
+    __syncthreads();
+
+    // Now compute the sum of exp(val - row_max)
+
+    local_sum = 0.0f;
+
+    for (int i = tid; i < features; i += blockDim.x) {
+
+        float val = input[row * features + i] - row_max;
+
+        local_sum += expf(val);
+
+    }
+
+    // Reduce the sum.
+
+    for (int s=blockDim.x/2; s>0; s>>=1) {
+
+        __syncthreads();
+
+        if (tid < s) {
+
+            sdata[tid] += sdata[tid + s];
+
+        }
+
+    }
+
+    if (tid == 0) {
+
+        output[row] = logf(sdata[0]) + row_max;
+
+    }
+
+}
+
+Wait, but this code has several issues. For example, the sdata array is initialized as shared memory but not properly used. Also, the first loop for local_max uses local variables but does not use shared memory. 
+
+Perhaps a better approach is needed. 
+
+Alternatively, here's a revised plan:
+
+For each row:
+
+1. Compute the max of all elements in the row.
+
+2. Compute the sum of exp(x_i - max).
+
+3. The logsumexp is log(sum) + max.
+
+To compute the max, each thread in the block can process a portion of the row's elements, track their local max, and then perform a block-wide reduction to find the global max. 
+
+Then, using the global max, each thread can compute their portion's contribution to the sum, and again perform a block-wide reduction to get the total sum. 
+
+The final value is computed in a single thread per block. 
+
+The kernel would look something like this:
+
+__global__ void logsumexp_kernel(const float* input, float* output, int batch_size, int features) {
+
+    extern __shared__ float sdata[];
+
+    int row = blockIdx.x;
+
+    int tid = threadIdx.x;
+
+    int nthreads = blockDim.x;
+
+    // Step 1: Compute the row max.
+
+    float local_max = -FLT_MAX;
+
+    for (int i = tid; i < features; i += nthreads) {
+
+        float val = input[row * features + i];
+
+        if (val > local_max) {
+
+            local_max = val;
+
+        }
+
+    }
+
+    // Reduce to get the block max.
+
+    // Use shared memory for reduction.
+
+    sdata[tid] = local_max;
+
+    __syncthreads();
+
+    for (int s = blockDim.x/2; s > 0; s >>=1) {
+
+        if (tid < s) {
+
+            if (sdata[tid + s] > sdata[tid]) {
+
+                sdata[tid] = sdata[tid + s];
+

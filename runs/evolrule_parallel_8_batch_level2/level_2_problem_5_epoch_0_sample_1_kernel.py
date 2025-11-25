@@ -1,0 +1,1 @@
+This implementation fuses the bias subtraction and tanh into a single kernel, reducing memory transfers and kernel launch overhead. The kernel uses efficient indexing to access the bias per channel, ensuring correctness without expanding the bias tensor. This should improve performance while maintaining numerical accuracy.

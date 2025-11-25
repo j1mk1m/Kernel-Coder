@@ -1,0 +1,1 @@
+All tests passed successfully. The custom CUDA kernel for cumulative sum is correctly implemented and performs significantly faster than the PyTorch version.

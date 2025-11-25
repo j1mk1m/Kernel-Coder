@@ -1,0 +1,166 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for GEMM
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum += A[row * K + k] * B[k * N + col];
+        }
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor gemm_cuda(torch::Tensor A, torch::Tensor B) {
+    int M = A.size(0);
+    int N = B.size(1);
+    int K = A.size(1);
+
+    auto C = torch::zeros({M, N}, A.options());
+
+    const int block_size = 16;
+    const int num_blocks_x = (N + block_size - 1) / block_size;
+    const int num_blocks_y = (M + block_size - 1) / block_size;
+
+    gemm_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, N, K);
+
+    return C;
+}
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor gemm_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for GEMM
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for BatchNorm
+batchnorm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void batchnorm_kernel(const float* X, const float* gamma, const float* beta, float* Y, int N, int C) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < N * C) {
+        int c = index % C;
+        int n = index / C;
+        float mean = X[n * C + c];
+        float var = X[n * C + c];
+        Y[index] = gamma[c] * ((X[index] - mean) / sqrt(var + 1e-5)) + beta[c];
+    }
+}
+
+torch::Tensor batchnorm_cuda(torch::Tensor X, torch::Tensor gamma, torch::Tensor beta) {
+    int N = X.size(0);
+    int C = X.size(1);
+
+    auto Y = torch::zeros_like(X);
+
+    const int block_size = 256;
+    const int num_blocks = (N * C + block_size - 1) / block_size;
+
+    batchnorm_kernel<<<num_blocks, block_size>>>(X.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(), Y.data_ptr<float>(), N, C);
+
+    return Y;
+}
+"""
+
+batchnorm_cpp_source = (
+    "torch::Tensor batchnorm_cuda(torch::Tensor X, torch::Tensor gamma, torch::Tensor beta);"
+)
+
+# Compile the inline CUDA code for BatchNorm
+batchnorm = load_inline(
+    name="batchnorm",
+    cpp_sources=batchnorm_cpp_source,
+    cuda_sources=batchnorm_source,
+    functions=["batchnorm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for GELU
+gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gelu_kernel(const float* X, float* Y, int N) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < N) {
+        Y[index] = 0.5f * X[index] * (1.0f + tanh(sqrt(2.0f / M_PI) * (X[index] + 0.044715f * pow(X[index], 3))));
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor X) {
+    int N = X.size(0);
+
+    auto Y = torch::zeros_like(X);
+
+    const int block_size = 256;
+    const int num_blocks = (N + block_size - 1) / block_size;
+
+    gelu_kernel<<<num_blocks, block_size>>>(X.data_ptr<float>(), Y.data_ptr<float>(), N);
+
+    return Y;
+}
+"""
+
+gelu_cpp_source = (
+    "torch::Tensor gelu_cuda(torch::Tensor X);"
+)
+
+# Compile the inline CUDA code for GELU
+gelu = load_inline(
+    name="gelu",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_source,
+    functions=["gelu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.gemm = gemm
+        self.batch_norm = batchnorm
+        self.gelu = gelu
+
+    def forward(self, x):
+        x = self.gemm.gemm_cuda(x, x.new_zeros((x.size(1), out_features)))
+        x = self.batch_norm.batchnorm_cuda(x, x.new_ones(out_features), x.new_zeros(out_features))
+        x = self.gelu.gelu_cuda(x)
+        x = torch.relu(x)
+        return x
+
+if __name__ == "__main__":
+    batch_size = 16384
+    in_features = 4096
+    out_features = 4096
+    model = ModelNew(in_features, out_features)
+    inputs = get_inputs()[0].cuda()
+    outputs = model(inputs)
+    print(outputs.shape)

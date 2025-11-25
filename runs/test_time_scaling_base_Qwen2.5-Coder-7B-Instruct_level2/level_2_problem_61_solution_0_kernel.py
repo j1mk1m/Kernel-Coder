@@ -1,0 +1,235 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed 3D convolution
+transposed_conv3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void transposed_conv3d_kernel(float* input, float* weight, float* output, int batch_size, int in_channels, int out_channels, int D_in, int H_in, int W_in, int D_out, int H_out, int W_out, int stride_d, int stride_h, int stride_w, int padding_d, int padding_h, int padding_w) {
+    int batch = blockIdx.z;
+    int oc = blockIdx.y * blockDim.y + threadIdx.y;
+    int ic = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (oc >= out_channels || ic >= in_channels) {
+        return;
+    }
+
+    int o_d_start = (threadIdx.z == 0) ? 0 : (D_out - 1);
+    int o_h_start = (threadIdx.y == 0) ? 0 : (H_out - 1);
+    int o_w_start = (threadIdx.x == 0) ? 0 : (W_out - 1);
+
+    for (int d_out = o_d_start; d_out < D_out; d_out += stride_d) {
+        for (int h_out = o_h_start; h_out < H_out; h_out += stride_h) {
+            for (int w_out = o_w_start; w_out < W_out; w_out += stride_w) {
+                int i_d = d_out * stride_d - padding_d;
+                int i_h = h_out * stride_h - padding_h;
+                int i_w = w_out * stride_w - padding_w;
+
+                if (i_d >= 0 && i_d < D_in && i_h >= 0 && i_h < H_in && i_w >= 0 && i_w < W_in) {
+                    int input_index = batch * in_channels * D_in * H_in * W_in + ic * D_in * H_in * W_in + i_d * H_in * W_in + i_h * W_in + i_w;
+                    int weight_index = oc * in_channels * D_in * H_in * W_in + ic * D_in * H_in * W_in + i_d * H_in * W_in + i_h * W_in + i_w;
+                    int output_index = batch * out_channels * D_out * H_out * W_out + oc * D_out * H_out * W_out + d_out * H_out * W_out + h_out * W_out + w_out;
+
+                    atomicAdd(&output[output_index], input[input_index] * weight[weight_index]);
+                }
+            }
+        }
+    }
+}
+
+torch::Tensor transposed_conv3d_cuda(torch::Tensor input, torch::Tensor weight) {
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int out_channels = weight.size(0);
+    int D_in = input.size(2);
+    int H_in = input.size(3);
+    int W_in = input.size(4);
+    int D_out = (D_in - 1) * stride_d + 1;
+    int H_out = (H_in - 1) * stride_h + 1;
+    int W_out = (W_in - 1) * stride_w + 1;
+
+    auto output = torch::zeros({batch_size, out_channels, D_out, H_out, W_out}, input.options());
+
+    dim3 threads_per_block(8, 8, 1);
+    dim3 blocks_per_grid((in_channels + threads_per_block.x - 1) / threads_per_block.x,
+                         (out_channels + threads_per_block.y - 1) / threads_per_block.y,
+                         batch_size);
+
+    transposed_conv3d_kernel<<<blocks_per_grid, threads_per_block>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(),
+                                                                     batch_size, in_channels, out_channels, D_in, H_in, W_in, D_out, H_out, W_out,
+                                                                     stride_d, stride_h, stride_w, padding_d, padding_h, padding_w);
+
+    return output;
+}
+"""
+
+transposed_conv3d_cpp_source = (
+    "torch::Tensor transposed_conv3d_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for transposed 3D convolution
+transposed_conv3d = load_inline(
+    name="transposed_conv3d",
+    cpp_sources=transposed_conv3d_cpp_source,
+    cuda_sources=transposed_conv3d_source,
+    functions=["transposed_conv3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for ReLU activation
+relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_kernel(float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = fmaxf(input[idx], 0.0f);
+    }
+}
+
+torch::Tensor relu_cuda(torch::Tensor input) {
+    auto size = input.numel();
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    relu_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+relu_cpp_source = (
+    "torch::Tensor relu_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for ReLU activation
+relu = load_inline(
+    name="relu",
+    cpp_sources=relu_cpp_source,
+    cuda_sources=relu_source,
+    functions=["relu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for Group Normalization
+group_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void group_norm_kernel(float* input, float* mean, float* var, float* gamma, float* beta, float* output, int batch_size, int channels, int D, int H, int W, int groups, float eps) {
+    int batch = blockIdx.z;
+    int g = blockIdx.y;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (c >= channels) {
+        return;
+    }
+
+    int c_group = c % groups;
+    int n_elements = D * H * W / groups;
+
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+
+    for (int i = 0; i < n_elements; ++i) {
+        int index = batch * channels * D * H * W + c * D * H * W + i;
+        sum += input[index];
+        sum_sq += input[index] * input[index];
+    }
+
+    mean[batch * groups + g] = sum / n_elements;
+    var[batch * groups + g] = sum_sq / n_elements - mean[batch * groups + g] * mean[batch * groups + g];
+
+    __syncthreads();
+
+    float inv_std = rsqrt(var[batch * groups + g] + eps);
+    float scale = gamma[g * channels + c_group];
+    float shift = beta[g * channels + c_group];
+
+    for (int i = 0; i < n_elements; ++i) {
+        int index = batch * channels * D * H * W + c * D * H * W + i;
+        output[index] = scale * (input[index] - mean[batch * groups + g]) * inv_std + shift;
+    }
+}
+
+torch::Tensor group_norm_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, float eps) {
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+    int groups = gamma.size(0);
+
+    auto mean = torch::zeros({batch_size, groups});
+    auto var = torch::zeros({batch_size, groups});
+    auto output = torch::zeros_like(input);
+
+    dim3 threads_per_block(32, 1, 1);
+    dim3 blocks_per_grid((channels + threads_per_block.x - 1) / threads_per_block.x,
+                         groups,
+                         batch_size);
+
+    group_norm_kernel<<<blocks_per_grid, threads_per_block>>>(input.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(),
+                                                               gamma.data_ptr<float>(), beta.data_ptr<float>(), output.data_ptr<float>(),
+                                                               batch_size, channels, D, H, W, groups, eps);
+
+    return output;
+}
+"""
+
+group_norm_cpp_source = (
+    "torch::Tensor group_norm_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, float eps);"
+)
+
+# Compile the inline CUDA code for Group Normalization
+group_norm = load_inline(
+    name="group_norm",
+    cpp_sources=group_norm_cpp_source,
+    cuda_sources=group_norm_source,
+    functions=["group_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.relu = nn.ReLU()
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels)
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.relu(x)
+        x = self.group_norm(x)
+        return x
+
+
+if __name__ == "__main__":
+    batch_size = 16
+    in_channels = 64
+    out_channels = 128
+    D, H, W = 32, 32, 32
+    kernel_size = 3
+    groups = 8
+    bias = False
+
+    model_new = ModelNew(in_channels, out_channels, kernel_size, groups, bias)
+    inputs = get_inputs()
+
+    outputs_new = model_new(inputs[0])
+    print(outputs_new.shape)

@@ -1,0 +1,807 @@
+You may assume that the input tensors are always contiguous. You can also assume that the input tensor dimensions are compatible for each operator (no need for error checking). You can also assume that the input tensors are on the GPU. 
+
+The goal is to maximize the speedup, so you should aim to fuse as many operators as possible into a single CUDA kernel. For example, fusing matmul + leaky_relu into one kernel would be a good idea. The more operators fused into a single kernel, the better. 
+
+You may need to look up the mathematical definitions of the operations involved, but I'll give you a brief summary here:
+- LogSumExp: LSE(x) = log( sum( exp(x_i) ) for i in elements along a dimension )
+- LeakyReLU: LReLU(x) = max(0, x) + negative_slope * min(0, x)
+- GELU: GELU(x) = 0.5 * x * (1 + tanh( sqrt(2 / pi) * (x + 0.044715 * x^3) )) 
+
+You should also consider whether to implement any of these activations in a more efficient way, e.g., using an approximation for GELU or combining steps to reduce computation.
+
+You can also make use of existing CUDA libraries (cuBLAS, cuDNN) where appropriate, but in cases where fusing is possible, you should prefer fused kernels to get maximum speedup.
+
+Start your answer with:
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        # Your code here
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+Then, write the CUDA code inline using load_inline. Make sure to replace all the operators in the forward method with calls to your fused CUDA kernels. 
+
+You can define multiple CUDA kernels if needed. Make sure to import any necessary libraries and that all dependencies are included.
+
+The fused kernels should process the entire computation path from the input x through all the operations up to the final GELU, in a single CUDA kernel if possible. If it's too complex, fuse as much as possible. 
+
+Make sure the final output is correct and matches the original model's output numerically (within reasonable floating point tolerance). 
+
+To simplify, you can assume that all the operations are applied element-wise after the initial linear layer (except LogSumExp which is along a dimension). 
+
+Also, you can choose to implement the GELU using an approximation, such as the tanh approximation, which might be faster but less accurate. 
+
+You can also combine the two LeakyReLU layers since they have the same negative slope, but they are separate in the original code. 
+
+The LogSumExp is along dim=1, which for a batch of size [batch_size, out_features], this reduces the tensor to [batch_size, 1], so after that, all subsequent operations are applied to this 1-dimension tensor. 
+
+Your fused CUDA kernel must handle the reduction in LogSumExp and the subsequent activations. 
+
+The key challenge is to implement all these steps in a single CUDA kernel to minimize memory transfers and maximize parallelism. 
+
+Remember, the goal is to maximize speedup.
+
+
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused CUDA kernel combining Linear (matmul + bias), LogSumExp, LeakyReLU x2, and GELU x2
+fused_kernel_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+
+template <typename T>
+__device__ T logsumexp(const T* data, int size) {
+    T max_val = -INFINITY;
+    T sum = 0;
+    for (int i = 0; i < size; ++i) {
+        T val = data[i];
+        if (val > max_val) max_val = val;
+    }
+    for (int i = 0; i < size; ++i) {
+        sum += exp(data[i] - max_val);
+    }
+    return max_val + log(sum);
+}
+
+template <typename T>
+__device__ T leaky_relu(T x, T neg_slope) {
+    return x > 0 ? x : neg_slope * x;
+}
+
+template <typename T>
+__device__ T gelu_approx(T x) {
+    // Tanh approximation for GELU: 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+    const T sqrt_2_over_pi = 0.7978845608;
+    const T a = 0.044715;
+    T inner = sqrt_2_over_pi * (x + a * x * x * x);
+    return 0.5 * x * (1 + tanh(inner));
+}
+
+extern "C" __global__ void fused_forward_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* output,
+    int batch_size,
+    int in_features,
+    int out_features
+) {
+    // Each block handles a single sample in the batch
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    // Compute the linear layer (matrix multiplication + bias)
+    float* linear_out = new float[out_features]; // Not efficient, but for illustration
+    for (int j = 0; j < out_features; j++) {
+        linear_out[j] = 0.0f;
+        for (int k = 0; k < in_features; k++) {
+            linear_out[j] += input[sample_idx * in_features + k] * weight[j * in_features + k];
+        }
+        linear_out[j] += bias[j];
+    }
+
+    // Compute LogSumExp over dim=1 (out_features dimension)
+    float lse = logsumexp(linear_out, out_features);
+
+    // Apply first LeakyReLU (slope 0.01)
+    float x = leaky_relu(lse, 0.01f);
+    // Apply second LeakyReLU (same slope)
+    x = leaky_relu(x, 0.01f);
+
+    // Apply first GELU approximation
+    x = gelu_approx(x);
+    // Apply second GELU approximation
+    x = gelu_approx(x);
+
+    // Store result in output
+    output[sample_idx] = x;
+
+    delete[] linear_out; // Not memory efficient, but for kernel correctness
+}
+
+torch::Tensor fused_forward_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
+    const int batch_size = input.size(0);
+    const int in_features = input.size(1);
+    const int out_features = weight.size(0);
+
+    auto output = torch::empty({batch_size, 1}, input.options());
+
+    const int threads = 256;
+    const int blocks = batch_size;
+
+    // Note: The kernel may need tuning and proper memory allocation
+    fused_forward_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features
+    );
+
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+fused_cpp_source = "torch::Tensor fused_forward_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);"
+
+# Compile the fused kernel
+fused_op = load_inline(
+    name="fused_op",
+    cpp_sources=fused_cpp_source,
+    cuda_sources=fused_kernel_source,
+    functions=["fused_forward_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.fused_op = fused_op
+
+    def forward(self, x):
+        # The fused kernel expects input, weight, and bias as separate tensors
+        weight = self.linear.weight.t().contiguous()  # Transposed for correct matmul
+        bias = self.linear.bias.contiguous()
+        x = x.contiguous()
+        return self.fused_op.fused_forward_cuda(x, weight, bias).view(-1, 1)
+
+def get_inputs():
+    batch_size = 1024
+    in_features = 8192
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+```python
+# Note: The above code contains a simplified kernel that may not be optimized for memory or performance.
+# The linear layer computation in the kernel uses a naive matrix multiplication which is not efficient.
+# In practice, you would use cuBLAS for the matrix multiplication and optimize memory allocations.
+# The logsumexp and element-wise operations are fused into a single kernel for maximum speedup.
+# The GELU uses an approximation to reduce computation.
+# The kernel assumes that the weight matrix is transposed as per PyTorch's linear layer implementation.
+# Further optimizations would include:
+# 1. Using shared memory for weight matrix to improve cache efficiency
+# 2. Implementing matrix multiplication with tiled approach for better performance
+# 3. Replacing the per-thread logsumexp with a parallel reduction using CUB
+# 4. Removing dynamic memory allocation (linear_out) by using shared memory or thread-local storage
+# 5. Optimizing thread and block configurations for maximum GPU utilization
+# 6. Unrolling loops and using vectorized operations where possible
+```
+</think>
+
+Wait, I see some issues here. Let me walk through the code step by step. First, in the fused_forward_kernel, you're using a naive matrix multiplication with nested loops. That's going to be very slow compared to cuBLAS. Also, the dynamic allocation of linear_out inside the kernel is problematic because it's not using shared memory and could cause memory fragmentation. Plus, the logsumexp implementation here is not parallelized. Let me think of how to optimize this properly.
+
+Another thing: the weight in PyTorch's Linear layer is stored as (out_features, in_features), so when you do the matrix multiplication, you need to transpose it. But in the kernel, the weight is accessed as weight[j * in_features + k], which implies it's stored in row-major order. So if the weight tensor passed to the kernel is the transposed version, that would be correct. Wait, in the ModelNew's forward, the code does weight = self.linear.weight.t().contiguous(), which transposes the weight matrix so that the dimensions are (in_features, out_features). Then in the kernel, the weight is accessed as weight[j * in_features + k], which would be correct for a row-wise traversal.
+
+But the matrix multiplication is done with two loops, which is O(N^2) per thread. That's going to be a bottleneck. To fix this, we should use cuBLAS for the matrix multiplication part. Alternatively, implement a tiled matrix multiplication kernel, but that's complicated.
+
+Alternatively, maybe we can split the computation into two parts: first do the matrix multiplication with cuBLAS, then do the rest in a single kernel. But the user wanted to fuse as much as possible into a single kernel. Hmm.
+
+Alternatively, since the LogSumExp reduces the output of the linear layer to a single value per sample, maybe we can compute the LogSumExp in a way that avoids storing the entire linear output. Let's think:
+
+The linear output is x = W * input + bias. To compute LogSumExp over the features dimension (dim=1), which is the out_features dimension. The LogSumExp is log(sum(exp(x_i))), so for each sample, we can compute this without storing the entire x array.
+
+Wait, but to compute the LogSumExp, we need all elements of x for that sample. So perhaps we can compute the linear layer in a way that accumulates the sum for each element of x, then compute the max and sum of exps in a single pass.
+
+Alternatively, here's an optimized approach:
+
+1. Compute the linear layer's output in a way that for each sample, we compute each element of x and immediately contribute to the LogSumExp computation.
+
+Wait, but the LogSumExp is over all the elements of x for a given sample. So for each sample, the LogSumExp requires the maximum value among all x elements for that sample, then the sum of exp(x_i - max). 
+
+Therefore, perhaps we can compute for each sample:
+
+- Initialize max_val and sum_exp to 0
+- For each element in x (each of the out_features elements for the sample):
+   - Compute x_ij = sum_{k} input_ik * weight_jk + bias_j (the linear output for that element)
+   - Update max_val with x_ij if it's larger
+   - Add exp(x_ij - current_max) to sum_exp (but need to track the current max properly)
+   
+Wait, but tracking the max and sum while computing x_ij would require per-element computation.
+
+This seems complicated but possible. Let's try rethinking the kernel structure.
+
+Let me outline the steps for a single sample:
+
+For sample i:
+
+Compute all x_i1, x_i2,...,x_iO (O is out_features)
+
+Compute max_x_i = max(x_i1, x_i2,...,x_iO)
+
+Compute sum_exp = sum(exp(x_ij - max_x_i) for all j)
+
+Then LSE = max_x_i + log(sum_exp)
+
+Then apply the two LeakyReLU layers (which, since they have the same slope, can be combined into one: leaky_relu(leaky_relu(x, 0.01), 0.01) = leaky_relu(x, 0.01) because applying it twice with the same slope doesn't change anything. Wait, actually, no:
+
+Wait, applying LeakyReLU twice with the same slope:
+
+First pass: x becomes max(0, x) + 0.01*min(0, x)
+
+Second pass: same. But the result after first pass is already the same as the second pass. So applying LeakyReLU twice with the same slope is redundant. Therefore, the two LeakyReLU can be fused into one. That's a good optimization point.
+
+Similarly, the two GELU layers can be fused into one, since applying GELU twice is the same as once (since GELU is applied element-wise and the function is its own composition? Wait no, GELU is a non-linear function; applying it twice would not be the same. So that can't be optimized away. So we have to compute GELU twice.
+
+Therefore, in the kernel, after computing the LSE value, we need to apply LeakyReLU once (since two are redundant), then apply GELU twice.
+
+Wait, let's verify the LeakyReLU redundancy:
+
+Let’s say the first LeakyReLU gives y = LReLU(x), then the second gives z = LReLU(y). Since the negative slope is 0.01, for y < 0: y = 0.01x, so z = 0.01*(0.01x) = 0.0001x? Wait no:
+
+Wait original x is the LSE value, which is log(sum(exp(...))), which is always a real number. But after the first LReLU, if x was negative, then y = 0.01x. Then the second LReLU would apply to y, which if y was negative (i.e., original x was negative), then z = 0.01*y = 0.01*(0.01x) = 0.0001x. But if x is positive, then y and z are both x.
+
+But in the original model, the LSE output is passed through two LeakyReLU layers with the same slope. That might be intentional, but it's mathematically equivalent to a single LeakyReLU with slope 0.01^2 = 0.0001. However, unless the original code had a specific reason for doing that, it's a redundant computation. However, since the user provided the original code with two LeakyReLU layers, we must preserve that behavior. Therefore, the two LeakyReLU layers must be applied in sequence, not combined.
+
+So back to the kernel:
+
+The problem is that the naive matrix multiplication in the kernel is too slow. To fix this, we need to compute the linear layer efficiently. Since the user allows using existing CUDA libraries, we can use cuBLAS for the matrix multiplication part, then proceed with the rest in a single kernel.
+
+Alternatively, we can split the kernel into two steps: first compute the matrix multiplication with cuBLAS, then compute the LogSumExp and activations in a separate kernel. But the user wants as much fusion as possible.
+
+Alternatively, let's try to restructure the kernel to compute the LogSumExp in a way that doesn't require storing the entire linear output. Let's consider that for each sample, we can compute the max and sum of exponentials on the fly while computing the linear layer.
+
+Here's an outline for a single thread per sample:
+
+Each thread handles one sample. For that sample, it iterates over all out_features elements (j from 0 to out_features-1):
+
+For each j:
+
+1. Compute x_j = (input_i * weight_j) + bias_j. Wait, how to compute this efficiently?
+
+Wait, the linear layer is x = W * input + bias. Each element x_j is the dot product of the input vector with the j-th row of W plus the bias_j. So for a single sample, to compute all x_j, it requires O(out_features * in_features) operations. This is expensive, especially with in_features=8192 and out_features=8192, leading to 8192^2 operations per sample, which is 67 million per sample and 6.7 billion for a batch of 1024. That's way too much.
+
+This suggests that the fused kernel approach may not be feasible due to computational complexity. Maybe it's better to offload the matrix multiplication to cuBLAS and then process the rest in a fused kernel.
+
+Let me recalculate the operations:
+
+Original architecture:
+
+- The matrix multiplication (gemm) is the dominant operation with O(batch * out * in) FLOPs.
+
+- The subsequent operations (logsumexp, two leaky_relu, two GELU) are O(batch * out) for the LogSumExp (since it reduces each sample's output to a scalar), then O(batch) for each activation.
+
+Thus, the dominant cost is the gemm. So fusing the post-operations won't help much if the gemm is already done via cuBLAS (which is optimized). The only potential gain is avoiding some memory copies or intermediate allocations.
+
+Therefore, perhaps the optimal approach is to leave the gemm to cuBLAS (via PyTorch's linear layer), then implement a fused kernel for LogSumExp followed by the activations.
+
+Let me see:
+
+Original forward path:
+
+x = linear(x) --> [batch, out_features]
+
+x = logsumexp(dim=1) --> [batch, 1]
+
+then apply leaky_relu twice and GELU twice.
+
+These operations can be fused into a single kernel that takes the linear output (already computed via PyTorch's optimized Linear layer) and computes the rest in a single step.
+
+This reduces the problem to fusing logsumexp, two leaky_relu, and two GELU into a single kernel.
+
+Let's proceed with that approach.
+
+So the kernel would take the output of the linear layer (a tensor of size [batch, out_features]), and compute for each sample the LSE, then apply the activations.
+
+Thus, the kernel can be structured as follows:
+
+For each sample in parallel:
+
+1. Compute LSE over the out_features dimension.
+
+2. Apply first LeakyReLU.
+
+3. Apply second LeakyReLU (which can be merged into the first one if redundant, but we must preserve the original behavior).
+
+4. Apply first GELU.
+
+5. Apply second GELU.
+
+This reduces the kernel to O(batch) computations instead of O(batch*out_features), which is much better.
+
+This approach allows us to leverage PyTorch's optimized gemm while fusing the rest.
+
+So the ModelNew would be:
+
+class ModelNew(nn.Module):
+    def __init__(self, ...):
+        self.linear = nn.Linear(...)
+        self.fused_post = load_inline(...)
+
+    def forward(self, x):
+        x = self.linear(x)  # uses PyTorch's optimized gemm
+        x = self.fused_post.kernel(x)
+        return x
+
+The fused kernel would process each sample independently.
+
+Now let's write this kernel.
+
+The kernel needs to process each sample's out_features elements to compute the LSE, then process the resulting scalar through the activations.
+
+The steps for each sample:
+
+Compute LSE:
+
+max_val = max(x_j for j in 0..out_features-1)
+
+sum_exp = sum(exp(x_j - max_val))
+
+lse_val = max_val + log(sum_exp)
+
+Then apply two leaky_relu with slope 0.01:
+
+val = leaky_relu(lse_val, 0.01)
+
+val = leaky_relu(val, 0.01) --> which is equivalent to leaky_relu once with slope 0.01, since if the first result was negative, the second applies 0.01 again, leading to 0.01^2*x. But since the user's code has two layers, we must do it twice.
+
+Then apply two GELU approximations.
+
+Thus, the kernel would process each sample's x tensor (size out_features) to compute the LSE and subsequent activations.
+
+Implementing this in CUDA:
+
+Each thread can handle a single sample.
+
+For each sample (thread):
+
+1. Iterate over all out_features elements to compute max and sum_exp.
+
+Wait, but out_features is 8192. Iterating 8192 elements per thread might be slow. To optimize, we can use parallel reduction for the max and sum.
+
+Alternatively, use CUB library for parallel reduction inside the kernel.
+
+Let me outline the kernel with CUB:
+
+First, for each sample, we need to compute the max and sum of exp(x_j - max).
+
+But to compute the max, we can use a parallel reduction.
+
+Similarly for the sum.
+
+Thus, using CUB's device-wide operations.
+
+The kernel code:
+
+#include <cub/cub.cuh>
+
+__global__ void fused_post_kernel(
+    const float* input,  // shape [batch, out_features]
+    float* output,       // shape [batch, 1]
+    int batch_size,
+    int out_features
+) {
+    int sample_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    // Get pointer to current sample's features
+    const float* sample_data = input + sample_idx * out_features;
+
+    // Compute max_val
+    float max_val = -INFINITY;
+    #pragma unroll
+    for (int j = 0; j < out_features; j++) {
+        if (sample_data[j] > max_val) {
+            max_val = sample_data[j];
+        }
+    }
+
+    // Compute sum_exp = sum(exp(x_j - max_val))
+    float sum_exp = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < out_features; j++) {
+        float temp = sample_data[j] - max_val;
+        sum_exp += exp(temp);
+    }
+
+    float lse = max_val + log(sum_exp);
+
+    // Apply first LeakyReLU
+    lse = (lse > 0) ? lse : 0.01f * lse;
+    // Apply second LeakyReLU
+    lse = (lse > 0) ? lse : 0.01f * lse;
+
+    // Apply first GELU approximation
+    float a = 0.044715f;
+    float inner = 0.7978845608f * (lse + a * lse * lse * lse);
+    float tanh_inner = tanh(inner);
+    lse = 0.5f * lse * (1.0f + tanh_inner);
+
+    // Apply second GELU approximation
+    inner = 0.7978845608f * (lse + a * lse * lse * lse);
+    tanh_inner = tanh(inner);
+    lse = 0.5f * lse * (1.0f + tanh_inner);
+
+    // Store result
+    output[sample_idx] = lse;
+}
+
+However, with out_features=8192, iterating over each element in a loop for max and sum would be slow. For example, 8192 iterations per thread for max and again for sum. With a batch of 1024, that's 1024 * 8192 * 2 = ~16 million operations just for loops. This is not efficient.
+
+To optimize, we need to parallelize the computation of max and sum across threads. But since each sample is processed by a single thread, that's not possible. So perhaps we should process samples in blocks and use shared memory for reductions.
+
+Alternatively, we can reorganize the kernel so that multiple threads process the same sample's features to compute the reduction.
+
+Wait, perhaps we can have each block handle one sample, and the threads within the block process chunks of the out_features elements.
+
+For example:
+
+Each block is assigned to a sample. Each thread in the block processes a chunk of the out_features elements to compute partial max and partial sum. Then perform a reduction within the block.
+
+Here's how:
+
+__global__ void fused_post_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int out_features
+) {
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    // Each block handles one sample
+    // Use block-wide parallelism to compute max and sum_exp
+
+    extern __shared__ float shared_data[];
+
+    int tid = threadIdx.x;
+
+    // Each thread reads a chunk of the sample's data
+    float local_max = -INFINITY;
+    float local_sum_exp = 0.0f;
+
+    for (int j = tid; j < out_features; j += blockDim.x) {
+        float val = input[sample_idx * out_features + j];
+        if (val > local_max) {
+            local_max = val;
+        }
+        float temp = val - local_max; // Not yet, because local_max is per-thread
+        // Wait, this approach won't work because local_max is per-thread and not yet reduced.
+        // Hmm, this complicates things.
+    }
+
+This seems tricky because the max computation is needed before computing the exponents.
+
+Alternative approach:
+
+First compute the max using a parallel reduction across the block's threads.
+
+Then compute the sum_exp using the max value and parallel reduction again.
+
+Here's a possible outline using CUB's thread block reduction:
+
+But integrating CUB can be complex in inline code. Alternatively, use manual reductions.
+
+First step: Compute the max.
+
+// Step 1: Compute max across all elements of the sample's features
+float max_val = -INFINITY;
+
+// Use thread block to compute max in parallel
+for (int j = tid; j < out_features; j += blockDim.x) {
+    if (input[sample_idx * out_features + j] > max_val) {
+        max_val = input[sample_idx * out_features + j];
+    }
+}
+// Perform block-wide reduction of max_val
+// Similarly for sum_exp
+
+But this requires a block-wide reduction.
+
+Alternatively, using shared memory:
+
+float* smem = (float*)shared_data;
+
+// Each thread loads its chunk into shared memory
+for (int j = tid; j < out_features; j += blockDim.x) {
+    smem[j] = input[sample_idx * out_features + j];
+}
+__syncthreads();
+
+// Then compute max over shared memory
+// But this may not be efficient for large out_features.
+
+Alternatively, using a block reduction approach:
+
+float block_max = -INFINITY;
+for (int j = tid; j < out_features; j += blockDim.x) {
+    if (input[sample_idx * out_features + j] > block_max) {
+        block_max = input[sample_idx * out_features + j];
+    }
+}
+// Reduce within the block using warp-level operations
+
+But this requires multiple passes.
+
+Alternatively, use a block-wide reduction using CUB's BlockReduce.
+
+Here's a better approach using CUB's BlockReduce for max and sum:
+
+template <typename T>
+struct MaxOp {
+    __host__ __device__ __forceinline__
+    T operator()(const T a, const T b) const {
+        return fmaxf(a, b);
+    }
+};
+
+template <typename T>
+struct SumExpOp {
+    __host__ __device__ __forceinline__
+    T operator()(const T a, const T b) const {
+        return a + b;
+    }
+};
+
+__global__ void fused_post_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int out_features
+) {
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    // Each block is a sample, use all threads in the block to process
+
+    typedef cub::BlockReduce<float, 256> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+
+    for (int j = threadIdx.x; j < out_features; j += blockDim.x) {
+        float val = input[sample_idx * out_features + j];
+        if (val > max_val) {
+            max_val = val;
+        }
+        // Need to compute sum_exp later after knowing max_val
+    }
+
+    // First compute the global max
+    float block_max = BlockReduce(temp_storage).Reduce(max_val, MaxOp<float>());
+    if (threadIdx.x == 0) {
+        max_val = block_max;
+    }
+    __syncthreads();
+
+    // Now compute sum_exp using the global max
+    for (int j = threadIdx.x; j < out_features; j += blockDim.x) {
+        float temp = input[sample_idx * out_features + j] - max_val;
+        sum_exp += exp(temp);
+    }
+
+    // Reduce the sum_exp
+    float block_sum_exp = BlockReduce(temp_storage).Reduce(sum_exp, SumExpOp<float>());
+    if (threadIdx.x == 0) {
+        float lse = max_val + log(block_sum_exp);
+        // Apply activations
+        lse = leaky_relu(leaky_relu(lse, 0.01f), 0.01f);
+        lse = gelu_approx(gelu_approx(lse));
+        output[sample_idx] = lse;
+    }
+}
+
+This approach uses a block of threads to compute the max and sum_exp in parallel. The blockDim.x should be chosen to cover the out_features with enough threads. For example, with out_features=8192 and a block size of 256, each thread would handle ~32 elements (8192/256=32). This reduces the per-thread loop count from 8192 to 32, which is manageable.
+
+The kernel requires a block size (number of threads per block) that can be set via kernel launch configuration.
+
+The shared memory usage is for CUB's temp storage, which for a BlockReduce of size 256 requires ~256 * size of float, which is acceptable.
+
+Now, putting this into code:
+
+The kernel would be written with proper CUB inclusion and correct memory handling.
+
+Also, the GELU function needs to be defined with the approximation.
+
+Thus, the fused_post kernel can be implemented efficiently with this approach.
+
+Now, integrating this into the Python code:
+
+The ModelNew would use PyTorch's Linear layer for the gemm, then call this kernel on the output.
+
+The kernel requires the input tensor to be contiguous and on the GPU.
+
+Thus, the code would look like:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the fused post-processing kernel
+fused_post_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+
+template <typename T>
+struct MaxOp {
+    __host__ __device__ __forceinline__
+    T operator()(const T a, const T b) const {
+        return fmaxf(a, b);
+    }
+};
+
+template <typename T>
+struct SumExpOp {
+    __host__ __device__ __forceinline__
+    T operator()(const T a, const T b) const {
+        return a + b;
+    }
+};
+
+template <typename T>
+__device__ T leaky_relu(T x, T neg_slope) {
+    return x > 0 ? x : neg_slope * x;
+}
+
+template <typename T>
+__device__ T gelu_approx(T x) {
+    const T sqrt_2_over_pi = 0.7978845608;
+    const T a = 0.044715;
+    T inner = sqrt_2_over_pi * (x + a * x * x * x);
+    return 0.5f * x * (1 + tanhf(inner));
+}
+
+extern "C" __global__ void fused_post_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int batch_size,
+    int out_features
+) {
+    int sample_idx = blockIdx.x;
+    if (sample_idx >= batch_size) return;
+
+    typedef cub::BlockReduce<float, 256> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    float max_val = -INFINITY;
+    float sum_exp = 0.0f;
+
+    for (int j = threadIdx.x; j < out_features; j += blockDim.x) {
+        float val = input[sample_idx * out_features + j];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    float block_max = BlockReduce(temp_storage).Reduce(max_val, MaxOp<float>());
+    if (threadIdx.x == 0) max_val = block_max;
+    __syncthreads();
+
+    for (int j = threadIdx.x; j < out_features; j += blockDim.x) {
+        float temp = input[sample_idx * out_features + j] - max_val;
+        sum_exp += exp(temp);
+    }
+
+    float block_sum_exp = BlockReduce(temp_storage).Reduce(sum_exp, SumExpOp<float>());
+    if (threadIdx.x == 0) {
+        float lse = max_val + logf(block_sum_exp);
+        lse = leaky_relu(leaky_relu(lse, 0.01f), 0.01f);
+        lse = gelu_approx(gelu_approx(lse));
+        output[sample_idx] = lse;
+    }
+}
+
+torch::Tensor fused_post_cuda(torch::Tensor input) {
+    const int batch_size = input.size(0);
+    const int out_features = input.size(1);
+
+    auto output = torch::empty({batch_size, 1}, input.options());
+
+    dim3 blocks(batch_size);
+    dim3 threads(256);  // Block size must be <= 1024 and divide out_features evenly?
+
+    // Launch kernel with block size 256, but need to ensure out_features is divisible by threads.x?
+    // Alternatively, use dynamic loop
+    fused_post_kernel<<<blocks, threads>>>(
+        input.contiguous().data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        out_features
+    );
+
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+fused_post_cpp_source = "torch::Tensor fused_post_cuda(torch::Tensor input);"
+
+# Compile the fused post-processing kernel
+fused_post_op = load_inline(
+    name="fused_post",
+    cpp_sources=fused_post_cpp_source,
+    cuda_sources=fused_post_source,
+    functions=["fused_post_cuda"],
+    verbose=True,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.fused_post = fused_post_op
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.fused_post.fused_post_cuda(x)
+        return x.view(-1, 1)  # Ensure output shape is [batch, 1]
+
+def get_inputs():
+    batch_size = 1024
+    in_features = 8192
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+This approach splits the computation into two parts: the matrix multiplication handled by PyTorch's optimized Linear layer, and the post-processing (LogSumExp, activations) fused into a single kernel. This reduces memory copies and leverages efficient reduction operations using CUB, which should provide a significant speedup compared to the original code.
+
+Potential optimizations:
+
+1. Adjust the block size (threads) for better performance. 256 might not be optimal; testing with 128 or 512 could help.
+
+2. Ensure that the input tensors are contiguous and on the GPU before kernel launch.
+
+3. The kernel uses threadIdx.x < out_features to process elements, which works even if out_features is not a multiple of the block size.
+
+4. The use of CUB's BlockReduce ensures efficient reduction across threads in the block.
+
+5. The GELU approximation uses tanhf (device function for tanh) for better performance.
+
+This implementation should be both correct and significantly faster than the original, especially for large batch and feature sizes.
+</think>
+
+<think>
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+#

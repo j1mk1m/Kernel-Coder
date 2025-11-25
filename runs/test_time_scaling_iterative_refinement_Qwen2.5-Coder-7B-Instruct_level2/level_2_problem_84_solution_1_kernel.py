@@ -1,0 +1,94 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Gemm
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    // Implement GEMM here
+    // ...
+}
+
+torch::Tensor gemm_cuda(torch::Tensor a, torch::Tensor b) {
+    // Get dimensions
+    int m = a.size(0);
+    int n = b.size(1);
+    int k = a.size(1);
+
+    // Allocate output tensor
+    auto c = torch::zeros({m, n}, a.options());
+
+    // Launch kernel
+    // ...
+
+    return c;
+}
+"""
+
+# Define the custom CUDA kernel for Batch Normalization
+bn_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bn_kernel(const float* x, float* y, float* mean, float* var, float* gamma, float* beta, float eps, int size) {
+    // Implement Batch Normalization here
+    // ...
+}
+
+torch::Tensor bn_cuda(torch::Tensor x, float* mean, float* var, float* gamma, float* beta, float eps) {
+    // Get dimensions
+    int size = x.numel();
+
+    // Allocate output tensor
+    auto y = torch::zeros_like(x);
+
+    // Launch kernel
+    // ...
+
+    return y;
+}
+"""
+
+# Define the custom CUDA kernel for Scale
+scale_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void scale_kernel(const float* x, float* y, const float* scale, int size) {
+    // Implement Scale here
+    // ...
+}
+
+torch::Tensor scale_cuda(torch::Tensor x, const float* scale) {
+    // Get dimensions
+    int size = x.numel();
+
+    // Allocate output tensor
+    auto y = torch::zeros_like(x);
+
+    // Launch kernel
+    // ...
+
+    return y;
+}
+"""
+
+# Define the custom CUDA kernel for Softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void softmax_kernel(const float* x, float* y, int size) {
+    // Implement Softmax here
+    // ...
+}
+
+torch::Tensor softmax_cuda(torch::Tensor x) {
+    // Get dimensions
+    int size = x.numel();
+
+    // Allocate output

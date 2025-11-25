@@ -1,0 +1,253 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused conv3d and hardswish
+fused_conv3d_hardswish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_conv3d_hardswish_kernel(
+    const float* input, const float* weight, float* output,
+    int batch_size, int in_channels, int out_channels, int depth, int height, int width,
+    int kernel_size, int stride, int padding
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * out_channels) return;
+
+    int b = idx / out_channels;
+    int c_out = idx % out_channels;
+    int d_in_start = max(0, (b * stride - padding) / depth);
+    int h_in_start = max(0, (b * stride - padding) / height);
+    int w_in_start = max(0, (b * stride - padding) / width);
+
+    float sum = 0.0f;
+    for (int d_in = d_in_start; d_in < min(depth, (b * stride + kernel_size - padding) / depth); ++d_in) {
+        for (int h_in = h_in_start; h_in < min(height, (b * stride + kernel_size - padding) / height); ++h_in) {
+            for (int w_in = w_in_start; w_in < min(width, (b * stride + kernel_size - padding) / width); ++w_in) {
+                int d_out = d_in * stride - padding;
+                int h_out = h_in * stride - padding;
+                int w_out = w_in * stride - padding;
+
+                for (int c_in = 0; c_in < in_channels; ++c_in) {
+                    sum += input[(b * in_channels * depth * height * width) +
+                                (c_in * depth * height * width) +
+                                (d_in * height * width) +
+                                (h_in * width) +
+                                w_in] *
+                           weight[(c_out * in_channels * kernel_size * kernel_size * kernel_size) +
+                                  (c_in * kernel_size * kernel_size * kernel_size) +
+                                  ((d_out + kernel_size / 2) * kernel_size * kernel_size) +
+                                  ((h_out + kernel_size / 2) * kernel_size) +
+                                  (w_out + kernel_size / 2)];
+                }
+            }
+        }
+    }
+
+    output[idx] = fmaxf(fminf(sum * 69.0f + 3.0f, 6.0f), 0.0f); // HardSwish approximation
+}
+
+torch::Tensor fused_conv3d_hardswish_cuda(
+    torch::Tensor input, torch::Tensor weight, int stride, int padding
+) {
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int out_channels = weight.size(0);
+    int depth = input.size(2);
+    int height = input.size(3);
+    int width = input.size(4);
+    int kernel_size = weight.size(2);
+
+    auto output = torch::zeros({batch_size, out_channels}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * out_channels + block_size - 1) / block_size;
+
+    fused_conv3d_hardswish_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(),
+        batch_size, in_channels, out_channels, depth, height, width,
+        kernel_size, stride, padding
+    );
+
+    return output;
+}
+"""
+
+fused_conv3d_hardswish_cpp_source = (
+    "torch::Tensor fused_conv3d_hardswish_cuda(torch::Tensor input, torch::Tensor weight, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for fused conv3d and hardswish
+fused_conv3d_hardswish = load_inline(
+    name="fused_conv3d_hardswish",
+    cpp_sources=fused_conv3d_hardswish_cpp_source,
+    cuda_sources=fused_conv3d_hardswish_source,
+    functions=["fused_conv3d_hardswish_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for groupnorm
+groupnorm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void groupnorm_kernel(
+    const float* input, const float* weight, const float* bias, float* output,
+    int batch_size, int channels, int groups, int height, int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * channels) return;
+
+    int b = idx / channels;
+    int c = idx % channels;
+    int g = c / (channels / groups);
+    int h = (idx - b * channels - c) / width;
+    int w = idx - b * channels - c - h * width;
+
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    for (int i = 0; i < height * width; ++i) {
+        sum += input[(b * channels * height * width) + (c * height * width) + i];
+        sum_sq += input[(b * channels * height * width) + (c * height * width) + i] * input[(b * channels * height * width) + (c * height * width) + i];
+    }
+
+    float mean = sum / (height * width);
+    float var = sum_sq / (height * width) - mean * mean;
+
+    output[idx] = weight[g] * (input[(b * channels * height * width) + (c * height * width) + i] - mean) / sqrt(var + 1e-5f) + bias[g];
+}
+
+torch::Tensor groupnorm_cuda(
+    torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int groups
+) {
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    auto output = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * channels + block_size - 1) / block_size;
+
+    groupnorm_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<float>(),
+        batch_size, channels, groups, height, width
+    );
+
+    return output;
+}
+"""
+
+groupnorm_cpp_source = (
+    "torch::Tensor groupnorm_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int groups);"
+)
+
+# Compile the inline CUDA code for groupnorm
+groupnorm = load_inline(
+    name="groupnorm",
+    cpp_sources=groupnorm_cpp_source,
+    cuda_sources=groupnorm_source,
+    functions=["groupnorm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for mean pooling
+mean_pooling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void mean_pooling_kernel(
+    const float* input, float* output,
+    int batch_size, int channels, int height, int width, int pool_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * channels) return;
+
+    int b = idx / channels;
+    int c = idx % channels;
+    int h_start = (idx - b * channels - c) / width;
+    int w_start = idx - b * channels - c - h_start * width;
+
+    float sum = 0.0f;
+    for (int i = 0; i < pool_size * pool_size; ++i) {
+        int h = h_start + i / pool_size;
+        int w = w_start + i % pool_size;
+        if (h >= height || w >= width) continue;
+        sum += input[(b * channels * height * width) + (c * height * width) + (h * width) + w];
+    }
+
+    output[idx] = sum / (pool_size * pool_size);
+}
+
+torch::Tensor mean_pooling_cuda(
+    torch::Tensor input, int pool_size
+) {
+    int batch_size = input.size(0);
+    int channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+
+    auto output = torch::zeros({batch_size, channels}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * channels + block_size - 1) / block_size;
+
+    mean_pooling_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), output.data_ptr<float>(),
+        batch_size, channels, height, width, pool_size
+    );
+
+    return output;
+}
+"""
+
+mean_pooling_cpp_source = (
+    "torch::Tensor mean_pooling_cuda(torch::Tensor input, int pool_size);"
+)
+
+# Compile the inline CUDA code for mean pooling
+mean_pooling = load_inline(
+    name="mean_pooling",
+    cpp_sources=mean_pooling_cpp_source,
+    cuda_sources=mean_pooling_source,
+    functions=["mean_pooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups=4, bias=True):
+        super(ModelNew, self).__init__()
+        self.fused_conv3d_hardswish = fused_conv3d_hardswish
+        self.groupnorm = groupnorm
+        self.mean_pooling = mean_pooling
+
+    def forward(self, x):
+        x = self.fused_conv3d_hardswish.fused_conv3d_hardswish_cuda(x, self.weight, stride=1, padding=1)  # (B, C, D, H, W)
+        x = self.groupnorm.groupnorm_cuda(x, self.weight, self.bias, num_groups)  # Normalization over channels
+        x = self.mean_pooling.mean_pooling_cuda(x, pool_size=2)  # Mean over spatial dims → (B, C)
+        return x
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 1024
+    in_channels = 3
+    out_channels = 16
+    depth, height, width = 16, 32, 32
+    kernel_size = 4
+
+    model = ModelNew(in_channels, out_channels, kernel_size)
+    x = torch.rand(batch_size, in_channels, depth, height, width).cuda()
+    output = model(x)
+    print(output.shape)

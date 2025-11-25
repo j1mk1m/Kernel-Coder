@@ -1,0 +1,68 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 2D convolution
+conv2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv2d_forward_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int height_in, int width_in, int out_channels, int height_out, int width_out, int kernel_height, int kernel_width, int stride_h, int stride_w, int padding_h, int padding_w) {
+    // Kernel implementation here
+}
+
+torch::Tensor conv2d_forward_cuda(torch::Tensor input, torch::Tensor weight, int stride_h, int stride_w, int padding_h, int padding_w) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto height_in = input.size(2);
+    auto width_in = input.size(3);
+    auto out_channels = weight.size(0);
+    auto kernel_height = weight.size(2);
+    auto kernel_width = weight.size(3);
+    auto height_out = (height_in + 2 * padding_h - kernel_height) / stride_h + 1;
+    auto width_out = (width_in + 2 * padding_w - kernel_width) / stride_w + 1;
+
+    auto output = torch::zeros({batch_size, out_channels, height_out, width_out}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks_x = (width_out + block_size - 1) / block_size;
+    const int num_blocks_y = (height_out + block_size - 1) / block_size;
+
+    dim3 grid(num_blocks_x, num_blocks_y);
+    dim3 block(block_size);
+
+    conv2d_forward_kernel<<<grid, block>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, height_in, width_in, out_channels, height_out, width_out, kernel_height, kernel_width, stride_h, stride_w, padding_h, padding_w);
+
+    return output;
+}
+"""
+
+conv2d_cpp_source = (
+    "torch::Tensor conv2d_forward_cuda(torch::Tensor input, torch::Tensor weight, int stride_h, int stride_w, int padding_h, int padding_w);"
+)
+
+# Compile the inline CUDA code for 2D convolution
+conv2d = load_inline(
+    name="conv2d",
+    cpp_sources=conv2d_cpp_source,
+    cuda_sources=conv2d_source,
+    functions=["conv2d_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1), padding: tuple = (0, 0)):
+        super(ModelNew, self).__init__()
+        self.conv2d = conv2d
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv2d.conv2d_forward_cuda(x, self.weight, stride[0], stride[1], padding[0], padding[1])
+
+
+# Initialize the weights for the convolutional layer
+model_new = ModelNew(in_channels, out_channels, kernel_size)
+model_new.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size[0], kernel_size[1]))

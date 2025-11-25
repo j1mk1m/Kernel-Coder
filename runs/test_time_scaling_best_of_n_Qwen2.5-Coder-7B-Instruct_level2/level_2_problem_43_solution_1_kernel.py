@@ -1,0 +1,225 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D convolution
+convolution_3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_3d_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int out_channels, int depth, int height, int width, int kernel_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < out_channels * batch_size * depth * height * width) {
+        int o_idx = idx % (out_channels * batch_size * depth * height);
+        int b_idx = o_idx / (out_channels * depth * height);
+        int c_idx = o_idx / (out_channels * depth * height * in_channels);
+        int d_idx = o_idx / (out_channels * depth * height * in_channels * kernel_size);
+        int h_idx = o_idx / (out_channels * depth * height * in_channels * kernel_size * kernel_size);
+        int w_idx = o_idx / (out_channels * depth * height * in_channels * kernel_size * kernel_size * kernel_size);
+
+        float sum = 0.0f;
+        for (int i = 0; i < kernel_size; ++i) {
+            for (int j = 0; j < kernel_size; ++j) {
+                for (int k = 0; k < kernel_size; ++k) {
+                    int ic_idx = c_idx * kernel_size + i;
+                    int ih_idx = h_idx * kernel_size + j;
+                    int iw_idx = w_idx * kernel_size + k;
+                    if (ic_idx >= in_channels || ih_idx >= height || iw_idx >= width) {
+                        continue;
+                    }
+                    sum += input[b_idx * in_channels * depth * height * width + ic_idx * depth * height * width + ih_idx * height * width + iw_idx] * weight[o_idx % out_channels * in_channels * kernel_size * kernel_size * kernel_size + ic_idx * kernel_size * kernel_size * kernel_size + i * kernel_size * kernel_size + j * kernel_size + k];
+                }
+            }
+        }
+        output[idx] = sum;
+    }
+}
+
+torch::Tensor convolution_3d_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto depth = input.size(2);
+    auto height = input.size(3);
+    auto width = input.size(4);
+    auto kernel_size = weight.size(2);
+
+    auto output = torch::zeros({batch_size, out_channels, depth, height, width}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (out_channels * batch_size * depth * height * width + block_size - 1) / block_size;
+
+    convolution_3d_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, out_channels, depth, height, width, kernel_size);
+
+    return output;
+}
+"""
+
+convolution_3d_cpp_source = (
+    "torch::Tensor convolution_3d_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for 3D convolution
+convolution_3d = load_inline(
+    name="convolution_3d",
+    cpp_sources=convolution_3d_cpp_source,
+    cuda_sources=convolution_3d_source,
+    functions=["convolution_3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for max pooling
+max_pooling_3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void max_pooling_3d_kernel(const float* input, float* output, int batch_size, int in_channels, int depth, int height, int width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < in_channels * batch_size * depth * height * width) {
+        int o_idx = idx % (in_channels * batch_size * depth * height);
+        int b_idx = o_idx / (in_channels * depth * height);
+        int c_idx = o_idx / (in_channels * depth * height * batch_size);
+        int d_idx = o_idx / (in_channels * depth * height * batch_size * 2);
+        int h_idx = o_idx / (in_channels * depth * height * batch_size * 2 * 2);
+        int w_idx = o_idx / (in_channels * depth * height * batch_size * 2 * 2 * 2);
+
+        float max_val = -FLT_MAX;
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                for (int k = 0; k < 2; ++k) {
+                    int dd_idx = d_idx * 2 + i;
+                    int hh_idx = h_idx * 2 + j;
+                    int ww_idx = w_idx * 2 + k;
+                    if (dd_idx >= depth || hh_idx >= height || ww_idx >= width) {
+                        continue;
+                    }
+                    max_val = fmax(max_val, input[b_idx * in_channels * depth * height * width + c_idx * depth * height * width + dd_idx * height * width + hh_idx * width + ww_idx]);
+                }
+            }
+        }
+        output[idx] = max_val;
+    }
+}
+
+torch::Tensor max_pooling_3d_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto depth = input.size(2);
+    auto height = input.size(3);
+    auto width = input.size(4);
+
+    auto output = torch::zeros({batch_size, in_channels, depth // 2, height // 2, width // 2}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (in_channels * batch_size * depth // 2 * height // 2 * width // 2 + block_size - 1) / block_size;
+
+    max_pooling_3d_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, depth, height, width);
+
+    return output;
+}
+"""
+
+max_pooling_3d_cpp_source = (
+    "torch::Tensor max_pooling_3d_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for max pooling
+max_pooling_3d = load_inline(
+    name="max_pooling_3d",
+    cpp_sources=max_pooling_3d_cpp_source,
+    cuda_sources=max_pooling_3d_source,
+    functions=["max_pooling_3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for log sum exp
+log_sum_exp_3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void log_sum_exp_3d_kernel(const float* input, float* output, int batch_size, int channels, int depth, int height, int width) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * depth * height * width) {
+        int b_idx = idx / (depth * height * width);
+        int d_idx = idx / (height * width);
+        int h_idx = idx / width;
+        int w_idx = idx % width;
+
+        float max_val = -FLT_MAX;
+        for (int c_idx = 0; c_idx < channels; ++c_idx) {
+            max_val = fmax(max_val, input[b_idx * channels * depth * height * width + c_idx * depth * height * width + d_idx * height * width + h_idx * width + w_idx]);
+        }
+
+        float sum = 0.0f;
+        for (int c_idx = 0; c_idx < channels; ++c_idx) {
+            sum += exp(input[b_idx * channels * depth * height * width + c_idx * depth * height * width + d_idx * height * width + h_idx * width + w_idx] - max_val);
+        }
+
+        output[idx] = max_val + log(sum);
+    }
+}
+
+torch::Tensor log_sum_exp_3d_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto depth = input.size(2);
+    auto height = input.size(3);
+    auto width = input.size(4);
+
+    auto output = torch::zeros({batch_size, depth, height, width}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * depth * height * width + block_size - 1) / block_size;
+
+    log_sum_exp_3d_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels, depth, height, width);
+
+    return output;
+}
+"""
+
+log_sum_exp_3d_cpp_source = (
+    "torch::Tensor log_sum_exp_3d_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for log sum exp
+log_sum_exp_3d = load_inline(
+    name="log_sum_exp_3d",
+    cpp_sources=log_sum_exp_3d_cpp_source,
+    cuda_sources=log_sum_exp_3d_source,
+    functions=["log_sum_exp_3d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = convolution_3d
+        self.max_pool = max_pooling_3d
+        self.log_sum_exp = log_sum_exp_3d
+
+    def forward(self, x):
+        x = self.conv.convolution_3d_cuda(x, self.weight)
+        x = self.max_pool.max_pooling_3d_cuda(x)
+        x = self.log_sum_exp.log_sum_exp_3d_cuda(x)
+        x = torch.relu(x)
+        return x
+
+# Initialize the model with weights
+model_new = ModelNew(in_channels, out_channels, kernel_size, stride, padding)
+
+# Get inputs
+inputs = get_inputs()
+
+# Forward pass
+output = model_new(inputs[0])
+print(output.shape)
