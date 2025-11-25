@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --partition preempt
 #SBATCH --time 0-23:00 # set time
+#SBATCH --exclude=babel-u9-16
 #SBATCH --job-name=evolrule
 #SBATCH --chdir=/home/gyeongwk/Kernel-Coder # working directory
 

@@ -1,16 +1,13 @@
 # Project
 
 ### Plan
-- [ ] Baseline test-time scaling methods (best-of-N, iterative refinement)
-    - [ ] Qwen2.5-Coder-7B-Instruct 
-        - [ ] Level 1
-        - [ ] Level 2
-    - [ ] QwQ-32B
-        - [ ] Level 1
-        - [ ] Level 2
-- [ ] AutoRule rule extraction with QwQ-32B
-- [ ] Use rules from prev step as prompt
-	- [ ] Use rules as part of feedback for iterative refinement (new)
-- [ ] Collect good kernels from prev steps and run SFT on 7B model (rejection sampling)
-- [ ] RL training with correctness/speedup as reward (Kevin) - stretch
-- [ ] RL training with + rules as reward (AutoRule) - stretch
+- [x] Baseline test-time scaling methods (best-of-N, iterative refinement)
+- [ ] Stage 1: AutoRule rule extraction with QwQ-32B (Mon)
+    - [ ] Level 1
+    - [x] Level 2
+- [ ] Stage 2: Rule-guided prompt optimization
+	- [ ] Use rules as part of feedback for iterative refinement
+- [ ] Stage 3: Rejection Fine-Tuning
+    - Filter kernels by execution results and rule satisfaction
+    - SFT on 7B model
+    - compare performance to only filtering with execution results?

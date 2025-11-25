@@ -300,7 +300,7 @@ class Rules(KnowledgeBase):
         self.config = config
         self.run_dir = run_dir
         base_api_url = f"http://{config.vllm_host}:{config.vllm_port}/v1" if config.server_type == "vllm" else None
-        self.llm_client = create_llm_client(data_file=os.path.join(self.run_dir, "rules_llm_usage.json"), default_model=config.memory_model_name, default_temperature=1.0, default_api_base=base_api_url, default_max_tokens=config.max_tokens)
+        self.llm_client = create_llm_client(data_file=os.path.join(self.run_dir, "rules_llm_usage.json"), default_model=config.memory_model_name, default_temperature=1.0, default_api_base=base_api_url, default_max_tokens=config.max_tokens, default_retry_delay=10.0)
 
     def retrieve(self, query):
         return "When writing kernels, consider the following tips:\n" + "\n".join(self.rules)
@@ -339,7 +339,7 @@ Task description:
 Solutions:
 {traj_string}
     """
-                response = self.llm_client.text_completion(prompt, tag="rule_extraction")["choices"][0]["text"]
+                response = self.llm_client.text_completion(prompt, max_tokens=7000, tag="rule_extraction")["choices"][0]["text"]
 
                 with open(file_path, "w") as f:
                     f.write(response)
