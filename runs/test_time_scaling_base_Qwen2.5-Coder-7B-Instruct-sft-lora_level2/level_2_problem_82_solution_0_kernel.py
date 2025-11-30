@@ -1,0 +1,125 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+// Your convolution kernel here
+"""
+
+convolution_cpp_source = (
+    // Your convolution function declaration here
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for tanh activation
+tanh_source = """
+// Your tanh kernel here
+"""
+
+tanh_cpp_source = (
+    // Your tanh function declaration here
+)
+
+# Compile the inline CUDA code for tanh activation
+tanh = load_inline(
+    name="tanh",
+    cpp_sources=tanh_cpp_source,
+    cuda_sources=tanh_source,
+    functions=["tanh_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for scaling
+scaling_source = """
+// Your scaling kernel here
+"""
+
+scaling_cpp_source = (
+    // Your scaling function declaration here
+)
+
+# Compile the inline CUDA code for scaling
+scaling = load_inline(
+    name="scaling",
+    cpp_sources=scaling_cpp_source,
+    cuda_sources=scaling_source,
+    functions=["scaling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for bias addition
+bias_addition_source = """
+// Your bias addition kernel here
+"""
+
+bias_addition_cpp_source = (
+    // Your bias addition function declaration here
+)
+
+# Compile the inline CUDA code for bias addition
+bias_addition = load_inline(
+    name="bias_addition",
+    cpp_sources=bias_addition_cpp_source,
+    cuda_sources=bias_addition_source,
+    functions=["bias_addition_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for max pooling
+max_pooling_source = """
+// Your max pooling kernel here
+"""
+
+max_pooling_cpp_source = (
+    // Your max pooling function declaration here
+)
+
+# Compile the inline CUDA code for max pooling
+max_pooling = load_inline(
+    name="max_pooling",
+    cpp_sources=max_pooling_cpp_source,
+    cuda_sources=max_pooling_source,
+    functions=["max_pooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.scaling_factor = scaling_factor
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.max_pool = max_pooling
+
+    def forward(self, x):
+        # Convolution
+        x = self.conv.convolution_cuda(x)
+        # Tanh activation
+        x = tanh.tanh_cuda(x)
+        # Scaling
+        x = scaling.scaling_cuda(x, self.scaling_factor)
+        # Bias addition
+        x = bias_addition.bias_addition_cuda(x, self.bias)
+        # Max-pooling
+        x = self.max_pool.max_pooling_cuda(x)
+        return x

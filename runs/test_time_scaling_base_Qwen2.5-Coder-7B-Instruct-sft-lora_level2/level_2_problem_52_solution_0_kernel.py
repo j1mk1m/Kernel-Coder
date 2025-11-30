@@ -1,0 +1,76 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_kernel(const float* input, const float* weight, float* output, int input_height, int input_width, int input_channels, int output_channels, int kernel_size) {
+    // Implement the convolution operation here
+}
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, int kernel_size) {
+    // Implement the convolution operation here
+    return output;
+}
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, int kernel_size);"
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Define the custom CUDA kernel for batch normalization
+batch_normalization_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void batch_normalization_kernel(const float* input, float* output, float* mean, float* var, float* gamma, float* beta, int input_height, int input_width, int input_channels, float eps) {
+    // Implement the batch normalization operation here
+}
+
+torch::Tensor batch_normalization_cuda(torch::Tensor input, float* gamma, float* beta, float eps) {
+    // Implement the batch normalization operation here
+    return output;
+}
+"""
+
+batch_normalization_cpp_source = (
+    "torch::Tensor batch_normalization_cuda(torch::Tensor input, float* gamma, float* beta, float eps);"
+)
+
+# Compile the inline CUDA code for batch normalization
+batch_normalization = load_inline(
+    name="batch_normalization",
+    cpp_sources=batch_normalization_cpp_source,
+    cuda_sources=batch_normalization_source,
+    functions=["batch_normalization_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.bn = batch_normalization
+
+    def forward(self, x):
+        x = self.conv.convolution_cuda(x, weight, kernel_size)
+        x = torch.multiply(torch.tanh(torch.nn.functional.softplus(x)), x)
+        x = self.bn.batch_normalization_cuda(x, gamma, beta, eps)
+        return x

@@ -1,0 +1,38 @@
+from torch.utils.cpp_extension import load_inline
+
+# Define the CUDA source code
+source_code = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Your CUDA kernel here
+
+torch::Tensor my_custom_op_cuda(torch::Tensor input) {
+    // Your implementation here
+    return output_tensor;
+}
+"""
+
+cpp_source_code = (
+    "torch::Tensor my_custom_op_cuda(torch::Tensor input);"
+)
+
+# Load the CUDA extension
+my_custom_op = load_inline(
+    name="my_custom_op",
+    cpp_sources=cpp_source_code,
+    cuda_sources=source_code,
+    functions=["my_custom_op_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+# Use the custom op in your model
+class MyModel(nn.Module):
+    def __init__(self):
+        super(MyModel, self).__init__()
+        self.my_custom_op = my_custom_op
+
+    def forward(self, x):
+        return self.my_custom_op.my_custom_op_cuda(x)
