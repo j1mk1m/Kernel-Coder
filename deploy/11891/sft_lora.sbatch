@@ -7,17 +7,16 @@
 #SBATCH --mem=512GB
 #SBATCH --cpus-per-task=128 # cpus
 
-#SBATCH --output=/home/gyeongwk/logs/%x-%j.out # output log
-#SBATCH --error=/home/gyeongwk/logs/%x-%j.err # error log
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=j1mk1m.dummy@gmail.com
+#SBATCH --output=logs/%x-%j.out # output log
+#SBATCH --error=logs/%x-%j.err # error log
 
 source ~/anaconda3/etc/profile.d/conda.sh
 
 source ~/.bashrc
 conda activate kernel
 
-DATA_DIR="/tmp/data/kernel-coder/kernel-only"
-OUTPUT_DIR="/tmp/kernel-coder_qwen2.5-coder-7b-instruct_kernel-only_sft-lora"
+PROJECT_DIR="/data/group_data/cx_group/data_centric_llm/zichunyu/11891"
+DATA_DIR="${PROJECT_DIR}/data/kernel-only"
+OUTPUT_DIR="${PROJECT_DIR}/out/kernel-coder_qwen2.5-coder-7b-instruct_kernel-only_sft-lora"
 
 bash scripts/11891/sft_lora.sh "$DATA_DIR" "$OUTPUT_DIR"

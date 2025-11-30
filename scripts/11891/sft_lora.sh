@@ -4,8 +4,8 @@
 set -x
 
 REPO_ROOT="$(pwd)"
-DATA_DIR="${1:-/tmp/data/kernel-coder/kernel-only}"
-OUTPUT_DIR="${2:-/tmp/kernel-coder_qwen2.5-coder-7b-instruct_kernel-only_sft-lora}"
+DATA_DIR="${1:-/tmp/data/kernel-only}"
+OUTPUT_DIR="${2:-/tmp/out/kernel-coder_qwen2.5-coder-7b-instruct_kernel-only_sft-lora}"
 
 _merge_on_exit() {
     rc=$?
