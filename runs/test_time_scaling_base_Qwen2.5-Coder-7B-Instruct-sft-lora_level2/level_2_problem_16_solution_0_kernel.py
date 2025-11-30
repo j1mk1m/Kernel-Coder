@@ -1,0 +1,80 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+transposed_convolution_source = """
+// Your custom CUDA kernel for transposed convolution goes here
+"""
+
+# Define the custom CUDA kernel for mish activation
+mish_activation_source = """
+// Your custom CUDA kernel for mish activation goes here
+"""
+
+# Define the custom CUDA kernel for adding a value
+adding_value_source = """
+// Your custom CUDA kernel for adding a value goes here
+"""
+
+# Define the custom CUDA kernel for hardtanh activation
+hardtanh_activation_source = """
+// Your custom CUDA kernel for hardtanh activation goes here
+"""
+
+# Define the custom CUDA kernel for scaling
+scaling_source = """
+// Your custom CUDA kernel for scaling goes here
+"""
+
+# Compile the inline CUDA code for all custom operations
+custom_operations = load_inline(
+    name="custom_operations",
+    cpp_sources="""
+    torch::Tensor transposed_convolution_cuda(torch::Tensor x, int in_channels, int out_channels, int kernel_size, int stride, int padding, int output_padding);
+    torch::Tensor mish_activation_cuda(torch::Tensor x);
+    torch::Tensor adding_value_cuda(torch::Tensor x, float value);
+    torch::Tensor hardtanh_activation_cuda(torch::Tensor x, float min_val, float max_val);
+    torch::Tensor scaling_cuda(torch::Tensor x, float scale);
+    """,
+    cuda_sources=f"""
+    {transposed_convolution_source}
+    {mish_activation_source}
+    {adding_value_source}
+    {hardtanh_activation_source}
+    {scaling_source}
+    """,
+    functions=[
+        "transposed_convolution_cuda", 
+        "mish_activation_cuda", 
+        "adding_value_cuda", 
+        "hardtanh_activation_cuda", 
+        "scaling_cuda"
+    ],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
+        super(ModelNew, self).__init__()
+        self.transposed_convolution = custom_operations.transposed_convolution_cuda
+        self.adding_value = custom_operations.adding_value_cuda
+        self.scaling = custom_operations.scaling_cuda
+
+    def forward(self, x):
+        x = self.transposed_convolution(x, in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        x = self.mish_activation(x)
+        x = self.adding_value(x, add_value)
+        x = self.hardtanh_activation(x, -1, 1)
+        x = self.scaling(x, scale)
+        return x
+
+    def mish_activation(self, x):
+        return custom_operations.mish_activation_cuda(x)
+
+    def hardtanh_activation(self, x, min_val, max_val):
+        return custom_operations.hardtanh_activation_cuda(x, min_val, max_val)

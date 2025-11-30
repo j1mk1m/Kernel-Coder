@@ -1,0 +1,12 @@
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+        self.batch_norm = nn.BatchNorm3d(out_channels)
+        self.sub_mean = SubMeanCUDA()  # Custom CUDA operator for subtracting mean along spatial dimensions
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.batch_norm(x)
+        x = self.sub_mean(x)  # Use custom CUDA operator instead of torch.mean
+        return x

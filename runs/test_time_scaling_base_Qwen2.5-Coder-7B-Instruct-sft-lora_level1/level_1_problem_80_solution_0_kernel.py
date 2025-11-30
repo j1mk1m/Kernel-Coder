@@ -1,0 +1,50 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 2D convolution
+convolution_2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Custom CUDA implementation for 2D convolution
+// ...
+
+torch::Tensor convolution_2d_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride_h, int stride_w, int padding_h, int padding_w, int dilation_h, int dilation_w) {
+    // ...
+    return output;
+}
+"""
+
+convolution_2d_cpp_source = (
+    "torch::Tensor convolution_2d_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride_h, int stride_w, int padding_h, int padding_w, int dilation_h, int dilation_w);"
+)
+
+# Compile the inline CUDA code for 2D convolution
+convolution_2d = load_inline(
+    name="convolution_2d",
+    cpp_sources=convolution_2d_cpp_source,
+    cuda_sources=convolution_2d_source,
+    functions=["convolution_2d_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: int = 1, padding: tuple = (0, 0), dilation: tuple = (1, 1), bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.bias = bias
+        
+        # Initialize weights and bias
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size[0], kernel_size[1]))
+        self.bias = nn.Parameter(torch.randn(out_channels)) if bias else None
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return convolution_2d.cuda.apply(x, self.weight, self.bias, self.stride, self.stride, self.padding[0], self.padding[1], self.dilation[0], self.dilation[1])

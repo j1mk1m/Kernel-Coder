@@ -1,0 +1,78 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+max_pool_1d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Custom CUDA kernel for Max Pooling 1D
+__global__ void max_pool_1d_forward_kernel(const float* input, float* output, int batch_size, int channels, int input_seq_len, int pool_size, int stride, int padding, int dilation) {
+    int batch_id = blockIdx.x / (channels * ((input_seq_len + padding - dilation * (pool_size - 1)) / stride));
+    int channel_id = (blockIdx.x % (channels * ((input_seq_len + padding - dilation * (pool_size - 1)) / stride))) / ((input_seq_len + padding - dilation * (pool_size - 1)) / stride);
+    int seq_idx = blockIdx.x % ((input_seq_len + padding - dilation * (pool_size - 1)) / stride);
+
+    int start_idx = seq_idx * stride - padding + dilation * (pool_size - 1);
+    int end_idx = min(start_idx + pool_size, input_seq_len);
+
+    float max_val = -FLT_MAX;
+    for (int i = start_idx; i < end_idx; ++i) {
+        max_val = max(max_val, input[batch_id * channels * input_seq_len + channel_id * input_seq_len + i]);
+    }
+
+    output[batch_id * channels * ((input_seq_len + padding - dilation * (pool_size - 1)) / stride) + channel_id * ((input_seq_len + padding - dilation * (pool_size - 1)) / stride) + seq_idx] = max_val;
+}
+
+torch::Tensor max_pool_1d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding, int dilation) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto input_seq_len = input.size(2);
+    auto output_seq_len = (input_seq_len + padding - dilation * (kernel_size - 1)) / stride;
+
+    auto output = torch::zeros({batch_size, channels, output_seq_len}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = batch_size * channels * output_seq_len;
+
+    max_pool_1d_forward_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, channels, input_seq_len, kernel_size, stride, padding, dilation);
+
+    return output;
+}
+"""
+
+max_pool_1d_cpp_source = (
+    "torch::Tensor max_pool_1d_forward_cuda(torch::Tensor input, int kernel_size, int stride, int padding, int dilation);"
+)
+
+# Compile the inline CUDA code for Max Pooling 1D
+max_pool_1d = load_inline(
+    name="max_pool_1d",
+    cpp_sources=max_pool_1d_cpp_source,
+    cuda_sources=max_pool_1d_source,
+    functions=["max_pool_1d_forward_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, dilation: int = 1, return_indices: bool = False):
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return max_pool_1d.max_pool_1d_forward_cuda(x, self.kernel_size, self.stride, self.padding, self.dilation)
+
+
+def get_inputs():
+    x = torch.rand(batch_size, features, sequence_length)
+    return [x]
+
+def get_init_inputs():
+    return [kernel_size, stride, padding, dilation, return_indices]

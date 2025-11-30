@@ -1,0 +1,109 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for convolution
+convolution_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convolution_kernel(const float* input, const float* weight, float* output, int input_height, int input_width, int output_height, int output_width, int channels, int kernel_size) {
+    int o_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int o_col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o_idx >= output_height || o_col >= output_width) {
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+        int i_row = o_idx * kernel_size - kernel_size / 2;
+        int i_col = o_col * kernel_size - kernel_size / 2;
+        for (int k_row = 0; k_row < kernel_size; ++k_row) {
+            for (int k_col = 0; k_col < kernel_size; ++k_col) {
+                int i_idx = ((i_row + k_row) * input_width + i_col + k_col) * channels + c;
+                int w_idx = ((k_row * kernel_size + k_col) * channels + c);
+                if (i_idx >= 0 && i_idx < input_height * input_width * channels) {
+                    sum += input[i_idx] * weight[w_idx];
+                }
+            }
+        }
+    }
+    output[o_idx * output_width + o_col] = sum;
+}
+
+torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight) {
+    auto input_shape = input.sizes();
+    auto weight_shape = weight.sizes();
+    auto output_shape = {input_shape[0], weight_shape[0], input_shape[2], input_shape[3]};
+    auto output = torch::zeros(output_shape, input.options());
+
+    const int block_size = 16;
+    const int num_blocks_x = (output_shape[3] + block_size - 1) / block_size;
+    const int num_blocks_y = (output_shape[2] + block_size - 1) / block_size;
+
+    convolution_kernel<<<dim3(num_blocks_x, num_blocks_y), dim3(block_size, block_size)>>>(
+        input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(),
+        input_shape[2], input_shape[3], output_shape[2], output_shape[3],
+        input_shape[1], weight_shape[2]);
+
+    return output;
+}
+"""
+
+convolution_cpp_source = (
+    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight);"
+)
+
+# Compile the inline CUDA code for convolution
+convolution = load_inline(
+    name="convolution",
+    cpp_sources=convolution_cpp_source,
+    cuda_sources=convolution_source,
+    functions=["convolution_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA convolution.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv = convolution
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv.convolution_cuda(x, self.conv.weight)
+        x = self.bn(x)
+        x = x * self.scaling_factor
+        return x
+
+# Example usage
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 128, 128
+kernel_size = 3
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, scaling_factor]
+
+# Initialize model
+model_new = ModelNew(*get_init_inputs()).cuda()
+
+# Get inputs
+inputs = get_inputs()
+x = inputs[0].cuda()
+
+# Forward pass
+output = model_new(x)
+print(output.shape)

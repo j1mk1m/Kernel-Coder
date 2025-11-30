@@ -1,0 +1,175 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 16;
+    dim3 grid((n + block_size - 1) / block_size, (m + block_size - 1) / block_size);
+    dim3 block(block_size, block_size);
+
+    matmul_kernel<<<grid, block>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul = load_inline(
+    name="matmul",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for adding the bias term
+add_bias_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void add_bias_kernel(const float* a, const float* b, float* c, int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < m * n) {
+        c[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor add_bias_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = a.size(1);
+    auto c = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (m * n + block_size - 1) / block_size;
+
+    add_bias_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n);
+
+    return c;
+}
+"""
+
+add_bias_cpp_source = (
+    "torch::Tensor add_bias_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for adding the bias term
+add_bias = load_inline(
+    name="add_bias",
+    cpp_sources=add_bias_cpp_source,
+    cuda_sources=add_bias_source,
+    functions=["add_bias_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for applying the ReLU activation function
+relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_kernel(const float* a, float* b, int m, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < m * n) {
+        b[idx] = fmaxf(a[idx], 0.0f);
+    }
+}
+
+torch::Tensor relu_cuda(torch::Tensor a) {
+    auto m = a.size(0);
+    auto n = a.size(1);
+    auto b = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (m * n + block_size - 1) / block_size;
+
+    relu_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), m, n);
+
+    return b;
+}
+"""
+
+relu_cpp_source = (
+    "torch::Tensor relu_cuda(torch::Tensor a);"
+)
+
+# Compile the inline CUDA code for applying the ReLU activation function
+relu = load_inline(
+    name="relu",
+    cpp_sources=relu_cpp_source,
+    cuda_sources=relu_source,
+    functions=["relu_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA kernels for matrix multiplication, bias addition, and ReLU.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        self.matmul = matmul
+        self.add_bias = add_bias
+        self.relu = relu
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor with shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor with shape (batch_size, out_features).
+        """
+        x = self.matmul.matmul_cuda(x, self.weight)
+        x = self.add_bias.add_bias_cuda(x, self.bias)
+        x = self.relu.relu_cuda(x)
+        return x
+
+
+if __name__ == "__main__":
+    batch_size = 1024
+    in_features = 8192
+    out_features = 8192
+    bias_shape = (out_features,)
+
+    model_new = ModelNew(in_features, out_features, bias_shape)
+    inputs = get_inputs()
+
+    with torch.no_grad():
+        output = model_new(inputs[0])
+        print(output.shape)
