@@ -22,6 +22,7 @@ class KernelBenchEvaluationResult(EvaluationResult):
     metadata: dict
     runtime: float = -1.0
     runtime_stats: dict = field(default_factory=list)
+    rule_satisfaction: str = None
 
     def __gt__(self, other):
         if isinstance(other, KernelBenchEvaluationResult):
@@ -69,6 +70,7 @@ def add_to_eval_results_file(evaluation: KernelBenchEvaluationResult, eval_file_
         "metadata": evaluation.metadata,
         "runtime": getattr(evaluation, "runtime", -1.0),
         "runtime_stats": getattr(evaluation, "runtime_stats", {}),
+        "rule_satisfaction": getattr(evaluation, "rule_satisfaction", None),
     }
 
     # replace if exists

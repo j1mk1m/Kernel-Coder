@@ -65,6 +65,8 @@ def parse_test_time_scaling_args():
     parser.add_argument("--num_iterations", type=int, default=1)
     parser.add_argument("--num_best", type=int, default=1)
 
+    parser.add_argument("--rules_file", type=str, default=None)
+
     # Inference Server
     add_inference_args(parser)
     

@@ -1,11 +1,11 @@
 python KernelCoder/main.py \
-    --run_name evolrule_parallel_8_batch_level2 \
+    --run_name evolrule_sequential_8_batch_level2 \
     --benchmark KernelBench \
     --level 2 \
     --num_epochs 1 \
     --batch_size 250 \
-    --num_parallel 8 \
-    --num_iterations 1 \
+    --num_parallel 1 \
+    --num_iterations 8 \
     --server_type vllm \
     --vllm_host babel-t9-32 \
     --vllm_port 8082 \

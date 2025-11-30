@@ -88,7 +88,10 @@ def base(config, benchmark, dataset, trace_cls, llm_client):
     for task in dataset:
         sol_name = f"{task.task_id}_solution_0"
         if not traces.check_for_solution(sol_name):
-            items.append((task, sol_name, benchmark.get_prompt(task)))
+            prompt = benchmark.get_prompt(task)
+            with open(os.path.join(benchmark.run_dir, f"{sol_name}_prompt.txt"), "w") as f:
+                f.write(prompt)
+            items.append((task, sol_name, prompt))
 
     if items:
         _batched_generate(config, benchmark, traces, items, llm_client)
@@ -110,7 +113,10 @@ def best_of_n(config, benchmark, dataset, trace_cls, llm_client):
         for task in dataset:
             sol_name = f"{task.task_id}_solution_{sample_id}"
             if not traces.check_for_solution(sol_name):
-                items.append((task, sol_name, benchmark.get_prompt(task)))
+                prompt = benchmark.get_prompt(task)
+                with open(os.path.join(benchmark.run_dir, f"{sol_name}_prompt.txt"), "w") as f:
+                    f.write(prompt)
+                items.append((task, sol_name, prompt))
 
         if items:
             _batched_generate(config, benchmark, traces, items, llm_client)
@@ -136,6 +142,8 @@ def iterative_refinement(config, benchmark, dataset, trace_cls, llm_client):
                 sol_name = f"{task.task_id}_solution_{sample_id + iteration * config.num_parallel}"
                 if not traces.check_for_solution(sol_name):
                     prompt = benchmark.get_prompt(task) if iteration == 0 else benchmark.get_refinement_prompt(task, traces)
+                    with open(os.path.join(benchmark.run_dir, f"{sol_name}_prompt.txt"), "w") as f:
+                        f.write(prompt)
                     items.append((task, sol_name, prompt))
 
         if items:

@@ -48,6 +48,32 @@ class KernelBenchBenchmark(Benchmark):
         if solution_code is None:
             solution_code = ""
         return KernelBenchSolution(solution_id=solution_id, task_id=task_id, solution_code=solution_code)
+    
+    def _rule_is_satisfied(self, rule, kernel_src):
+        prompt = f"""You are a kernel expert. Determine whether the following kernel satisfies the following rule.
+    {rule}
+
+    Be as objective as possible when evaluating the rule and do not evaluate other characteristics of the response. If the rule is not applicable for this task, treat it as if the rule is satisfied. 
+    You must provide your answer by strictly outputting either one of the following two options:"[[Yes]]" or "[[No]]" and nothing else
+
+    Kernel:
+    {kernel_src}
+    """
+        response = self.llm_client.text_completion(prompt, tag="rule_satisfaction_check", max_tokens=256)
+        response = response["choices"][0]["text"]
+        return "Yes" in response
+    
+    def evaluate_rule_satisfaction(self, kernel_src):
+        rules = json.load(open(self.config.rules_file))
+        rule_str = ""
+        for rule in rules:
+            print(f"Evaluating rule: {rule}")
+            rule_satisfaction = self._rule_is_satisfied(rule, kernel_src)
+            rule_str += f"Rule: {rule}\nSatisfied: {rule_satisfaction}\n\n"
+        
+        print(f"Rule satisfaction: {rule_str}")
+        return rule_str
+
 
     def evaluate_solution(self, traces: KernelBenchTraces) -> KernelBenchTraces:
         """
@@ -60,7 +86,8 @@ class KernelBenchBenchmark(Benchmark):
                     workload.append((task, solution))
         results = batch_eval(workload, self.config, self.run_dir, os.path.join(self.run_dir, "eval_results.json"))
         for (evaluation_id, task_id, solution_id, result) in results:
-            evaluation = KernelBenchEvaluationResult(evaluation_id=evaluation_id, task_id=task_id, solution_id=solution_id, compiled=result.compiled, correctness=result.correctness, metadata=result.metadata, runtime=result.runtime, runtime_stats=result.runtime_stats)
+            rule_str = self.evaluate_rule_satisfaction(solution.solution_code) if self.config.rules_file else None
+            evaluation = KernelBenchEvaluationResult(evaluation_id=evaluation_id, task_id=task_id, solution_id=solution_id, compiled=result.compiled, correctness=result.correctness, metadata=result.metadata, runtime=result.runtime, runtime_stats=result.runtime_stats, rule_satisfaction=rule_str)
             traces.add_evaluation(evaluation)
         return traces
 

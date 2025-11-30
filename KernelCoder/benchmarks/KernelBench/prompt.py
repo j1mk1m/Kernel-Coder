@@ -165,10 +165,12 @@ def exec_result_to_exeution_feedback(exec_result: dict) -> str:
         metadata = exec_result.metadata
         correctness = exec_result.correctness
         runtime = exec_result.runtime
+        rule_satisfaction = exec_result.rule_satisfaction
     else:
         metadata = exec_result['metadata']
         correctness = exec_result['correctness']
         runtime = exec_result['runtime']
+        rule_satisfaction = exec_result['rule_satisfaction']
 
     compilation_error = metadata['compilation_error'] if 'compilation_error' in metadata else None
     runtime_error = metadata['runtime_error'] if 'runtime_error' in metadata else None
@@ -181,6 +183,11 @@ Here is your Evaluation Result:
 ```
 {correctness_feedback}
 ```
+
+Consider getting inspiration from the following rule satisfaction feedback:
+```
+{rule_satisfaction}
+```
 """
 
     if correctness:
@@ -189,6 +196,11 @@ Your kernel executed successfully and produced the correct output.
 Here is your wall clock time: {runtime} milliseconds.
 
 {metadata["profiler_info"]}
+
+Consider getting inspiration from the following rule satisfaction feedback:
+```
+{rule_satisfaction}
+```
 """
 
     return evaluation_feedback

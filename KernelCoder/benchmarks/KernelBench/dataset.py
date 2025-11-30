@@ -12,7 +12,7 @@ class KernelBenchDataset(Dataset):
         level = config.level
 
         if config.test:
-            self.dataset = [KernelBenchTask(task_id=f"level_1_problem_{problem}", level=1, problem=problem, task_description=fetch_ref_arch_from_level_problem_id(1, problem, config.dataset_src)[0]) for problem in range(1, 3)] 
+            self.dataset = [KernelBenchTask(task_id=f"level_2_problem_{problem}", level=2, problem=problem, task_description=fetch_ref_arch_from_level_problem_id(2, problem, config.dataset_src)[0]) for problem in range(1, 3)] 
         elif level > 0:
             if level == 3:
                 count = 50

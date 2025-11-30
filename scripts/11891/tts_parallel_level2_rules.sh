@@ -1,9 +1,9 @@
 python KernelCoder/test_time_scaling.py \
-    --run_name test_time_scaling_best_of_n_QwQ-32B_level2 \
+    --run_name test_time_scaling_best_of_n_QwQ-32B_level2_rules \
     --benchmark KernelBench \
     --level 2 \
     --method "best-of-N" \
-    --num_parallel 8 \
+    --num_parallel 4 \
     --num_iterations 1 \
     --server_type vllm \
     --vllm_host babel-t9-32 \
@@ -13,5 +13,6 @@ python KernelCoder/test_time_scaling.py \
     --temperature 0.7 \
     --hardware A6000_babel \
     --num_eval_devices 4 \
-    --num_cpu_workers 16
+    --num_cpu_workers 16 \
+    --rules_file runs/rules.json
 
