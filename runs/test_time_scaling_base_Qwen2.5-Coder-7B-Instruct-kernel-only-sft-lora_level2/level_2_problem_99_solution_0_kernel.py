@@ -1,0 +1,1 @@
+torch.utils.cpp_extension.load_inline(name, cpp_sources, cuda_sources, functions, verbose=False, extra_cflags=None, extra_ldflags=None)

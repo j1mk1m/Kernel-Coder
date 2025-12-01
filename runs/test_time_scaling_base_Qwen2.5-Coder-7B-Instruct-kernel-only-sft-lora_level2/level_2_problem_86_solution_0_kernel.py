@@ -1,0 +1,110 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matrix_mul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matrix_mul_kernel(const float* a, const float* b, float* c, int m, int n, int k) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sum += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+torch::Tensor matrix_mul_cuda(torch::Tensor a, torch::Tensor b) {
+    auto m = a.size(0);
+    auto n = b.size(1);
+    auto k = a.size(1);
+    auto c = torch::zeros({m, n}, a.options());
+
+    const int block_size = 16;
+    dim3 grid((n + block_size - 1) / block_size, (m + block_size - 1) / block_size);
+    dim3 block(block_size, block_size);
+
+    matrix_mul_kernel<<<grid, block>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), m, n, k);
+
+    return c;
+}
+"""
+
+matrix_mul_cpp_source = (
+    "torch::Tensor matrix_mul_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matrix_mul = load_inline(
+    name="matrix_mul",
+    cpp_sources=matrix_mul_cpp_source,
+    cuda_sources=matrix_mul_source,
+    functions=["matrix_mul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for division by a scalar
+scalar_div_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void scalar_div_kernel(const float* a, float* out, int size, float divisor) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] / divisor;
+    }
+}
+
+torch::Tensor scalar_div_cuda(torch::Tensor a, float divisor) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    scalar_div_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), out.data_ptr<float>(), size, divisor);
+
+    return out;
+}
+"""
+
+scalar_div_cpp_source = (
+    "torch::Tensor scalar_div_cuda(torch::Tensor a, float divisor);"
+)
+
+# Compile the inline CUDA code for division by a scalar
+scalar_div = load_inline(
+    name="scalar_div",
+    cpp_sources=scalar_div_cpp_source,
+    cuda_sources=scalar_div_source,
+    functions=["scalar_div_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, output_size, divisor):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(input_size, output_size)
+        self.divisor = divisor
+        self.matrix_mul = matrix_mul
+        self.scalar_div = scalar_div
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.matrix_mul.matrix_mul_cuda(x, self.linear.weight.t())
+        x = self.scalar_div.scalar_div_cuda(x, self.divisor)
+        x = torch.nn.functional.gelu(x)
+        return x

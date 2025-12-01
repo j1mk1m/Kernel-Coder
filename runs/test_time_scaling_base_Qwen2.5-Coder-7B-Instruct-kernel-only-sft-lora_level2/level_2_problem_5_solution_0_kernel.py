@@ -1,0 +1,166 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed convolution
+transposed_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void transposed_conv_kernel(const float* input, const float* weight, float* output, int in_channels, int out_channels, int kernel_size, int batch_size, int height_in, int width_in, int height_out, int width_out) {
+    int b = blockIdx.z;
+    int c = blockIdx.y;
+    int h = blockIdx.x / width_out;
+    int w = blockIdx.x % width_out;
+
+    float sum = 0.0f;
+    for (int i = 0; i < kernel_size; ++i) {
+        for (int j = 0; j < kernel_size; ++j) {
+            int ih = h * stride - pad + i;
+            int iw = w * stride - pad + j;
+            if (ih >= 0 && ih < height_in && iw >= 0 && iw < width_in) {
+                int idx_in = b * in_channels * height_in * width_in + (c * kernel_size * kernel_size + i * kernel_size + j) * height_in * width_in + ih * width_in + iw;
+                int idx_weight = (c * kernel_size * kernel_size + i * kernel_size + j) * out_channels + b;
+                sum += input[idx_in] * weight[idx_weight];
+            }
+        }
+    }
+
+    int idx_out = b * out_channels * height_out * width_out + c * height_out * width_out + h * width_out + w;
+    output[idx_out] = sum;
+}
+
+torch::Tensor transposed_conv_cuda(torch::Tensor input, torch::Tensor weight, int stride, int pad) {
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0);
+    auto kernel_size = weight.size(2);
+    auto batch_size = input.size(0);
+    auto height_in = input.size(2);
+    auto width_in = input.size(3);
+    auto height_out = ((height_in - 1) * stride - 2 * pad + kernel_size) / stride + 1;
+    auto width_out = ((width_in - 1) * stride - 2 * pad + kernel_size) / stride + 1;
+
+    auto output = torch::zeros({batch_size, out_channels, height_out, width_out}, input.options());
+
+    const int block_size = 256;
+    const int num_blocks = (height_out * width_out + block_size - 1) / block_size;
+
+    dim3 grid_dim(height_out * width_out, out_channels, batch_size);
+    dim3 block_dim(block_size);
+
+    transposed_conv_kernel<<<grid_dim, block_dim>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), in_channels, out_channels, kernel_size, batch_size, height_in, width_in, height_out, width_out);
+
+    return output;
+}
+"""
+
+transposed_conv_cpp_source = (
+    "torch::Tensor transposed_conv_cuda(torch::Tensor input, torch::Tensor weight, int stride, int pad);"
+)
+
+# Compile the inline CUDA code for transposed convolution
+transposed_conv = load_inline(
+    name="transposed_conv",
+    cpp_sources=transposed_conv_cpp_source,
+    cuda_sources=transposed_conv_source,
+    functions=["transposed_conv_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for subtraction
+subtraction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void subtraction_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] - b[idx];
+    }
+}
+
+torch::Tensor subtraction_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    subtraction_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+subtraction_cpp_source = (
+    "torch::Tensor subtraction_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for subtraction
+subtraction = load_inline(
+    name="subtraction",
+    cpp_sources=subtraction_cpp_source,
+    cuda_sources=subtraction_source,
+    functions=["subtraction_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for tanh activation
+tanh_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void tanh_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = tanh(input[idx]);
+    }
+}
+
+torch::Tensor tanh_cuda(torch::Tensor input) {
+    auto size = input.numel();
+    auto out = torch::zeros_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    tanh_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), out.data_ptr<float>(), size);
+
+    return out;
+}
+"""
+
+tanh_cpp_source = (
+    "torch::Tensor tanh_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for tanh activation
+tanh = load_inline(
+    name="tanh",
+    cpp_sources=tanh_cpp_source,
+    cuda_sources=tanh_source,
+    functions=["tanh_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
+        super(ModelNew, self).__init__()
+        self.transposed_conv = transposed_conv
+        self.subtraction = subtraction
+        self.tanh = tanh
+
+    def forward(self, x):
+        x = self.transposed_conv.transposed_conv_cuda(x, self.weight, stride, padding)
+        x = self.subtraction.subtraction_cuda(x, self.bias)
+        x = self.tanh.tanh_cuda(x)
+        return x

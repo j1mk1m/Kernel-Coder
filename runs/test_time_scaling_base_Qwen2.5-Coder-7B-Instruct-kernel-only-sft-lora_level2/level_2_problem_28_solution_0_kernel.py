@@ -1,0 +1,129 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for batch matrix multiplication
+bmm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bmm_kernel(const float* a, const float* b, float* c, int batch_size, int in_features, int out_features) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * out_features) {
+        float sum = 0.0f;
+        for (int k = 0; k < in_features; ++k) {
+            sum += a[idx * in_features + k] * b[k * out_features + idx % out_features];
+        }
+        c[idx] = sum;
+    }
+}
+
+torch::Tensor bmm_cuda(torch::Tensor a, torch::Tensor b) {
+    auto batch_size = a.size(0);
+    auto in_features = a.size(1);
+    auto out_features = b.size(1);
+    auto c = torch::zeros({batch_size, out_features}, a.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * out_features + block_size - 1) / block_size;
+
+    bmm_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), batch_size, in_features, out_features);
+
+    return c;
+}
+"""
+
+bmm_cpp_source = (
+    "torch::Tensor bmm_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for batch matrix multiplication
+bmm = load_inline(
+    name="bmm",
+    cpp_sources=bmm_cpp_source,
+    cuda_sources=bmm_source,
+    functions=["bmm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define custom CUDA kernels for instance normalization
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void instance_norm_kernel(const float* x, float* mean, float* var, float* gamma, float* beta, float* out, int batch_size, int out_features, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * out_features) {
+        int i = idx / out_features;
+        int j = idx % out_features;
+        float sum = 0.0f;
+        for (int k = 0; k < batch_size; ++k) {
+            sum += x[k * out_features + j];
+        }
+        mean[j] = sum / batch_size;
+        var[j] = 0.0f;
+        for (int k = 0; k < batch_size; ++k) {
+            var[j] += (x[k * out_features + j] - mean[j]) * (x[k * out_features + j] - mean[j]);
+        }
+        var[j] /= batch_size;
+        var[j] = max(var[j], eps);
+        out[idx] = gamma[j] * (x[idx] - mean[j]) / sqrt(var[j]) + beta[j];
+    }
+}
+
+torch::Tensor instance_norm_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, float eps) {
+    auto batch_size = x.size(0);
+    auto out_features = x.size(1);
+    auto mean = torch::zeros({out_features}, x.options());
+    auto var = torch::zeros({out_features}, x.options());
+    auto out = torch::zeros_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size * out_features + block_size - 1) / block_size;
+
+    instance_norm_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), mean.data_ptr<float>(), var.data_ptr<float>(), gamma.data_ptr<float>(), beta.data_ptr<float>(), out.data_ptr<float>(), batch_size, out_features, eps);
+
+    return out;
+}
+"""
+
+instance_norm_cpp_source = (
+    "torch::Tensor instance_norm_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, float eps);"
+)
+
+# Compile the inline CUDA code for instance normalization
+instance_norm = load_inline(
+    name="instance_norm",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the optimized model using the custom CUDA kernels
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = bmm
+        self.instance_norm = instance_norm
+
+    def forward(self, x, y):
+        x = self.bmm.bmm_cuda(x, y)
+        x = self.instance_norm.instance_norm_cuda(x, torch.ones_like(x), torch.zeros_like(x))
+        x = x + y
+        x = x * y
+        return x
+
+
+# Example usage:
+model_new = ModelNew(in_features, out_features)
+inputs = get_inputs()
+outputs = model_new(inputs[0], inputs[1])
+print(outputs.shape)  # Should be (batch_size, out_features)

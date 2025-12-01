@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for transposed 3D convolution
+conv_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Placeholder function for actual transposed 3D convolution kernel implementation
+torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int padding) {
+    // TODO: Implement actual transposed 3D convolution kernel
+    return torch::zeros_like(input);
+}
+"""
+
+conv_transpose_cpp_source = (
+    "torch::Tensor conv_transpose_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for transposed 3D convolution
+conv_transpose = load_inline(
+    name="conv_transpose",
+    cpp_sources=conv_transpose_cpp_source,
+    cuda_sources=conv_transpose_source,
+    functions=["conv_transpose_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for mean pooling across depth
+mean_pooling_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Placeholder function for actual mean pooling kernel implementation
+torch::Tensor mean_pooling_cuda(torch::Tensor input, int kernel_size) {
+    // TODO: Implement actual mean pooling kernel
+    return torch::zeros_like(input);
+}
+"""
+
+mean_pooling_cpp_source = (
+    "torch::Tensor mean_pooling_cuda(torch::Tensor input, int kernel_size);"
+)
+
+# Compile the inline CUDA code for mean pooling
+mean_pooling = load_inline(
+    name="mean_pooling",
+    cpp_sources=mean_pooling_cpp_source,
+    cuda_sources=mean_pooling_source,
+    functions=["mean_pooling_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+# Define the custom CUDA kernel for addition
+addition_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Placeholder function for actual addition kernel implementation
+torch::Tensor addition_cuda(torch::Tensor a, torch::Tensor b) {
+    // TODO: Implement actual addition kernel
+    return torch::zeros_like(a);
+}
+"""
+
+addition_cpp_source = (
+    "torch::Tensor addition_cuda(torch::Tensor a, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code for addition
+addition = load_inline(
+    name="addition",
+    cpp_sources=addition_cpp_source,
+    cuda_sources=addition_source,
+    functions=["addition_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = conv_transpose
+        self.bias = nn.Parameter(torch.randn(1, out_channels, 1, 1, 1))  # Broadcastable bias over channels
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        x = self.conv_transpose.conv_transpose_cuda(x, weight=None, bias=self.bias, stride=stride, padding=padding)  # (B, C, D, H, W)
+        x = mean_pooling.mean_pooling_cuda(x, kernel_size=2)  # Mean pool over depth dim (D)
+        x = addition.addition_cuda(x, torch.zeros_like(x))  # Bias add per channel
+        x = F.softmax(x, dim=1)  # Softmax over channels
+        x = torch.tanh(x)  # Nonlinearity
+        x = x * self.scaling_factor  # Scaling
+        return x
+
+# Example usage
+if __name__ == "__main__":
+    batch_size = 16
+    in_channels = 16
+    out_channels = 64
+    depth = 32
+    height = width = 128
+    kernel_size = 3
+    stride = 1
+    padding = 1
+    scaling_factor = 2.0
+
+    model_new = ModelNew(in_channels, out_channels, kernel_size, stride, padding, scaling_factor)
+    inputs = get_inputs()
+    outputs = model_new(inputs[0])
+    print(outputs.shape)
