@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
 
-# Define the custom CUDA kernel for Softsign
+# Define the custom CUDA kernel for Softsign activation
 softsign_source = """
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -11,7 +10,8 @@ softsign_source = """
 __global__ void softsign_kernel(const float* x, float* out, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        out[idx] = x[idx] / (1 + fabsf(x[idx]));
+        float abs_x = fabsf(x[idx]);
+        out[idx] = x[idx] / (1.0f + abs_x);
     }
 }
 
@@ -32,7 +32,7 @@ softsign_cpp_source = (
     "torch::Tensor softsign_cuda(torch::Tensor x);"
 )
 
-# Compile the inline CUDA code for Softsign
+# Compile the inline CUDA code for Softsign activation
 softsign = load_inline(
     name="softsign",
     cpp_sources=softsign_cpp_source,
@@ -45,9 +45,8 @@ softsign = load_inline(
 
 
 class ModelNew(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.softsign = softsign
-
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.softsign.softsign_cuda(x)
+        return softsign.softsign_cuda(x)

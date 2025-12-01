@@ -1,33 +1,28 @@
-import torch
-import torch.nn as nn
-from torch.utils.cpp_extension import load_inline
+c++
+#include <torch/extension.h>
+#include <cuda_runtime.h>
 
-# Define your custom CUDA kernel here
-custom_cuda_code_source = """
-// Your CUDA kernel code goes here
-"""
+// CUDA kernel function for performing 1D convolution
+__global__ void conv1d_kernel(const float* input, const float* weight, float* output, int batch_size, int in_channels, int length, int out_channels, int kernel_size) {
+    // Implement the 1D convolution logic here
+    // ...
+}
 
-custom_cuda_code_cpp_source = (
-    // Your C++ function declarations go here
-)
+torch::Tensor conv1d_cuda(torch::Tensor input, torch::Tensor weight, int out_channels, int kernel_size) {
+    // Get input dimensions
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto length = input.size(2);
 
-# Compile the inline CUDA code
-custom_cuda_code = load_inline(
-    name="custom_cuda_code_name",
-    cpp_sources=custom_cuda_code_cpp_source,
-    cuda_sources=custom_cuda_code_source,
-    functions=["function_name"],
-    verbose=True,
-    extra_cflags=[""],
-    extra_ldflags=[""],
-)
+    // Allocate memory for output tensor
+    auto output = torch::zeros({batch_size, out_channels, length}, input.options());
 
-class ModelNew(nn.Module):
-    def __init__(self, **kwargs):
-        super(ModelNew, self).__init__()
-        # Initialize your layers using custom CUDA operators if needed
-        self.conv1d_custom = ...
+    // Set grid and block sizes
+    dim3 threads_per_block(256);
+    dim3 blocks_per_grid((length + threads_per_block.x - 1) / threads_per_block.x);
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Implement your forward pass using custom CUDA operators if needed
-        return ...
+    // Launch the convolution kernel
+    conv1d_kernel<<<blocks_per_grid, threads_per_block>>>(input.data_ptr<float>(), weight.data_ptr<float>(), output.data_ptr<float>(), batch_size, in_channels, length, out_channels, kernel_size);
+
+    return output;
+}

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
 
 # Define the custom CUDA kernel for masked cumulative sum
@@ -7,37 +8,40 @@ masked_cumsum_source = """
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
-__global__ void masked_cumsum_kernel(const float* x, const bool* mask, float* out, int batch_size, int input_size, int dim) {
+__global__ void masked_cumsum_kernel(const float* x, const bool* mask, float* out, int batch_size, int input_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < input_size) {
-        int batch_idx = idx / input_size;
-        int remaining_idx = idx % input_size;
-        float cum_sum = 0.0f;
-        for (int i = 0; i <= remaining_idx; ++i) {
-            if (mask[batch_idx * input_size + i]) {
-                cum_sum += x[batch_idx * input_size + i];
+    if (idx < batch_size * input_size) {
+        int i = idx / input_size;
+        int j = idx % input_size;
+        if (mask[i][j]) {
+            out[idx] = x[idx];
+            for (int k = 1; k <= j; ++k) {
+                if (mask[i][j - k]) {
+                    out[idx] += x[idx - k];
+                }
             }
+        } else {
+            out[idx] = 0;
         }
-        out[idx] = cum_sum;
     }
 }
 
-torch::Tensor masked_cumsum_cuda(torch::Tensor x, torch::Tensor mask, int dim) {
+torch::Tensor masked_cumsum_cuda(torch::Tensor x, torch::Tensor mask) {
     auto batch_size = x.size(0);
     auto input_size = x.size(1);
     auto out = torch::zeros_like(x);
 
     const int block_size = 256;
-    const int num_blocks = (input_size + block_size - 1) / block_size;
+    const int num_blocks = (batch_size * input_size + block_size - 1) / block_size;
 
-    masked_cumsum_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), mask.data_ptr<bool>(), out.data_ptr<float>(), batch_size, input_size, dim);
+    masked_cumsum_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), mask.data_ptr<bool>(), out.data_ptr<float>(), batch_size, input_size);
 
     return out;
 }
 """
 
 masked_cumsum_cpp_source = (
-    "torch::Tensor masked_cumsum_cuda(torch::Tensor x, torch::Tensor mask, int dim);"
+    "torch::Tensor masked_cumsum_cuda(torch::Tensor x, torch::Tensor mask);"
 )
 
 # Compile the inline CUDA code for masked cumulative sum
@@ -59,10 +63,4 @@ class ModelNew(nn.Module):
         self.masked_cumsum = masked_cumsum
 
     def forward(self, x, mask):
-        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)
-
-# Test the model
-model_new = ModelNew(dim)
-x, mask = get_inputs()
-output = model_new(x, mask)
-print(output.shape)
+        return self.masked_cumsum.masked_cumsum_cuda(x, mask)

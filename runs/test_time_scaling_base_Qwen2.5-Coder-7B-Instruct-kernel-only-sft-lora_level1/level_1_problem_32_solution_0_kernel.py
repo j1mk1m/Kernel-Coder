@@ -1,7 +1,0 @@
-start_event = torch.cuda.Event(enable_timing=True)
-end_event = torch.cuda.Event(enable_timing=True)
-start_event.record()
-# Your CUDA kernel call here
-end_event.record()
-torch.cuda.synchronize()  # Wait for all events to be recorded
-print(f"Kernel time: {start_event.elapsed_time(end_event)} ms")

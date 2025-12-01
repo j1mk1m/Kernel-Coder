@@ -1,42 +1,9 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.cpp_extension import load_inline
-
-# Define the custom CUDA kernel for convolution
-convolution_source = """
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-
-// Custom convolution implementation here...
-
-torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int padding) {
-    // Your custom CUDA kernel code here...
-    return output;
-}
-"""
-
-convolution_cpp_source = (
-    "torch::Tensor convolution_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int padding);"
-)
-
-# Compile the inline CUDA code for convolution
-convolution = load_inline(
-    name="convolution",
-    cpp_sources=convolution_cpp_source,
-    cuda_sources=convolution_source,
-    functions=["convolution_cuda"],
-    verbose=True,
-    extra_cflags=[""],
-    extra_ldflags=[""],
-)
-
-
 class ModelNew(nn.Module):
-    def __init__(self, num_classes=1000):
-        super(ModelNew, self).__init__()
-        self.conv1 = convolution
+       def __init__(self, num_classes=1000):
+           super(ModelNew, self).__init__()
+           self.conv1_weight = nn.Parameter(torch.randn(96, 3, 11, 11))
+           self.conv1_bias = nn.Parameter(torch.randn(96))
 
-    def forward(self, x):
-        x = self.conv1(x, weight=None, bias=None, stride=4, padding=2)
-        return x
+       def forward(self, x):
+           x = conv2d.conv2d_cuda(x, self.conv1_weight, pad_h=2, pad_w=2, stride_h=4, stride_w=4)
+           return x

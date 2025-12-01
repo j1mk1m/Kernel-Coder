@@ -7,44 +7,45 @@ logsoftmax_source = """
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
-__global__ void logsoftmax_kernel(const float* input, float* output, int batch_size, int dim) {
+// Custom CUDA kernel for LogSoftmax
+__global__ void logsoftmax_kernel(const float* x, float* y, int batch_size, int dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= batch_size * dim) return;
+    if (idx >= batch_size * dim) {
+        return;
+    }
 
     int batch_idx = idx / dim;
-    int feature_idx = idx % dim;
+    int dim_idx = idx % dim;
 
-    float max_val = -FLT_MAX;
+    float max_val = -INFINITY;
     for (int i = 0; i < dim; ++i) {
-        float val = input[batch_idx * dim + i];
-        if (val > max_val) {
-            max_val = val;
-        }
+        max_val = fmaxf(max_val, x[batch_idx * dim + i]);
     }
 
     float sum_exp = 0.0f;
     for (int i = 0; i < dim; ++i) {
-        sum_exp += exp(input[batch_idx * dim + i] - max_val);
+        sum_exp += expf(x[batch_idx * dim + i] - max_val);
     }
 
-    output[idx] = input[idx] - max_val - log(sum_exp);
+    y[idx] = x[batch_idx * dim + dim_idx] - max_val - logf(sum_exp);
 }
 
-torch::Tensor logsoftmax_cuda(torch::Tensor input, int dim) {
-    auto batch_size = input.size(0);
-    auto output = torch::zeros_like(input);
+torch::Tensor logsoftmax_cuda(torch::Tensor x) {
+    auto batch_size = x.size(0);
+    auto dim = x.size(1);
+    auto y = torch::zeros_like(x);
 
     const int block_size = 256;
     const int num_blocks = (batch_size * dim + block_size - 1) / block_size;
 
-    logsoftmax_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), batch_size, dim);
+    logsoftmax_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), batch_size, dim);
 
-    return output;
+    return y;
 }
 """
 
 logsoftmax_cpp_source = (
-    "torch::Tensor logsoftmax_cuda(torch::Tensor input, int dim);"
+    "torch::Tensor logsoftmax_cuda(torch::Tensor x);"
 )
 
 # Compile the inline CUDA code for LogSoftmax
@@ -58,12 +59,10 @@ logsoftmax = load_inline(
     extra_ldflags=[""],
 )
 
-
 class ModelNew(nn.Module):
     def __init__(self, dim: int = 1):
         super(ModelNew, self).__init__()
-        self.dim = dim
         self.logsoftmax = logsoftmax
-
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.logsoftmax.logsoftmax_cuda(x, self.dim)
+        return self.logsoftmax.logsoftmax_cuda(x)

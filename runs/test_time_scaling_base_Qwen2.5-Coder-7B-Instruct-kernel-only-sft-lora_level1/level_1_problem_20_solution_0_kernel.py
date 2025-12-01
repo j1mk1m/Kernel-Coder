@@ -3,34 +3,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
 
+# Define the custom CUDA kernel for LeakyReLU
 leaky_relu_source = """
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
-__global__ void leaky_relu_kernel(const float* x, float* y, int size, float negative_slope) {
+__global__ void leaky_relu_kernel(const float* input, float* output, int size, float negative_slope) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        y[idx] = x[idx] > 0 ? x[idx] : x[idx] * negative_slope;
+        output[idx] = input[idx] > 0 ? input[idx] : input[idx] * negative_slope;
     }
 }
 
-torch::Tensor leaky_relu_cuda(torch::Tensor x, float negative_slope) {
-    auto size = x.numel();
-    auto y = torch::zeros_like(x);
+torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope) {
+    auto size = input.numel();
+    auto output = torch::zeros_like(input);
 
     const int block_size = 256;
     const int num_blocks = (size + block_size - 1) / block_size;
 
-    leaky_relu_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), y.data_ptr<float>(), size, negative_slope);
+    leaky_relu_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size, negative_slope);
 
-    return y;
+    return output;
 }
 """
 
 leaky_relu_cpp_source = (
-    "torch::Tensor leaky_relu_cuda(torch::Tensor x, float negative_slope);"
+    "torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope);"
 )
 
+# Compile the inline CUDA code for LeakyReLU
 leaky_relu = load_inline(
     name="leaky_relu",
     cpp_sources=leaky_relu_cpp_source,

@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.cpp_extension import load_inline
 
 # Define the custom CUDA kernel for Swish activation
@@ -11,12 +10,8 @@ swish_source = """
 __global__ void swish_kernel(const float* x, float* out, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        out[idx] = x[idx] * sigmoid(x[idx]);
+        out[idx] = x[idx] * (1.0f + tanh(x[idx] * 0.5f));
     }
-}
-
-float sigmoid(float x) {
-    return 1.0f / (1.0f + exp(-x));
 }
 
 torch::Tensor swish_cuda(torch::Tensor x) {
@@ -52,6 +47,6 @@ class ModelNew(nn.Module):
     def __init__(self):
         super(ModelNew, self).__init__()
         self.swish = swish
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.swish.swish_cuda(x)
