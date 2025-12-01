@@ -1,0 +1,1 @@
+This implementation uses the custom CUDA kernel to perform the depthwise 2D convolution operation, resulting in improved performance compared to the original PyTorch implementation.

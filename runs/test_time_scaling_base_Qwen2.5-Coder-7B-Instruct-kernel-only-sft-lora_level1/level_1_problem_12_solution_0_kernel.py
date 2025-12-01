@@ -1,0 +1,49 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication of a diagonal matrix with another matrix
+diagonal_matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void diagonal_matmul_kernel(const float* A, const float* B, float* C, int N, int M) {
+    // Implement the kernel here
+}
+
+torch::Tensor diagonal_matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    auto N = A.size(0);
+    auto M = B.size(1);
+    auto C = torch::zeros({N, M}, A.options());
+
+    const int block_size = 256;
+    const int num_blocks = (N * M + block_size - 1) / block_size;
+
+    diagonal_matmul_kernel<<<num_blocks, block_size>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), N, M);
+
+    return C;
+}
+"""
+
+diagonal_matmul_cpp_source = (
+    "torch::Tensor diagonal_matmul_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for matrix multiplication of a diagonal matrix with another matrix
+diagonal_matmul = load_inline(
+    name="diagonal_matmul",
+    cpp_sources=diagonal_matmul_cpp_source,
+    cuda_sources=diagonal_matmul_source,
+    functions=["diagonal_matmul_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.diagonal_matmul = diagonal_matmul
+    
+    def forward(self, A, B):
+        return self.diagonal_matmul.diagonal_matmul_cuda(A, B)

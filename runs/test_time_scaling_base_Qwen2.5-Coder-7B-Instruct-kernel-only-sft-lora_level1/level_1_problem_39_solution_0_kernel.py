@@ -1,0 +1,3 @@
+## Solution Explanation
+
+The custom CUDA kernel `l2_norm_kernel` computes the L2 norm for each row of the input tensor. It uses a shared memory approach to accumulate the squared values and then calculates the square root. The kernel modifies the input tensor in place by subtracting the computed norm. This avoids the need for additional memory allocation and ensures efficient computation on the GPU.

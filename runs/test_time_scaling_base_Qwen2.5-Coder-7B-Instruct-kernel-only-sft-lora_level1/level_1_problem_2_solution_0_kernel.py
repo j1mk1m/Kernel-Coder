@@ -1,0 +1,82 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+matrix_mult_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matrix_mult_kernel(const float* A, const float* B, float* C, int M, int K, int N) {
+    __shared__ float As[32][32], Bs[32][32];
+
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float sum = 0.0f;
+    for (int k = 0; k < (K + 31) / 32; ++k) {
+        if (row < M && k * 32 + threadIdx.x < K) {
+            As[threadIdx.y][threadIdx.x] = A[row * K + k * 32 + threadIdx.x];
+        } else {
+            As[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        if (col < N && k * 32 + threadIdx.y < K) {
+            Bs[threadIdx.y][threadIdx.x] = B[(k * 32 + threadIdx.y) * N + col];
+        } else {
+            Bs[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+        for (int i = 0; i < 32; ++i) {
+            sum += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor matrix_mult_cuda(torch::Tensor A, torch::Tensor B) {
+    auto M = A.size(0);
+    auto K = A.size(1);
+    auto N = B.size(1);
+    auto C = torch::zeros({M, N}, A.options());
+
+    dim3 threads_per_block(32, 32);
+    dim3 blocks_per_grid((N + threads_per_block.x - 1) / threads_per_block.x, (M + threads_per_block.y - 1) / threads_per_block.y);
+
+    matrix_mult_kernel<<<blocks_per_grid, threads_per_block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, K, N);
+
+    return C;
+}
+"""
+
+matrix_mult_cpp_source = (
+    "torch::Tensor matrix_mult_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matrix_mult = load_inline(
+    name="matrix_mult",
+    cpp_sources=matrix_mult_cpp_source,
+    cuda_sources=matrix_mult_source,
+    functions=["matrix_mult_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.matrix_mult = matrix_mult
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matrix_mult.matrix_mult_cuda(A, B)
