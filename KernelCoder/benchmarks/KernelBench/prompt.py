@@ -183,11 +183,6 @@ Here is your Evaluation Result:
 ```
 {correctness_feedback}
 ```
-
-Consider getting inspiration from the following rule satisfaction feedback:
-```
-{rule_satisfaction}
-```
 """
 
     if correctness:

@@ -1,10 +1,10 @@
 python KernelCoder/test_time_scaling.py \
-    --run_name test_time_scaling_iterative_refinement_QwQ-32B_level2_rules3 \
+    --run_name test_time_scaling_iterative_refinement_QwQ-32B_level2 \
     --benchmark KernelBench \
     --level 2 \
     --method "iterative refinement" \
     --num_parallel 1 \
-    --num_iterations 4 \
+    --num_iterations 8 \
     --server_type vllm \
     --vllm_host babel-t9-32 \
     --vllm_port 8082 \
@@ -13,6 +13,5 @@ python KernelCoder/test_time_scaling.py \
     --temperature 0.7 \
     --hardware A6000_babel \
     --num_eval_devices 4 \
-    --num_cpu_workers 16 \
-    --rules_file runs/rules.json
+    --num_cpu_workers 16
 

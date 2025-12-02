@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition preempt
 #SBATCH --time 0-23:00 # set time
-#SBATCH --job-name=tts_base
+#SBATCH --job-name=tts_sequential
 #SBATCH --chdir=/home/gyeongwk/Kernel-Coder # working directory
 
 #SBATCH --gres=gpu:A6000:4
@@ -18,4 +18,4 @@ source ~/anaconda3/etc/profile.d/conda.sh
 source ~/.bashrc
 conda activate kernel
 
-bash scripts/11891/tts_base_level2.sh
+bash scripts/11891/tts_sequential_level2_sft.sh

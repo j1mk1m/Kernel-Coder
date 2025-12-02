@@ -18,4 +18,4 @@ source ~/anaconda3/etc/profile.d/conda.sh
 source ~/.bashrc
 conda activate kernel
 
-bash scripts/11891/tts_base_level2.sh
+bash scripts/11891/tts_base_level2_sft.sh

@@ -104,7 +104,7 @@ class KernelBenchTraces(Traces):
             with open(eval_file, "r") as f:
                 eval_results = json.load(f)
             for eval_result in eval_results:
-                self.add_evaluation(KernelBenchEvaluationResult(evaluation_id=eval_result["evaluation_id"], task_id=eval_result["task_id"], solution_id=eval_result["solution_id"], compiled=eval_result["compiled"], correctness=eval_result["correctness"], metadata=eval_result["metadata"], runtime=eval_result["runtime"], runtime_stats=eval_result["runtime_stats"]))
+                self.add_evaluation(KernelBenchEvaluationResult(evaluation_id=eval_result["evaluation_id"], task_id=eval_result["task_id"], solution_id=eval_result["solution_id"], compiled=eval_result["compiled"], correctness=eval_result["correctness"], metadata=eval_result["metadata"], runtime=eval_result["runtime"], runtime_stats=eval_result["runtime_stats"], rule_satisfaction=eval_result["rule_satisfaction"]))
     
     def add_solution(self, solution: KernelBenchSolution):
         super().add_solution(solution)

@@ -4,7 +4,7 @@
 #SBATCH --job-name=tts_base
 #SBATCH --chdir=/home/gyeongwk/Kernel-Coder # working directory
 
-#SBATCH --gres=gpu:A6000:1
+#SBATCH --gres=gpu:A6000:4
 #SBATCH --mem=64GB
 #SBATCH --cpus-per-task=8 # cpus
 

@@ -1,7 +1,7 @@
 python KernelCoder/test_time_scaling.py \
-    --run_name test_time_scaling_iterative_refinement_QwQ-32B_level1 \
+    --run_name test_time_scaling_iterative_refinement_QwQ-32B_level2_rules \
     --benchmark KernelBench \
-    --level 1 \
+    --level 2 \
     --method "iterative refinement" \
     --num_parallel 1 \
     --num_iterations 8 \
@@ -13,5 +13,6 @@ python KernelCoder/test_time_scaling.py \
     --temperature 0.7 \
     --hardware A6000_babel \
     --num_eval_devices 4 \
-    --num_cpu_workers 16
+    --num_cpu_workers 16 \
+    --rules_file runs/evolrule_parallel_8_batch_level2/epoch_0_batch_0/filtered_rules.json
 

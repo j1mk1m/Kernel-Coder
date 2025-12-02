@@ -1,5 +1,5 @@
 python KernelCoder/test_time_scaling.py \
-    --run_name test_time_scaling_base_Qwen2.5-Coder-7B-Instruct_level1 \
+    --run_name test_time_scaling_base_Qwen2.5-Coder-7B-Instruct-kernel-only-sft-lora_level1 \
     --benchmark KernelBench \
     --level 1 \
     --method "base" \
@@ -12,6 +12,6 @@ python KernelCoder/test_time_scaling.py \
     --max_tokens 16384 \
     --temperature 0.7 \
     --hardware A6000_babel \
-    --num_eval_devices 1 \
+    --num_eval_devices 4 \
     --num_cpu_workers 16
 

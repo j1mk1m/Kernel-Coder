@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition preempt
 #SBATCH --time 0-23:00 # set time
-#SBATCH --job-name=tts_parallel
+#SBATCH --job-name=tts_parallel_rules
 #SBATCH --chdir=/home/gyeongwk/Kernel-Coder # working directory
 
 #SBATCH --gres=gpu:A6000:4

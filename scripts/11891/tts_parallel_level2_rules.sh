@@ -14,5 +14,5 @@ python KernelCoder/test_time_scaling.py \
     --hardware A6000_babel \
     --num_eval_devices 4 \
     --num_cpu_workers 16 \
-    --rules_file runs/rules.json
+    --rules_file runs/evolrule_parallel_8_batch_level2/epoch_0_batch_0/filtered_rules.json
 

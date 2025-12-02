@@ -8,6 +8,7 @@ Implements basic test-time scaling approaches
 
 import yaml
 import os
+import json
 import multiprocessing as mp
 from multiprocessing.dummy import Pool as ThreadPool
 from llm_utils import create_llm_client, setup_logging
@@ -84,11 +85,17 @@ def base(config, benchmark, dataset, trace_cls, llm_client):
     """
     traces = trace_cls(dataset, benchmark.run_dir)
     # Batched single-sample generation for each task
+    if config.rules_file is not None:
+        rules = json.load(open(config.rules_file))
+        context = "Consider the following rules when generating the kernel:\n" + "\n".join(rules)
+    else:
+        context = None
+
     items = []
     for task in dataset:
         sol_name = f"{task.task_id}_solution_0"
         if not traces.check_for_solution(sol_name):
-            prompt = benchmark.get_prompt(task)
+            prompt = benchmark.get_prompt(task, context=context)
             with open(os.path.join(benchmark.run_dir, f"{sol_name}_prompt.txt"), "w") as f:
                 f.write(prompt)
             items.append((task, sol_name, prompt))
@@ -107,13 +114,19 @@ def best_of_n(config, benchmark, dataset, trace_cls, llm_client):
     """
     traces = trace_cls(dataset, benchmark.run_dir)
     
+    if config.rules_file is not None:
+        rules = json.load(open(config.rules_file))
+        context = "Consider the following rules when generating the kernel:\n" + "\n".join(rules)
+    else:
+        context = None
+
     # Build batch of generation items across all tasks and samples
     for sample_id in range(config.num_parallel):
         items = []
         for task in dataset:
             sol_name = f"{task.task_id}_solution_{sample_id}"
             if not traces.check_for_solution(sol_name):
-                prompt = benchmark.get_prompt(task)
+                prompt = benchmark.get_prompt(task, context=context)
                 with open(os.path.join(benchmark.run_dir, f"{sol_name}_prompt.txt"), "w") as f:
                     f.write(prompt)
                 items.append((task, sol_name, prompt))
@@ -131,6 +144,12 @@ def iterative_refinement(config, benchmark, dataset, trace_cls, llm_client):
     Iterative refinement approach using the new Benchmark API.
     """
 
+    if config.rules_file is not None:
+        rules = json.load(open(config.rules_file))
+        context = "Consider the following rules when generating the kernel:\n" + "\n".join(rules)
+    else:
+        context = None
+
     traces = trace_cls(dataset, benchmark.run_dir)
     num_iterations = config.num_iterations
     for iteration in range(num_iterations):
@@ -141,7 +160,7 @@ def iterative_refinement(config, benchmark, dataset, trace_cls, llm_client):
             for sample_id in range(config.num_parallel):
                 sol_name = f"{task.task_id}_solution_{sample_id + iteration * config.num_parallel}"
                 if not traces.check_for_solution(sol_name):
-                    prompt = benchmark.get_prompt(task) if iteration == 0 else benchmark.get_refinement_prompt(task, traces)
+                    prompt = benchmark.get_prompt(task, context=context) if iteration == 0 else benchmark.get_refinement_prompt(task, traces, context=context)
                     with open(os.path.join(benchmark.run_dir, f"{sol_name}_prompt.txt"), "w") as f:
                         f.write(prompt)
                     items.append((task, sol_name, prompt))
